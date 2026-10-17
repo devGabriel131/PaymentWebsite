@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Management</title>
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js"
+    integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg"
+    crossorigin="anonymous" defer></script>
+  <style>
+    body { margin: 1rem; font-family: system-ui, sans-serif; }
+    button { min-height: 44px; font: inherit; }
+    a { overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Management</h1>
+    <form action="/management/links" method="post" hx-post="/management/links"
+      hx-target="#generated-link" hx-disabled-elt="button">
+      <button type="submit">Generate link</button>
+    </form>
+    <form action="/management/links/cancel" method="post" hx-post="/management/links/cancel"
+      hx-target="#generated-link" hx-disabled-elt="button"
+      hx-confirm="Cancel all links? Existing customer links will return 404.">
+      <button type="submit">Cancel all links</button>
+    </form>
+    <p id="generated-link" role="status">{{template "result" .}}</p>
+  </main>
+</body>
+</html>
+
+{{define "result"}}{{if .Link}}<a href="{{.Link}}">{{.Link}}</a>{{end}}{{.Notice}}{{end}}
