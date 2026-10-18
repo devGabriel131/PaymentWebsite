@@ -61,14 +61,19 @@ func run() error {
 		return fmt.Errorf("register customer routes: %w", err)
 	}
 
+	addr := "127.0.0.1:8080"
+	if port := os.Getenv("PORT"); port != "" {
+		addr = ":" + port
+	}
+
 	server := &http.Server{
-		Addr:              "127.0.0.1:8080",
+		Addr:              addr,
 		Handler:           http.NewCrossOriginProtection().Handler(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
-	log.Printf("Listening on http://%s", server.Addr)
+	log.Printf("Listening on %s", server.Addr)
 	return server.ListenAndServe()
 }

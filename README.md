@@ -15,14 +15,14 @@ The first runnable slice implements cryptographic link issuance, validation, and
 
 Links are not customer- or invoice-bound yet. Lifetime settings, expiration, customer forms, authentication, invoices, and payments remain outside this slice.
 
-**Development only:** management is not authenticated, and issued links do not expire yet. The server binds to loopback. Do not expose this application publicly or use it for real customer/payment data in this state.
+**Test/development only:** management is not authenticated, and issued links do not expire yet. Anyone reaching a public test deployment can generate or cancel links. Use disposable test data only, never real customer/payment data.
 
 ## Stack and development
 
 - Go 1.26 or newer, using `net/http` and `html/template`.
 - HTMX for server-rendered interactions; mobile-first pages.
 - PostgreSQL for persistence, accessed through GORM and its PostgreSQL driver.
-- Railway is the intended deployment platform; deployment is not configured yet.
+- Railway hosts the shared test deployment; see [Railway test deployment](#railway-test-deployment).
 - Air is installed as a project-local Go tool.
 
 Start local development from the project root. The copy step preserves an existing `.env`:
@@ -48,6 +48,26 @@ Open <http://127.0.0.1:8080/management/>. Generated links are same-origin paths;
 Air watches Go and HTML files. Its generated defaults do not automatically refresh the browser; refresh manually. Use `go tool air`, not a separately installed global `air` command. The existing `.air.toml` was generated with `go tool air init`.
 
 No frontend build step is required. Air's generated `tmp/` directory is ignored by Git.
+
+## Railway test deployment
+
+The `PaymentWebsite` service in the existing `amused-light` project deploys `devGabriel131/PaymentWebsite`, branch `master`, using Railpack. Railway names this environment `production`; the application is still for testing only.
+
+Service configuration:
+
+- `DATABASE_URL=${{Postgres.DATABASE_URL}}` references the project's PostgreSQL service over Railway's private network. Local `.env` credentials are not uploaded or reused.
+- `PORT=8080` makes the application listen on all interfaces for Railway routing. Without `PORT`, local startup remains bound to `127.0.0.1:8080`.
+- The health check uses `/management/`. PostgreSQL connection and GORM migration must succeed before HTTP starts.
+- Railpack builds the Go application from `go.mod`; the deployed process does not run Air. Pushes to `master` trigger automatic deployments.
+
+For a manual deployment from this directory:
+
+```fish
+railway link --project a0207263-4a1b-4174-b693-5830fd46e486 --environment production --service PaymentWebsite
+railway up --ci -m "Test PaymentWebsite on Railway"
+```
+
+The public HTTPS domain serves both management and customer routes. PostgreSQL traffic stays private. Do not copy Railway database credentials into `.env.example` or commit a local `.env`.
 
 ## Project structure
 
