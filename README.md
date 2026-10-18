@@ -58,7 +58,7 @@ Service configuration:
 - `DATABASE_URL=${{Postgres.DATABASE_URL}}` references the project's PostgreSQL service over Railway's private network. Local `.env` credentials are not uploaded or reused.
 - `PORT=8080` makes the application listen on all interfaces for Railway routing. Without `PORT`, local startup remains bound to `127.0.0.1:8080`.
 - The health check uses `/management/`. PostgreSQL connection and GORM migration must succeed before HTTP starts.
-- Railpack builds the Go application from `go.mod`; the deployed process does not run Air. Pushes to `master` trigger automatic deployments.
+- Railpack uses the preferred Go toolchain declared in `go.mod`; the deployed process does not run Air. Pushes to `master` trigger automatic deployments.
 
 For a manual deployment from this directory:
 
