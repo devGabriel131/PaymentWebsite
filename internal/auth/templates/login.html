@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="management">
+  <a class="management-skip-link" href="#main-content">Skip to content</a>
+  <header class="management-header">
+    <div class="management-brand" translate="no">
+      <img src="/static/logo.png" alt="" width="56" height="56">
+      <span>Masterminds</span>
+    </div>
+  </header>
+  <main id="main-content" class="management-links management-login">
+    <h1>Sign in</h1>
+    {{if .Error}}<p id="login-error" role="alert">{{.Error}}</p>{{end}}
+    <form method="post" action="/management/login">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none"
+        spellcheck="false" required value="{{.Username}}" {{if .Error}}aria-describedby="login-error"{{end}}>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required
+        {{if .Error}}aria-describedby="login-error"{{end}}>
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>

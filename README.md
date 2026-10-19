@@ -4,22 +4,23 @@ A company payment application with separate management and customer interfaces, 
 
 ## Current status
 
-The first runnable slice implements cryptographic link issuance, validation, and bulk cancellation:
+The runnable slice implements CLI-managed staff access, persistent sign-in, encrypted link history, clipboard copying, cancellation, and a customer name form:
 
-- `/` redirects to `/management/`.
-- `/management/` has bare HTMX **Generate link** and **Cancel all links** buttons.
-- `POST /management/links` creates a random token, persists its hash, and returns a same-origin customer link.
-- `POST /management/links/cancel` deletes all issued token hashes. Previously issued customer URLs then return HTTP 404.
-- `/customer/{token}` displays **Hello, world!** only for an issued token. Unknown or modified tokens return HTTP 404.
-- Issued links survive application restarts and remain independently usable until canceled.
+- `/` redirects to `/management/`. Signed-out staff see a login form; signed-in staff see the shared link registry. **Settings** and **Customers** remain visual-only buttons.
+- Staff accounts are created through the CLI, not a registration page. Passwords use Argon2id; SCS stores sessions in PostgreSQL for a fixed 14 days. Password changes, revocation, and account removal invalidate existing sessions.
+- **Create & copy link** appends and copies a new URL. Every staff account sees the same saved list after reloads and server restarts. Rows show saved customer names, **Copy link**, and **Cancel link**; customer links open in a separate tab.
+- `POST /management/links` persists the random token's digest and encrypted recovery value, then returns a row fragment for HTMX or the complete list for ordinary form submissions.
+- `POST /management/links/{id}/cancel` deletes one record by its management ID. Other links and names remain active. `POST /management/links/cancel` deletes the complete active registry.
+- `/customer/{token}` remains public to anyone holding an issued URL. Unknown, modified, or canceled tokens return the branded HTTP 404 page. Its name form saves only against the matching active link.
+- Links issued before encrypted history was enabled remain valid and cancelable, but their original URLs cannot be reconstructed from stored hashes. Their rows show an unavailable-URL notice instead of a fabricated link.
 
-Links are not customer- or invoice-bound yet. Lifetime settings, expiration, customer forms, authentication, invoices, and payments remain outside this slice.
+Links are not customer- or invoice-bound yet; the name still belongs to an issued link. Customer-link expiration, full customer records, invoices, and payments remain outside this slice. Sign-in expiry does not expire customer links.
 
-**Test/development only:** management is not authenticated, and issued links do not expire yet. Anyone reaching a public test deployment can generate or cancel links. Use disposable test data only, never real customer/payment data.
+**Test/development only:** management is authenticated, but invoice/payment workflows and customer-link expiration are not implemented. Use disposable data, never real customer/payment data.
 
 ## Stack and development
 
-- Go 1.26 or newer, using `net/http` and `html/template`.
+- Go 1.26 or newer, using `net/http` and `html/template`; `go.mod` selects the patched Go 1.27.2 toolchain.
 - HTMX for server-rendered interactions; mobile-first pages.
 - PostgreSQL for persistence, accessed through GORM and its PostgreSQL driver.
 - Railway hosts the shared test deployment; see [Railway test deployment](#railway-test-deployment).
@@ -29,25 +30,45 @@ Start local development from the project root. The copy step preserves an existi
 
 ```fish
 test -f .env; or cp .env.example .env
+# Before the first server start, set LINK_ENCRYPTION_KEY in .env as described below.
 docker compose up --detach --wait --wait-timeout 90 db
 go tool air
 ```
 
-Air loads `DATABASE_URL` automatically from `.env`; no manual Fish environment command is needed. Existing shell environment variables take precedence over `.env`. Local `.env` files are ignored by Git; `.env.example` contains only the local development defaults.
+Before the first server start, generate a key with `openssl rand -base64 32` and save it once as `LINK_ENCRYPTION_KEY` in private `.env`. Keep `SESSION_COOKIE_SECURE=false` for local HTTP. Preserve an existing key: replacing it makes saved URLs unreadable. Air loads these variables and `DATABASE_URL` from `.env`; shell variables take precedence. Local `.env` files are ignored by Git, and `.env.example` deliberately contains no usable encryption key.
 
 The database credentials in `compose.yaml` and `.env.example` are for local development only. PostgreSQL is bound to `127.0.0.1:5432`; its named volume preserves issued links between container restarts. Start the Compose service before Air if it is not already running.
 
-`DATABASE_URL` is required. GORM connects and runs `AutoMigrate` for the link model on startup. Models define the table and constraints; there are no hand-written SQL queries or migration files.
+`DATABASE_URL` is required in both server and CLI modes. The server additionally requires the Base64-encoded 32-byte `LINK_ENCRYPTION_KEY`; `SESSION_COOKIE_SECURE` defaults to true when unset. GORM connects and runs `AutoMigrate` for links, users, and the SCS-compatible sessions table on startup. Models define the tables and constraints; there are no versioned migration files.
 
-Restart existing Air processes after changing its configuration so they load `.env`. Keep only one instance running. For a server without Air, export `DATABASE_URL` explicitly before `go run .`; the application itself deliberately requires an environment variable rather than falling back to local credentials.
+Restart an existing Air process after changing its environment so it reloads `.env`. Keep one instance running. Without Air, export the required variables before `go run .`; the application never loads `.env` itself or silently falls back to local credentials.
 
 Use one server or Air instance at a time: they share port 8080, and Air instances also share `tmp/main`.
 
-Open <http://127.0.0.1:8080/management/>. Generated links are same-origin paths; following or copying the link address resolves the full customer URL.
+Open <http://127.0.0.1:8080/management/> and sign in using a CLI-created account. **Create & copy link** copies the same-origin URL and appends it; **Copy link** copies any saved URL again after reload. Clipboard access requires JavaScript and HTTPS or localhost. If blocked, URLs remain available for manual copying; failed creation leaves the clipboard unchanged.
 
-Air watches Go and HTML files. Its generated defaults do not automatically refresh the browser; refresh manually. Use `go tool air`, not a separately installed global `air` command. The existing `.air.toml` was generated with `go tool air init`.
+Air watches Go, HTML, CSS, and JavaScript files. Its generated defaults do not automatically refresh the browser; refresh manually. Use `go tool air`, not a separately installed global `air` command. The existing `.air.toml` was generated with `go tool air init`.
+
+Both interfaces load the shared `static/styles.css` stylesheet from `/static/styles.css`, with shared brand colors defined on `:root`. Management-only layout rules are scoped under `.management`; customer rules use `.customer` for the name form and `.customer-not-found` for the invalid-link page. Go embeds the stylesheet, the management clipboard script (`static/management.js`), and the existing Masterminds logo (`static/logo.png`) into the binary and serves them under `/static/`, so deployment needs no separate asset directory. CSS and JavaScript edits require a rebuild, which Air handles during development.
 
 No frontend build step is required. Air's generated `tmp/` directory is ignored by Git.
+
+## Staff accounts and sessions
+
+Create the two staff accounts explicitly. For the default local database:
+
+```fish
+set -gx DATABASE_URL 'postgres://paymentwebsite:paymentwebsite@127.0.0.1:5432/paymentwebsite?sslmode=disable'
+go run . user add gabriel
+go run . user add worker
+go run . user list
+```
+
+Replace example usernames as needed. Usernames are case-insensitive, normalized to lowercase, and accept 1–64 ASCII letters, digits, `.`, `_`, or `-`. Passwords are 12–1024 bytes and are entered twice at a hidden terminal prompt. Password arguments, environment variables, and piped plaintext are not accepted. Account commands need `DATABASE_URL`, but not the encryption key or a running web server.
+
+`user passwd <username>` changes a password and invalidates prior sessions. `user revoke <username>` invalidates sessions without changing the password; `user remove <username>` removes the account, not its links. Recreating a removed username cannot revive old cookies. Duplicate creation never overwrites an existing password.
+
+Both staff have the same access to the active link registry. Sessions contain account identity/version, not link history. Persistent HttpOnly, SameSite=Lax cookies remember sign-in across tabs and browser restarts; ordinary visits do not extend the 14-day deadline. Production cookies are Secure even behind Railway's TLS proxy. Login attempts share a per-process limit of two initial attempts, then one every 12 seconds. There is no registration, email recovery, or logout UI.
 
 ## Railway test deployment
 
@@ -56,38 +77,67 @@ The `PaymentWebsite` service in the existing `amused-light` project deploys `dev
 Service configuration:
 
 - `DATABASE_URL=${{Postgres.DATABASE_URL}}` references the project's PostgreSQL service over Railway's private network. Local `.env` credentials are not uploaded or reused.
+- `LINK_ENCRYPTION_KEY` is a separately generated stable secret for this service. Never reuse the local key, replace it during deployments, or commit it. Keep a secure backup.
+- `SESSION_COOKIE_SECURE=true` keeps management cookies HTTPS-only.
 - `PORT=8080` makes the application listen on all interfaces for Railway routing. Without `PORT`, local startup remains bound to `127.0.0.1:8080`.
-- The health check uses `/management/`. PostgreSQL connection and GORM migration must succeed before HTTP starts.
+- The health check remains `/management/`: signed-out requests receive HTTP 200 with only the login form. PostgreSQL connection and migrations must succeed before HTTP starts.
 - Railpack uses the preferred Go toolchain declared in `go.mod`; the deployed process does not run Air. Pushes to `master` trigger automatic deployments.
 
 For a manual deployment from this directory:
 
 ```fish
-railway link --project a0207263-4a1b-4174-b693-5830fd46e486 --environment production --service PaymentWebsite
-railway up --ci -m "Test PaymentWebsite on Railway"
+railway up --project a0207263-4a1b-4174-b693-5830fd46e486 --environment production --service PaymentWebsite --ci -m "Update PaymentWebsite"
 ```
 
 The public HTTPS domain serves both management and customer routes. PostgreSQL traffic stays private. Do not copy Railway database credentials into `.env.example` or commit a local `.env`.
+
+Manage hosted accounts inside the deployed app container, where the private PostgreSQL URL works:
+
+```fish
+railway ssh --project a0207263-4a1b-4174-b693-5830fd46e486 --environment production --service PaymentWebsite
+```
+
+Then run these in the remote shell:
+
+```sh
+/app/out user add gabriel
+/app/out user add worker
+/app/out user list
+```
+
+Railpack currently builds `/app/out`; account commands ship in that same binary. Real staff enter their own passwords at the hidden prompts. The same remote commands support `passwd`, `revoke`, and `remove`. `railway run` and `railway shell` execute locally and do not make Railway's private database hostname reachable; do not expose PostgreSQL publicly or copy production credentials into local `.env` for this CLI.
 
 ## Project structure
 
 ```text
 .
 ├── main.go
+├── static/
+│   ├── logo.png
+│   ├── management.js
+│   └── styles.css
 ├── internal/
+│   ├── auth/
+│   │   ├── auth.go
+│   │   ├── cli.go
+│   │   ├── http.go
+│   │   ├── http_test.go
+│   │   └── templates/login.html
 │   ├── management/
 │   │   ├── management.go
-│   │   └── templates/
-│   │       └── index.html
+│   │   ├── management_test.go
+│   │   └── templates/index.html
 │   ├── customer/
 │   │   ├── customer.go
+│   │   ├── customer_test.go
 │   │   └── templates/
-│   │       └── index.html
-│   └── links/
-│       ├── links.go
-│       └── links_test.go
-├── migrations/
-│   └── .gitkeep
+│   │       ├── index.html
+│   │       └── not-found.html
+│   ├── links/
+│   │   ├── links.go
+│   │   └── links_test.go
+│   └── testdb/testdb.go
+├── migrations/.gitkeep
 ├── compose.yaml
 ├── go.mod
 ├── go.sum
@@ -98,32 +148,50 @@ The public HTTPS domain serves both management and customer routes. PostgreSQL t
 ```
 
 - `main.go`: configuration, GORM initialization and migration, bounded connection pool, route wiring, HTTP timeouts, and native cross-origin request protection.
+- `internal/auth/`: staff credentials/CLI, embedded login form, account-version authorization, and SCS table model.
 - `internal/management/`: management handlers and embedded templates.
-- `internal/customer/`: issued-link validation at entry and the embedded customer template.
-- `internal/links/`: random token issuance, SHA-256 lookup, GORM model, and PostgreSQL integration tests.
+- `internal/customer/`: issued-link validation on entry and submission, name validation, and embedded customer form and invalid-link templates.
+- `internal/links/`: random issuance, digest lookup, AES-GCM recovery, shared inventory, cancellation, GORM model, and PostgreSQL regressions.
+- `static/styles.css`: shared interface styles and scoped management/customer layout, embedded and served by the Go application.
+- `static/management.js`: management-only native clipboard copying and request-failure feedback; creation and cancellation use declarative HTMX forms.
 - `compose.yaml`: local PostgreSQL service and persistent development volume.
 - `.env.example`: local database connection template. Air loads the private `.env` copy.
+- `internal/testdb/`: integration-only isolated PostgreSQL schemas/pools, including SCS's SQL access.
 - `migrations/`: reserved for future versioned GORM migrations. This slice uses `AutoMigrate`; its `.gitkeep` only preserves the directory in version control.
 
 Both interfaces use the same link store. Dependencies are passed explicitly; there is no global database or `init()` setup. Folder separation is not an authorization boundary.
 
 ## Cryptographic link design
 
-Each token uses 32 bytes from Go's `crypto/rand`: 256 bits of OS-backed cryptographic randomness, encoded as 43 URL-safe Base64 characters without padding. Tokens contain no customer data, timestamps, or sequential IDs. No encryption or signing key is needed for this opaque-token design.
+Each token uses 32 bytes from Go's `crypto/rand`: 256 bits of OS-backed randomness, encoded as 43 URL-safe Base64 characters without padding. Tokens contain no customer data, timestamps, or sequential IDs and are not JWTs. The encryption key protects stored URL recovery, not token validity.
 
-PostgreSQL stores only the SHA-256 digest of the encoded token as a binary primary key. The GORM model also defines a 32-byte hash constraint. Issuance returns the usable token only after persistence succeeds; a duplicate hash or failed write returns an error, not a link.
+PostgreSQL stores the SHA-256 digest as a 32-byte binary primary key, the submitted name, creation timestamp, and an AES-256-GCM-encrypted copy of the token. `cipher.NewGCMWithRandomNonce` manages nonce generation/storage; the digest is authenticated associated data, so moving ciphertext between rows fails. Issuance returns a usable URL only after persistence succeeds. A wrong key or damaged ciphertext fails the management list rather than hiding records or falling back to plaintext.
+
+Pre-upgrade rows have NULL ciphertext. They remain valid through digest lookup and can be canceled by the hex digest management ID, but their original URLs are unrecoverable from the database. Do not regenerate the encryption key to recover these rows: hashing is not reversible.
 
 SHA-256 is the lookup digest, not the source of randomness. Go 1.26's `crypto/rand.Read` terminates the process if the OS random source fails; there is no weaker fallback.
 
-Customer entry hashes the supplied token and checks for a matching database record through GORM's structured conditions. Multiple issued tokens remain valid until canceled; opening a link does not consume it. A database error does not grant access.
+Customer entry and name submission hash the supplied token and check for a matching database record through GORM's structured conditions. Multiple issued tokens remain valid until canceled; opening a link does not consume it. A database error does not grant access. Saving a name updates only the matching, still-issued link; it cannot insert or revive a canceled link.
 
-Tokens are bearer credentials: anyone possessing a usable link can open it. Responses containing generated links and customer entry responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Management creation and cancellation use Go's native cross-origin request protection, but still need authentication before public deployment.
+Tokens are bearer credentials: anyone possessing a usable URL can open it and edit its name without staff authentication. Management routes require a current staff session, while generated-link and customer responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Login, management writes, and customer submissions retain Go's native cross-origin protection.
+
+### Name form
+
+The form accepts Unicode names, trims surrounding whitespace, and rejects blank names, invalid UTF-8, and NUL characters server-side. Form request bodies are limited to 4 KiB of encoded request bytes, not name characters.
+
+Invalid names return HTTP 422, malformed forms return HTTP 400, oversized bodies return HTTP 413, and database lookup or name-save failures return HTTP 500. These errors retain the form with an inline message: HTMX POST requests receive only the form fragment, while ordinary requests receive a complete page. Successful submissions show confirmation, and reloading the link restores its saved name.
 
 ### Testing cancellation
 
-Open a generated customer link in another tab. On management, click **Cancel all links** and confirm. The generated URL is replaced with **All links canceled.** Reloading an old customer URL must show HTTP 404. Generating a new link afterward must still display Hello World.
+Sign in and click **Create & copy link** twice. The clipboard should hold the latest URL. Reload: both URLs remain unchanged, and **Copy link** can recopy either. A second staff account sees the same list. Open both customer links.
 
-This development control permanently deletes the current link registry through GORM. The permission to perform an unfiltered delete is scoped to this one operation; other database operations retain GORM's global-delete guard. Repeating cancellation on an empty registry is safe. Cancellation is not a lifetime or expiration setting.
+Click **Cancel link** on one row. A confirmation dialog must ask whether you are sure you want to cancel that link. Dismiss it first: no cancellation request should be sent, and the row and customer link must remain active. Click again and confirm. Only that row disappears; the other link and its saved name must remain usable. Opening or submitting the canceled customer URL must return HTTP 404 with the centered logo and Spanish invalid-link message. Check the title **Enlace no válido | Masterminds** and accents in **válido** and **comuníquese**. A canceled HTMX submission refreshes the whole customer page instead of swapping the error into the name form.
+
+With clipboard completion deliberately delayed for the second link, cancel the first link before clipboard work settles. The second link stays usable, and delayed clipboard success or failure must not overwrite **Link canceled.** Any newer management request invalidates earlier clipboard feedback when it starts, even before its HTTP response arrives.
+
+Click **Cancel all links** and confirm to clear the list and revoke all issued links, including those created before the current page was opened. The status becomes **All links canceled.** Creating a new link afterward must still copy a working URL with an empty customer name form.
+
+This development control permanently deletes the current link registry, including submitted names, through GORM. The permission to perform an unfiltered delete is scoped to this one operation; other database operations retain GORM's global-delete guard. Repeating cancellation on an empty registry is safe. Cancellation is not a lifetime or expiration setting.
 
 ## Verification
 
@@ -138,10 +206,11 @@ Run the checks:
 ```fish
 set -gx TEST_DATABASE_URL 'postgres://paymentwebsite:paymentwebsite@127.0.0.1:5432/paymentwebsite_test?sslmode=disable'
 go test -race -tags=integration ./...
-go vet ./...
+go vet -tags=integration ./...
+go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 ```
 
-Tests roll back their changes. They guard hash-only persistence, multiple usable links, rejection of unissued or tampered tokens and SQL-like input, and failure to issue a token when persistence fails. Cancellation tests cover rejection of all previous tokens, safe repeated cancellation, successful new issuance, and preservation of the shared database's global-delete guard.
+Each integration test creates its own PostgreSQL schema/pool and drops only that schema afterward. Tests guard encrypted URL recovery, corruption/wrong-key rejection, legacy migration, token boundaries, name isolation, cancellation, and GORM's global-delete guard. Authentication checks cover credential failure, rate limiting, token rotation, persistence/expiry, password/revocation/removal invalidation, and username recreation. Real management handlers verify authorization/CSRF boundaries and shared, reloadable lists.
 
 These checks do not prove randomness statistically. Cryptographic randomness comes from the standard library's OS-backed generator, not from a finite collision test.
 
@@ -193,7 +262,7 @@ Forms update the customer resolved from the link and server-side flow context. A
 
 HTMX endpoints can return HTML fragments. A separate JavaScript frontend or duplicate JSON endpoint for every UI action is not required. Management and customer areas do not need webhooks to communicate within this application.
 
-Management routes require authorization before being exposed. Authentication and customer-verification mechanisms have not been selected yet.
+Management now uses CLI-managed staff username/password accounts and persistent sessions. Customer-verification mechanisms for the broader invoice/payment workflow have not been selected.
 
 ### Preventing duplicate payment
 
@@ -211,8 +280,8 @@ Provider webhooks may be appropriate for payment confirmation later. That is sep
 
 ## Implementation approach
 
-The current slice implements link issuance and validation only. Subsequent changes should remain small enough for line-by-line review for correctness, security, readability, and maintainability.
+The current slice implements link issuance, validation, cancellation, and link-scoped name capture. Subsequent changes should remain small enough for line-by-line review for correctness, security, readability, and maintainability.
 
 Implement complete, runnable slices rather than disconnected handlers or pretend functionality. Add database constraints and focused regression checks for critical contracts as the relevant behavior is implemented, including customer isolation, expiration boundaries, invoice reuse, and concurrent payment attempts.
 
-The broader paper design remains deferred. Invoice contents and amounts, customer form fields, payment-provider integration, authentication, and the unresolved lifetime and reissue policies must be clarified before implementing those respective behaviors.
+The broader paper design remains deferred. Invoice contents and amounts, remaining customer form fields, payment-provider integration, customer verification, and the unresolved customer-link lifetime and reissue policies must be clarified before implementing those respective behaviors.

@@ -7,27 +7,61 @@
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js"
     integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg"
     crossorigin="anonymous" defer></script>
-  <style>
-    body { margin: 1rem; font-family: system-ui, sans-serif; }
-    button { min-height: 44px; font: inherit; }
-    a { overflow-wrap: anywhere; }
-  </style>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/management.js" defer></script>
 </head>
-<body>
-  <main>
+<body class="management">
+  <a class="management-skip-link" href="#main-content">Skip to content</a>
+  <header class="management-header">
+    <div class="management-brand" translate="no">
+      <img src="/static/logo.png" alt="" width="56" height="56">
+      <span>Masterminds</span>
+    </div>
+    <button class="management-settings" type="button">Settings</button>
+  </header>
+  <nav class="management-menu" aria-label="Management">
+    <button type="button">Customers</button>
+  </nav>
+  <main id="main-content" class="management-links">
     <h1>Management</h1>
-    <form action="/management/links" method="post" hx-post="/management/links"
-      hx-target="#generated-link" hx-disabled-elt="button">
-      <button type="submit">Generate link</button>
+    <form id="create-link" class="management-create" action="/management/links" method="post"
+      hx-post="/management/links" hx-target="#generated-links" hx-swap="beforeend"
+      hx-disabled-elt="button">
+      <button type="submit">Create &amp; copy link</button>
     </form>
-    <form action="/management/links/cancel" method="post" hx-post="/management/links/cancel"
-      hx-target="#generated-link" hx-disabled-elt="button"
+    <p id="link-status" role="status">{{.Notice}}</p>
+    <ul id="generated-links" role="list" aria-label="Generated customer links">{{range .Links}}{{template "link" .}}{{end}}</ul>
+    <form class="management-cancel-all" action="/management/links/cancel" method="post"
+      hx-post="/management/links/cancel" hx-target="#generated-links" hx-disabled-elt="button"
       hx-confirm="Cancel all links? Existing customer links will return 404.">
       <button type="submit">Cancel all links</button>
     </form>
-    <p id="generated-link" role="status">{{template "result" .}}</p>
   </main>
 </body>
 </html>
 
-{{define "result"}}{{if .Link}}<a href="{{.Link}}">{{.Link}}</a>{{end}}{{.Notice}}{{end}}
+{{define "link"}}
+<li class="management-link">
+  <div>
+    {{with .Name}}<div><strong>{{.}}</strong></div>{{end}}
+    {{if .Token}}
+    <a href="/customer/{{.Token}}" target="_blank" rel="noopener noreferrer">/customer/{{.Token}}</a>
+    {{else}}
+    <span>Original URL unavailable for this existing link.</span>
+    {{end}}
+  </div>
+  <div class="management-link-actions">
+    {{if .Token}}<button type="button" data-copy-link>Copy link</button>{{end}}
+    <form action="/management/links/{{.ID}}/cancel" method="post"
+      hx-post="/management/links/{{.ID}}/cancel" hx-target="closest li" hx-swap="outerHTML"
+      hx-disabled-elt="button" hx-confirm="Are you sure you want to cancel this link? It will no longer open the customer form.">
+      <button type="submit">Cancel link</button>
+    </form>
+  </div>
+</li>
+{{end}}
+
+{{define "result"}}
+{{if .Created.ID}}{{template "link" .Created}}{{end}}
+<p id="link-status" hx-swap-oob="innerHTML">{{.Notice}}</p>
+{{end}}

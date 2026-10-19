@@ -3,11 +3,29 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Hello, world!</title>
+  <title>Your name</title>
+  <meta name="htmx-config" content='{"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}'>
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js"
+    integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg"
+    crossorigin="anonymous" defer></script>
+  <link rel="stylesheet" href="/static/styles.css">
 </head>
-<body>
+<body class="customer">
   <main>
-    <h1>{{.}}</h1>
+    <h1>What's your name?</h1>
+    {{template "name-form" .}}
   </main>
 </body>
 </html>
+
+{{define "name-form"}}
+<form action="{{.Path}}" method="post" hx-post="{{.Path}}" hx-target="this"
+  hx-swap="outerHTML" hx-disabled-elt="button">
+  <label for="name">Name</label>
+  <input id="name" name="name" type="text" autocomplete="name" required value="{{.Name}}"
+    {{if .Error}}aria-invalid="true" aria-describedby="name-error"{{end}}>
+  {{if .Error}}<p id="name-error" role="alert">{{.Error}}</p>{{end}}
+  <button type="submit">Save name</button>
+  {{if .Saved}}<p role="status">Thanks, {{.Name}}. Your name has been saved.</p>{{end}}
+</form>
+{{end}}

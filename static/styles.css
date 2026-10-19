@@ -1,0 +1,268 @@
+body {
+  margin: 1rem;
+  font-family: system-ui, sans-serif;
+}
+
+input,
+button {
+  min-height: 44px;
+  font: inherit;
+}
+
+a {
+  overflow-wrap: anywhere;
+}
+
+:root {
+  --brand-ink: #25484e;
+  --brand-tint: #eef4f4;
+  --brand-border: #d5e2e3;
+}
+
+.management {
+  margin: clamp(1rem, 3vw, 2rem);
+}
+
+.management-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 1.25rem;
+}
+
+.management-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--brand-ink);
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(1.25rem, 3vw, 1.75rem);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.management-brand img {
+  width: clamp(2.5rem, 5vw, 3.5rem);
+  height: auto;
+}
+
+.management-settings,
+.management-menu button,
+.management-links button {
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--brand-border);
+  border-radius: 0.5rem;
+  background: #ffffff;
+  color: var(--brand-ink);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.management-menu {
+  text-align: center;
+  margin-bottom: 1.5rem;
+  padding-block: 0.75rem;
+  border-block: 1px solid var(--brand-border);
+}
+
+.management-menu button {
+  background: var(--brand-tint);
+  font-weight: 600;
+}
+
+.management-settings:hover,
+.management-menu button:hover,
+.management-links button:hover {
+  background: var(--brand-border);
+}
+
+.management-settings:focus-visible,
+.management-menu button:focus-visible,
+.management-links button:focus-visible,
+.management-login input:focus-visible,
+.management-skip-link:focus-visible {
+  outline: 2px solid var(--brand-ink);
+  outline-offset: 3px;
+}
+
+.management-skip-link {
+  position: absolute;
+  top: 1rem;
+  left: 1rem;
+  padding: 0.5rem 1rem;
+  background: #ffffff;
+  color: var(--brand-ink);
+  transform: translateY(-200%);
+}
+
+.management-skip-link:focus {
+  transform: translateY(0);
+}
+
+.management-links {
+  box-sizing: border-box;
+  max-width: 48rem;
+  margin-inline: auto;
+  padding: clamp(1rem, 3vw, 1.5rem);
+  border: 1px solid var(--brand-border);
+  border-radius: 0.75rem;
+}
+
+.management-links h1 {
+  margin-top: 0;
+  color: var(--brand-ink);
+  font-size: 1.5rem;
+  text-align: center;
+}
+
+.management-create,
+.management-cancel-all {
+  text-align: center;
+}
+
+.management-create button,
+.management-login button {
+  border-color: var(--brand-ink);
+  background: var(--brand-ink);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.management-create button:hover,
+.management-login button:hover {
+  background: #18353a;
+}
+
+#link-status {
+  min-height: 1.5em;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+#generated-links {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.management-link {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 1rem;
+  padding-block: 1rem;
+  border-top: 1px solid var(--brand-border);
+}
+
+.management-link a {
+  color: var(--brand-ink);
+}
+
+.management-cancel-all {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--brand-border);
+}
+
+.management-link-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+@media (max-width: 480px) {
+  .management-link {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .management-link-actions {
+    justify-content: flex-start;
+  }
+}
+
+.management-login {
+  max-width: 28rem;
+}
+
+.management-login form {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.management-login label {
+  color: var(--brand-ink);
+  font-weight: 600;
+}
+
+.management-login input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--brand-border);
+  border-radius: 0.5rem;
+}
+
+.management-login button {
+  margin-top: 0.5rem;
+}
+
+.customer main {
+  max-width: 28rem;
+}
+
+.customer form {
+  display: grid;
+  gap: 1rem;
+}
+
+.customer input,
+.customer button {
+  box-sizing: border-box;
+}
+
+.customer input {
+  width: 100%;
+}
+
+.customer p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.customer [role="alert"],
+.management-login [role="alert"] {
+  color: #b91c1c;
+}
+
+.customer-not-found {
+  box-sizing: border-box;
+  display: grid;
+  place-items: center;
+  min-height: 100svh;
+  margin: 0;
+  padding: 2rem 1.5rem;
+  background: #ffffff;
+  color: var(--brand-ink);
+  text-align: center;
+}
+
+.customer-not-found main {
+  max-width: 34rem;
+}
+
+.customer-not-found img {
+  display: block;
+  width: min(15rem, 65vw);
+  height: auto;
+  margin: 0 auto 1.75rem;
+}
+
+.customer-not-found h1 {
+  margin: 0;
+  font-size: clamp(1.125rem, 2vw, 1.375rem);
+  font-weight: 400;
+  line-height: 1.6;
+  text-wrap: balance;
+}
