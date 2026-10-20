@@ -4,19 +4,21 @@ A company payment application with separate management and customer interfaces, 
 
 ## Current status
 
-The runnable slice implements CLI-managed staff access, persistent sign-in, encrypted link history, clipboard copying, cancellation, and a customer name form:
+The runnable slice implements CLI-managed staff access, persistent sign-in, hash-only customer links with progress status and configurable expiry, clipboard copying, cancellation, and an autosaving customer name form that locks on submit:
 
-- `/` redirects to `/management/`. Signed-out staff see a login form; signed-in staff see the shared link registry. **Settings** and **Customers** remain visual-only buttons.
+- `/` redirects to `/management/`. Signed-out staff see a login form; signed-in staff see the shared link registry, with their username, **Settings**, and **Sign out** at the top right. **Customers** remains a visual-only button.
+- **Settings** (`/management/settings`) has a slider for how long new customer links stay usable: 2–14 days in one-day steps, 7 by default. Saving records who changed it. Each link's expiry is fixed when it's created, so moving the slider never changes links already sent.
 - Staff accounts are created through the CLI, not a registration page. Passwords use Argon2id; SCS stores sessions in PostgreSQL for a fixed 14 days. Password changes, revocation, and account removal invalidate existing sessions.
-- **Create & copy link** appends and copies a new URL. Every staff account sees the same saved list after reloads and server restarts. Rows show saved customer names, **Copy link**, and **Cancel link**; customer links open in a separate tab.
-- `POST /management/links` persists the random token's digest and encrypted recovery value, then returns a row fragment for HTMX or the complete list for ordinary form submissions.
-- `POST /management/links/{id}/cancel` deletes one record by its management ID. Other links and names remain active. `POST /management/links/cancel` deletes the complete active registry.
-- `/customer/{token}` remains public to anyone holding an issued URL. Unknown, modified, or canceled tokens return the branded HTTP 404 page. Its name form saves only against the matching active link.
-- Links issued before encrypted history was enabled remain valid and cancelable, but their original URLs cannot be reconstructed from stored hashes. Their rows show an unavailable-URL notice instead of a fabricated link.
+- **Create & copy link** appends and copies a new URL. The URL is shown only in that creating response: PostgreSQL stores just its digest, so it can't be recovered later. A lost URL is replaced by creating a new link.
+- Every staff account sees the same saved list after reloads and server restarts. Rows show the customer's saved name, creation and expiry times in the viewer's time zone, and a status: **Not opened**, **Opened** (first visit recorded), **In progress** (autosaved data, not yet submitted), **Finished** (customer pressed **Submit**), **Expired** (lapsed before the customer finished), or **Canceled**. Once payments exist, **Finished** will mean a completed payment.
+- `POST /management/links` persists the random token's digest, then returns a row fragment for HTMX or the complete list for ordinary form submissions.
+- `POST /management/links/{id}/cancel` revokes one link by its management ID; `POST /management/links/cancel` revokes every usable link. Revocation keeps the row and submitted name visible as **Canceled**; there is no deletion UI. Expired links can't be canceled and keep showing **Expired**. Cancel responses refresh every row, so statuses are current.
+- Each row is an audit trail: "created … by gabriel · canceled by worker". The username comes from the verified server-side session, never from form input, and the store refuses creation or cancellation without one. **Cancel all** records its canceler only on links that were still active. Links from before auditing show no names.
+- `/customer/{token}` remains public to anyone holding an issued URL. Unknown, modified, canceled, and expired tokens all return the same branded HTTP 404 page. Its name form autosaves when the customer leaves a changed box and finishes on **Submit**, which locks it: afterwards the customer sees a read-only confirmation and can't change their answers.
 
-Links are not customer- or invoice-bound yet; the name still belongs to an issued link. Customer-link expiration, full customer records, invoices, and payments remain outside this slice. Sign-in expiry does not expire customer links.
+Links are not customer- or invoice-bound yet; the name still belongs to an issued link. Full customer records, invoices, and payments remain outside this slice. Sign-in expiry does not expire customer links.
 
-**Test/development only:** management is authenticated, but invoice/payment workflows and customer-link expiration are not implemented. Use disposable data, never real customer/payment data.
+**Test/development only:** management is authenticated, but invoice and payment workflows are not implemented. Use disposable data, never real customer/payment data.
 
 ## Stack and development
 
@@ -30,22 +32,21 @@ Start local development from the project root. The copy step preserves an existi
 
 ```fish
 test -f .env; or cp .env.example .env
-# Before the first server start, set LINK_ENCRYPTION_KEY in .env as described below.
 docker compose up --detach --wait --wait-timeout 90 db
 go tool air
 ```
 
-Before the first server start, generate a key with `openssl rand -base64 32` and save it once as `LINK_ENCRYPTION_KEY` in private `.env`. Keep `SESSION_COOKIE_SECURE=false` for local HTTP. Preserve an existing key: replacing it makes saved URLs unreadable. Air loads these variables and `DATABASE_URL` from `.env`; shell variables take precedence. Local `.env` files are ignored by Git, and `.env.example` deliberately contains no usable encryption key.
+Keep `SESSION_COOKIE_SECURE=false` in private `.env` for local HTTP. Air loads it and `DATABASE_URL` from `.env`; shell variables take precedence. Local `.env` files are ignored by Git.
 
 The database credentials in `compose.yaml` and `.env.example` are for local development only. PostgreSQL is bound to `127.0.0.1:5432`; its named volume preserves issued links between container restarts. Start the Compose service before Air if it is not already running.
 
-`DATABASE_URL` is required in both server and CLI modes. The server additionally requires the Base64-encoded 32-byte `LINK_ENCRYPTION_KEY`; `SESSION_COOKIE_SECURE` defaults to true when unset. GORM connects and runs `AutoMigrate` for links, users, and the SCS-compatible sessions table on startup. Models define the tables and constraints; there are no versioned migration files.
+`DATABASE_URL` is required in both server and CLI modes. `SESSION_COOKIE_SECURE` defaults to true when unset. GORM connects and runs `AutoMigrate` for links, users, settings, and the SCS-compatible sessions table on startup. The links migration also drops the `token_ciphertext` column left by the removed encrypted URL recovery, and backfills columns it adds to existing rows, once, when each column first appears: existing named links are marked submitted, since names were only saved by submitting before autosave, and existing links expire 7 days after creation. Models define the tables and constraints; there are no versioned migration files.
 
 Restart an existing Air process after changing its environment so it reloads `.env`. Keep one instance running. Without Air, export the required variables before `go run .`; the application never loads `.env` itself or silently falls back to local credentials.
 
-Use one server or Air instance at a time: they share port 8080, and Air instances also share `tmp/main`.
+Use one server or Air instance at a time: they share port 3000, and Air instances also share `tmp/main`. Keep the Air dev server running and reuse it (see `AGENTS.md`).
 
-Open <http://127.0.0.1:8080/management/> and sign in using a CLI-created account. **Create & copy link** copies the same-origin URL and appends it; **Copy link** copies any saved URL again after reload. Clipboard access requires JavaScript and HTTPS or localhost. If blocked, URLs remain available for manual copying; failed creation leaves the clipboard unchanged.
+Open <http://127.0.0.1:3000/management/> and sign in using a CLI-created account. **Create & copy link** copies the same-origin URL and appends it; **Copy link** on that new row recopies it until the page reloads. Clipboard access requires JavaScript and HTTPS or localhost. If blocked, the new URL remains visible for manual copying; failed creation leaves the clipboard unchanged.
 
 Air watches Go, HTML, CSS, and JavaScript files. Its generated defaults do not automatically refresh the browser; refresh manually. Use `go tool air`, not a separately installed global `air` command. The existing `.air.toml` was generated with `go tool air init`.
 
@@ -64,11 +65,13 @@ go run . user add worker
 go run . user list
 ```
 
-Replace example usernames as needed. Usernames are case-insensitive, normalized to lowercase, and accept 1–64 ASCII letters, digits, `.`, `_`, or `-`. Passwords are 12–1024 bytes and are entered twice at a hidden terminal prompt. Password arguments, environment variables, and piped plaintext are not accepted. Account commands need `DATABASE_URL`, but not the encryption key or a running web server.
+Replace example usernames as needed. Usernames are case-insensitive, normalized to lowercase, and accept 1–64 ASCII letters, digits, `.`, `_`, or `-`. Passwords are 12–1024 bytes and are entered twice at a hidden terminal prompt. Password arguments, environment variables, and piped plaintext are not accepted. Account commands need `DATABASE_URL`, but not a running web server.
 
 `user passwd <username>` changes a password and invalidates prior sessions. `user revoke <username>` invalidates sessions without changing the password; `user remove <username>` removes the account, not its links. Recreating a removed username cannot revive old cookies. Duplicate creation never overwrites an existing password.
 
-Both staff have the same access to the active link registry. Sessions contain account identity/version, not link history. Persistent HttpOnly, SameSite=Lax cookies remember sign-in across tabs and browser restarts; ordinary visits do not extend the 14-day deadline. Production cookies are Secure even behind Railway's TLS proxy. Login attempts share a per-process limit of two initial attempts, then one every 12 seconds. There is no registration, email recovery, or logout UI.
+Both staff have the same access to the link registry; the separate accounts exist so each action records who did it. Sessions contain account identity/version, not link history. Persistent HttpOnly, SameSite=Lax cookies remember sign-in across tabs and browser restarts; ordinary visits do not extend the 14-day deadline. Production cookies are Secure even behind Railway's TLS proxy. Login attempts from every client share a per-process limit of two initial attempts, then one every 12 seconds. This bounds password guessing and Argon2 memory use; the accepted tradeoff is that anyone who keeps the limit spent blocks new staff sign-ins until they stop, while existing sessions keep working. There is no registration or email recovery.
+
+**Sign out** posts to `POST /management/logout`, which deletes that browser's session row and expires its cookie; the account's other browsers stay signed in. To end every session for an account, use `user revoke`.
 
 ## Railway test deployment
 
@@ -77,9 +80,9 @@ The `PaymentWebsite` service in the existing `amused-light` project deploys `dev
 Service configuration:
 
 - `DATABASE_URL=${{Postgres.DATABASE_URL}}` references the project's PostgreSQL service over Railway's private network. Local `.env` credentials are not uploaded or reused.
-- `LINK_ENCRYPTION_KEY` is a separately generated stable secret for this service. Never reuse the local key, replace it during deployments, or commit it. Keep a secure backup.
+- `LINK_ENCRYPTION_KEY` is no longer read. After the first deployment that drops `token_ciphertext`, delete the variable and destroy any backup of it; without the key, older database backups that still contain ciphertext can't yield URLs.
 - `SESSION_COOKIE_SECURE=true` keeps management cookies HTTPS-only.
-- `PORT=8080` makes the application listen on all interfaces for Railway routing. Without `PORT`, local startup remains bound to `127.0.0.1:8080`.
+- `PORT=8080` makes the application listen on all interfaces for Railway routing. Without `PORT`, local startup is bound to `127.0.0.1:3000`.
 - The health check remains `/management/`: signed-out requests receive HTTP 200 with only the login form. PostgreSQL connection and migrations must succeed before HTTP starts.
 - Railpack uses the preferred Go toolchain declared in `go.mod`; the deployed process does not run Air. Pushes to `master` trigger automatic deployments.
 
@@ -126,7 +129,9 @@ Railpack currently builds `/app/out`; account commands ship in that same binary.
 │   ├── management/
 │   │   ├── management.go
 │   │   ├── management_test.go
-│   │   └── templates/index.html
+│   │   └── templates/
+│   │       ├── index.html
+│   │       └── settings.html
 │   ├── customer/
 │   │   ├── customer.go
 │   │   ├── customer_test.go
@@ -136,6 +141,9 @@ Railpack currently builds `/app/out`; account commands ship in that same binary.
 │   ├── links/
 │   │   ├── links.go
 │   │   └── links_test.go
+│   ├── settings/
+│   │   ├── settings.go
+│   │   └── settings_test.go
 │   └── testdb/testdb.go
 ├── migrations/.gitkeep
 ├── compose.yaml
@@ -148,12 +156,13 @@ Railpack currently builds `/app/out`; account commands ship in that same binary.
 ```
 
 - `main.go`: configuration, GORM initialization and migration, bounded connection pool, route wiring, HTTP timeouts, and native cross-origin request protection.
-- `internal/auth/`: staff credentials/CLI, embedded login form, account-version authorization, and SCS table model.
-- `internal/management/`: management handlers and embedded templates.
-- `internal/customer/`: issued-link validation on entry and submission, name validation, and embedded customer form and invalid-link templates.
-- `internal/links/`: random issuance, digest lookup, AES-GCM recovery, shared inventory, cancellation, GORM model, and PostgreSQL regressions.
+- `internal/auth/`: staff credentials/CLI, embedded login form, sign-out, account-version authorization exposing the verified username (`auth.Staff`), and SCS table model.
+- `internal/management/`: registry and settings handlers and embedded templates; `main.go` injects `auth.Staff` so every write records its account.
+- `internal/customer/`: issued-link validation on entry, autosave, and submission; name validation; the submit lock; and embedded customer form and invalid-link templates.
+- `internal/links/`: random issuance, digest-only storage, expiry, customer progress status, revocation, GORM model and migration, and PostgreSQL regressions.
+- `internal/settings/`: the single settings row, its link-lifetime range (enforced by the store and by database checks), and who last changed it.
 - `static/styles.css`: shared interface styles and scoped management/customer layout, embedded and served by the Go application.
-- `static/management.js`: management-only native clipboard copying and request-failure feedback; creation and cancellation use declarative HTMX forms.
+- `static/management.js`: management-only native clipboard copying, local-time display of row times, and request-failure feedback; creation and cancellation use declarative HTMX forms.
 - `compose.yaml`: local PostgreSQL service and persistent development volume.
 - `.env.example`: local database connection template. Air loads the private `.env` copy.
 - `internal/testdb/`: integration-only isolated PostgreSQL schemas/pools, including SCS's SQL access.
@@ -163,35 +172,41 @@ Both interfaces use the same link store. Dependencies are passed explicitly; the
 
 ## Cryptographic link design
 
-Each token uses 32 bytes from Go's `crypto/rand`: 256 bits of OS-backed randomness, encoded as 43 URL-safe Base64 characters without padding. Tokens contain no customer data, timestamps, or sequential IDs and are not JWTs. The encryption key protects stored URL recovery, not token validity.
+Each token uses 32 bytes from Go's `crypto/rand`: 256 bits of OS-backed randomness, encoded as 43 URL-safe Base64 characters without padding. Tokens contain no customer data, timestamps, or sequential IDs and are not JWTs.
 
-PostgreSQL stores the SHA-256 digest as a 32-byte binary primary key, the submitted name, creation timestamp, and an AES-256-GCM-encrypted copy of the token. `cipher.NewGCMWithRandomNonce` manages nonce generation/storage; the digest is authenticated associated data, so moving ciphertext between rows fails. Issuance returns a usable URL only after persistence succeeds. A wrong key or damaged ciphertext fails the management list rather than hiding records or falling back to plaintext.
-
-Pre-upgrade rows have NULL ciphertext. They remain valid through digest lookup and can be canceled by the hex digest management ID, but their original URLs are unrecoverable from the database. Do not regenerate the encryption key to recover these rows: hashing is not reversible.
+PostgreSQL stores the SHA-256 digest as a 32-byte binary primary key, the latest saved name, creation, first-visit, submission, cancellation, and expiry timestamps, and the creating and canceling staff usernames. The usable token is never stored in any form, so a database leak yields no working customer URL and staff can't redisplay one. Issuance returns a usable URL only after persistence succeeds.
 
 SHA-256 is the lookup digest, not the source of randomness. Go 1.26's `crypto/rand.Read` terminates the process if the OS random source fails; there is no weaker fallback.
 
-Customer entry and name submission hash the supplied token and check for a matching database record through GORM's structured conditions. Multiple issued tokens remain valid until canceled; opening a link does not consume it. A database error does not grant access. Saving a name updates only the matching, still-issued link; it cannot insert or revive a canceled link.
+Customer entry, autosave, and submission hash the supplied token and check for a matching database record that is neither canceled nor expired, through GORM's structured conditions. Expiry is compared with the database clock (`expires_at > now()`) on every request, so it is a hard cutoff: a customer mid-form whose link lapses gets the 404 page on their next autosave or submit, and keeps what was already saved. The first successful entry records `opened_at`. Multiple issued tokens remain valid until canceled or expired; opening a link does not consume it. A database error does not grant access. Saving a name updates only the matching, usable, unsubmitted link; it cannot insert or revive a canceled or expired link.
 
-Tokens are bearer credentials: anyone possessing a usable URL can open it and edit its name without staff authentication. Management routes require a current staff session, while generated-link and customer responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Login, management writes, and customer submissions retain Go's native cross-origin protection.
+Tokens are bearer credentials: anyone possessing a usable URL can open it and edit its name without staff authentication until the form is submitted. Management routes require a current staff session, while generated-link and customer responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Login, management writes, and customer submissions retain Go's native cross-origin protection.
 
 ### Name form
 
-The form accepts Unicode names, trims surrounding whitespace, and rejects blank names, invalid UTF-8, and NUL characters server-side. Form request bodies are limited to 4 KiB of encoded request bytes, not name characters.
+The form accepts Unicode names, trims surrounding whitespace, and rejects invalid UTF-8 and NUL characters server-side. Form request bodies are limited to 4 KiB of encoded request bytes, not name characters.
 
-Invalid names return HTTP 422, malformed forms return HTTP 400, oversized bodies return HTTP 413, and database lookup or name-save failures return HTTP 500. These errors retain the form with an inline message: HTMX POST requests receive only the form fragment, while ordinary requests receive a complete page. Successful submissions show confirmation, and reloading the link restores its saved name.
+Leaving a changed box sends it to `POST /customer/{token}/draft` (HTMX `change` trigger), so a reload or lost connection keeps every box saved so far. Autosave never sets `submitted_at` and replies only with the status line (**Saved.** or **Not saved.** plus the reason), never redrawing fields the customer may be typing in. Drafts mirror the box, including clearing it; a network failure shows **Not saved. Check your connection.** Text typed but never blurred, or blurred while offline, is not kept. Requests from one box are queued so an older draft can't overwrite a newer one.
+
+**Submit** posts to `POST /customer/{token}`, additionally rejects a blank name, and records `submitted_at`. Invalid names return HTTP 422, malformed forms return HTTP 400, oversized bodies return HTTP 413, and database lookup or name-save failures return HTTP 500. Submission errors retain the form with an inline message: HTMX POST requests receive only the form fragment, while ordinary requests receive a complete page.
+
+A successful submission replaces the form with a read-only confirmation and locks it. Reloading shows the same confirmation. Any later autosave or submit, including one from another tab, returns HTTP 409, and HTMX reloads into the read-only page. The database update itself only matches unsubmitted links, so two tabs racing can't change a submitted form either.
 
 ### Testing cancellation
 
-Sign in and click **Create & copy link** twice. The clipboard should hold the latest URL. Reload: both URLs remain unchanged, and **Copy link** can recopy either. A second staff account sees the same list. Open both customer links.
+Sign in and click **Create & copy link** three times. The clipboard should hold the latest URL. Open all three customer links. On the first, type a name and press **Submit**; on the second, type a name and click outside the box, which shows **Saved.**, then reload: the name is still there. Reload management: no URL is shown again, and the rows show **Finished**, **In progress**, and **Opened**. A second staff account sees the same list and statuses.
 
-Click **Cancel link** on one row. A confirmation dialog must ask whether you are sure you want to cancel that link. Dismiss it first: no cancellation request should be sent, and the row and customer link must remain active. Click again and confirm. Only that row disappears; the other link and its saved name must remain usable. Opening or submitting the canceled customer URL must return HTTP 404 with the centered logo and Spanish invalid-link message. Check the title **Enlace no válido | Masterminds** and accents in **válido** and **comuníquese**. A canceled HTMX submission refreshes the whole customer page instead of swapping the error into the name form.
+Click **Cancel link** on one row. A confirmation dialog must ask whether you are sure you want to cancel that link. Dismiss it first: no cancellation request should be sent, and the row and customer link must remain active. Click again and confirm. That row changes to **Canceled**, keeps its saved name, and loses its cancel button; the other link must remain usable. Opening or submitting the canceled customer URL must return HTTP 404 with the centered logo and Spanish invalid-link message. Check the title **Enlace no válido | Masterminds** and accents in **válido** and **comuníquese**. A canceled HTMX submission refreshes the whole customer page instead of swapping the error into the name form.
 
 With clipboard completion deliberately delayed for the second link, cancel the first link before clipboard work settles. The second link stays usable, and delayed clipboard success or failure must not overwrite **Link canceled.** Any newer management request invalidates earlier clipboard feedback when it starts, even before its HTTP response arrives.
 
-Click **Cancel all links** and confirm to clear the list and revoke all issued links, including those created before the current page was opened. The status becomes **All links canceled.** Creating a new link afterward must still copy a working URL with an empty customer name form.
+Click **Cancel all links** and confirm to revoke all active links, including those created before the current page was opened. The status becomes **All links canceled.** and every row shows **Canceled** with its saved name. Creating a new link afterward must still copy a working URL with an empty customer name form.
 
-This development control permanently deletes the current link registry, including submitted names, through GORM. The permission to perform an unfiltered delete is scoped to this one operation; other database operations retain GORM's global-delete guard. Repeating cancellation on an empty registry is safe. Cancellation is not a lifetime or expiration setting.
+Cancellation never deletes rows or submitted names; remove unwanted rows directly in PostgreSQL. Repeating cancellation is safe. Cancellation is not a lifetime or expiration setting.
+
+### Testing expiry
+
+Open **Settings**, move the slider to 3 days with the mouse or arrow keys, and **Save**: the page shows **Saved.** and who changed it. Create a link: its row says it expires 3 days after creation, while older rows keep their original expiry. To see the cutoff without waiting, set a link's `expires_at` to the past in PostgreSQL while its customer page is open, then edit the name and click outside the box: the page switches to the 404 page, and management shows **Expired** with the name saved before the cutoff.
 
 ## Verification
 
@@ -210,7 +225,7 @@ go vet -tags=integration ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 ```
 
-Each integration test creates its own PostgreSQL schema/pool and drops only that schema afterward. Tests guard encrypted URL recovery, corruption/wrong-key rejection, legacy migration, token boundaries, name isolation, cancellation, and GORM's global-delete guard. Authentication checks cover credential failure, rate limiting, token rotation, persistence/expiry, password/revocation/removal invalidation, and username recreation. Real management handlers verify authorization/CSRF boundaries and shared, reloadable lists.
+Each integration test creates its own PostgreSQL schema/pool and drops only that schema afterward. Tests guard that no stored column contains a usable token, that migration drops the old recoverable-token column and backfills submissions and expiries only once, token boundaries, status progression, that autosave survives reload without finishing the form, that a submitted form is locked, that expired links stop working even mid-form while keeping saved data, name isolation, that cancellation revokes access while keeping submitted data, and that every create/cancel records its account and anonymous ones are refused. Settings checks cover the default, the 2–14 day range in the store and the database, and the single settings row. Authentication checks cover credential failure, rate limiting, token rotation, persistence/expiry, password/revocation/removal invalidation, username recreation, and that sign-out ends only that browser's session on the server. Real management handlers verify authorization/CSRF boundaries, show-once URLs, shared statuses, audit names from each session, and that the slider changes only new links.
 
 These checks do not prove randomness statistically. Cryptographic randomness comes from the standard library's OS-backed generator, not from a finite collision test.
 
@@ -220,7 +235,7 @@ These checks do not prove randomness statistically. Cryptographic randomness com
 
 Management enters a customer's phone number and generates an invoice link. Link lifetime is configured separately on the **management settings page**, so it does not need to be entered for every generation.
 
-Settings must persist in PostgreSQL. Each issued link has an explicit expiration timestamp. The initial lifetime, allowed duration range, and effect of later setting changes on already-issued links remain undecided.
+Settings persist in PostgreSQL. The lifetime slider runs from 2 to 14 days in one-day steps, defaulting to 7. Each issued link has an explicit expiration timestamp fixed at creation, so later setting changes affect only new links.
 
 ### Customers, invoices, and links
 
@@ -245,10 +260,9 @@ Multiple links can be active at the same time. Different customers have separate
 
 ### Expiration and the customer flow
 
-- Check expiration server-side on initial entry, using an absolute expiration instant, not the browser's clock. PostgreSQL expiration fields use `timestamptz`.
-- An expired link returns a customer-facing **This link has expired.** dead end with HTTP 410. An unknown link returns HTTP 404.
-- Expiration must not interrupt a customer already moving from form to form.
-- Reloading or re-entering through an expired link shows the expired-link page; automatic renewal or recovery is not required for this scope. The customer can contact the company.
+- Check expiration server-side using an absolute expiration instant, not the browser's clock. PostgreSQL expiration fields use `timestamptz`.
+- An expired link shows the same customer-facing 404 page as an unknown or canceled link.
+- Expiration is a hard cutoff: it applies to every request, including a customer already moving from form to form. Reloading or re-entering through an expired link shows the 404 page; automatic renewal or recovery is not required for this scope. The customer can contact the company.
 - Expiration does not delete customer information already saved.
 - Correct expiration does not depend on a background deletion job.
 
@@ -280,8 +294,8 @@ Provider webhooks may be appropriate for payment confirmation later. That is sep
 
 ## Implementation approach
 
-The current slice implements link issuance, validation, cancellation, and link-scoped name capture. Subsequent changes should remain small enough for line-by-line review for correctness, security, readability, and maintainability.
+The current slice implements link issuance, validation, cancellation, and link-scoped name capture with autosave. Subsequent changes should remain small enough for line-by-line review for correctness, security, readability, and maintainability.
 
 Implement complete, runnable slices rather than disconnected handlers or pretend functionality. Add database constraints and focused regression checks for critical contracts as the relevant behavior is implemented, including customer isolation, expiration boundaries, invoice reuse, and concurrent payment attempts.
 
-The broader paper design remains deferred. Invoice contents and amounts, remaining customer form fields, payment-provider integration, customer verification, and the unresolved customer-link lifetime and reissue policies must be clarified before implementing those respective behaviors.
+The broader paper design remains deferred. Invoice contents and amounts, remaining customer form fields, payment-provider integration, customer verification, and the unresolved link-reissue policy must be clarified before implementing those respective behaviors.

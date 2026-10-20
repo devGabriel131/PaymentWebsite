@@ -19,13 +19,23 @@
 </html>
 
 {{define "name-form"}}
+{{if .Submitted}}
+<p role="status">Thanks, {{.Name}}. Your name has been saved.</p>
+{{else}}
+{{/* hx-disinherit keeps the form's swap and disabling off the autosaving input. */}}
 <form action="{{.Path}}" method="post" hx-post="{{.Path}}" hx-target="this"
-  hx-swap="outerHTML" hx-disabled-elt="button">
+  hx-swap="outerHTML" hx-disabled-elt="button" hx-disinherit="*">
   <label for="name">Name</label>
   <input id="name" name="name" type="text" autocomplete="name" required value="{{.Name}}"
+    hx-post="{{.Path}}/draft" hx-trigger="change" hx-sync="this:queue last"
+    hx-target="#save-status" hx-swap="innerHTML"
+    hx-on::send-error="document.getElementById('save-status').textContent = 'Not saved. Check your connection.'"
     {{if .Error}}aria-invalid="true" aria-describedby="name-error"{{end}}>
   {{if .Error}}<p id="name-error" role="alert">{{.Error}}</p>{{end}}
-  <button type="submit">Save name</button>
-  {{if .Saved}}<p role="status">Thanks, {{.Name}}. Your name has been saved.</p>{{end}}
+  <p id="save-status" role="status"></p>
+  <button type="submit">Submit</button>
 </form>
 {{end}}
+{{end}}
+
+{{define "save-status"}}{{with .Error}}Not saved. {{.}}{{else}}Saved.{{end}}{{end}}

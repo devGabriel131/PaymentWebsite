@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Settings</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="management">
+  <a class="management-skip-link" href="#main-content">Skip to content</a>
+  {{template "header" .Staff}}
+  <main id="main-content" class="management-links management-settings">
+    <h1>Settings</h1>
+    <form method="post" action="/management/settings" oninput="lifetime_days.value = lifetime.value">
+      <label for="lifetime">Customer links expire after</label>
+      <div class="management-slider">
+        <input id="lifetime" name="lifetime" type="range" min="{{.Min}}" max="{{.Max}}" step="1"
+          value="{{.Current.LinkLifetimeDays}}" aria-describedby="lifetime-scope{{if .Error}} lifetime-error{{end}}"
+          {{if .Error}}aria-invalid="true"{{end}}>
+        <span><output name="lifetime_days" for="lifetime">{{.Current.LinkLifetimeDays}}</output> days</span>
+      </div>
+      <p id="lifetime-scope">Applies to links created from now on. Links already sent keep their expiry date.</p>
+      {{if .Error}}<p id="lifetime-error" role="alert">{{.Error}}</p>{{end}}
+      <button type="submit">Save</button>
+    </form>
+    <p role="status">{{.Notice}}</p>
+    {{with .Current.UpdatedBy}}<p>Last changed by {{.}} on {{$.Current.UpdatedAt.UTC.Format "Jan 2, 2006 15:04 UTC"}}.</p>{{end}}
+    <p><a href="/management/">Back to links</a></p>
+  </main>
+</body>
+</html>

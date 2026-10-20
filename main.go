@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"embed"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -21,6 +20,7 @@ import (
 	"paymentwebsite/internal/customer"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/management"
+	"paymentwebsite/internal/settings"
 )
 
 //go:embed static/styles.css static/logo.png static/management.js
@@ -70,18 +70,17 @@ func run() error {
 	if err := sqlDB.PingContext(ctx); err != nil {
 		return fmt.Errorf("connect to PostgreSQL: %w", err)
 	}
-	if err := db.WithContext(ctx).AutoMigrate(&links.Link{}, &auth.User{}, &auth.Session{}); err != nil {
+	if err := db.WithContext(ctx).AutoMigrate(&auth.User{}, &auth.Session{}, &settings.Settings{}); err != nil {
 		return fmt.Errorf("migrate database: %w", err)
+	}
+	if err := links.Migrate(db.WithContext(ctx)); err != nil {
+		return fmt.Errorf("migrate links: %w", err)
 	}
 
 	if len(args) > 0 {
 		return auth.RunCLI(context.Background(), db, args[1:])
 	}
 
-	key, err := base64.StdEncoding.DecodeString(os.Getenv("LINK_ENCRYPTION_KEY"))
-	if err != nil || len(key) != 32 {
-		return errors.New("LINK_ENCRYPTION_KEY must be a base64-encoded 32-byte key; generate once with openssl rand -base64 32")
-	}
 	secureCookies := true
 	if value, ok := os.LookupEnv("SESSION_COOKIE_SECURE"); ok {
 		secureCookies, err = strconv.ParseBool(value)
@@ -89,10 +88,7 @@ func run() error {
 			return errors.New("SESSION_COOKIE_SECURE must be true or false")
 		}
 	}
-	store, err := links.New(db, key)
-	if err != nil {
-		return fmt.Errorf("initialize link encryption: %w", err)
-	}
+	store := links.New(db)
 	sessionStore := postgresstore.New(sqlDB)
 	defer sessionStore.StopCleanup()
 	sessions := scs.New()
@@ -117,7 +113,7 @@ func run() error {
 	})
 	authentication.RegisterRoutes(mux)
 	managementMux := http.NewServeMux()
-	if err := management.RegisterRoutes(managementMux, store); err != nil {
+	if err := management.RegisterRoutes(managementMux, store, settings.New(db), auth.Staff); err != nil {
 		return fmt.Errorf("register management routes: %w", err)
 	}
 	mux.Handle("/management/", authentication.Require(managementMux))
@@ -125,7 +121,7 @@ func run() error {
 		return fmt.Errorf("register customer routes: %w", err)
 	}
 
-	addr := "127.0.0.1:8080"
+	addr := "127.0.0.1:3000"
 	if port := os.Getenv("PORT"); port != "" {
 		addr = ":" + port
 	}

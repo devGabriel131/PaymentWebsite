@@ -25,6 +25,7 @@ a {
 
 .management-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
@@ -47,7 +48,18 @@ a {
   height: auto;
 }
 
-.management-settings,
+.management-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-left: auto;
+  color: var(--brand-ink);
+}
+
+.management-header-actions a,
+.management-header-actions button,
 .management-menu button,
 .management-links button {
   padding: 0.5rem 1rem;
@@ -57,6 +69,14 @@ a {
   color: var(--brand-ink);
   cursor: pointer;
   touch-action: manipulation;
+}
+
+.management-header-actions a {
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  min-height: 44px;
+  text-decoration: none;
 }
 
 .management-menu {
@@ -71,13 +91,15 @@ a {
   font-weight: 600;
 }
 
-.management-settings:hover,
+.management-header-actions a:hover,
+.management-header-actions button:hover,
 .management-menu button:hover,
 .management-links button:hover {
   background: var(--brand-border);
 }
 
-.management-settings:focus-visible,
+.management-header-actions a:focus-visible,
+.management-header-actions button:focus-visible,
 .management-menu button:focus-visible,
 .management-links button:focus-visible,
 .management-login input:focus-visible,
@@ -122,7 +144,8 @@ a {
 }
 
 .management-create button,
-.management-login button {
+.management-login button,
+.management-settings button {
   border-color: var(--brand-ink);
   background: var(--brand-ink);
   color: #ffffff;
@@ -130,7 +153,8 @@ a {
 }
 
 .management-create button:hover,
-.management-login button:hover {
+.management-login button:hover,
+.management-settings button:hover {
   background: #18353a;
 }
 
@@ -159,6 +183,11 @@ a {
   color: var(--brand-ink);
 }
 
+.management-link-meta {
+  color: var(--brand-ink);
+  font-size: 0.875rem;
+}
+
 .management-cancel-all {
   margin-top: 1rem;
   padding-top: 1rem;
@@ -182,16 +211,19 @@ a {
   }
 }
 
-.management-login {
+.management-login,
+.management-settings {
   max-width: 28rem;
 }
 
-.management-login form {
+.management-login form,
+.management-settings form {
   display: grid;
   gap: 0.5rem;
 }
 
-.management-login label {
+.management-login label,
+.management-settings label {
   color: var(--brand-ink);
   font-weight: 600;
 }
@@ -204,8 +236,26 @@ a {
   border-radius: 0.5rem;
 }
 
-.management-login button {
+.management-login button,
+.management-settings button {
   margin-top: 0.5rem;
+}
+
+.management-slider {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  color: var(--brand-ink);
+}
+
+.management-slider input {
+  flex: 1;
+  min-height: 44px;
+  accent-color: var(--brand-ink);
+}
+
+.management-slider output {
+  font-weight: 600;
 }
 
 .customer main {
@@ -232,7 +282,8 @@ a {
 }
 
 .customer [role="alert"],
-.management-login [role="alert"] {
+.management-login [role="alert"],
+.management-settings [role="alert"] {
   color: #b91c1c;
 }
 

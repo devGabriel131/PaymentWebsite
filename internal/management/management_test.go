@@ -3,10 +3,8 @@
 package management
 
 import (
-	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
+	"fmt"
 	"io"
 	"maps"
 	"net/http"
@@ -25,13 +23,14 @@ import (
 
 	"paymentwebsite/internal/auth"
 	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/testdb"
 )
 
-var (
-	testKey = bytes.Repeat([]byte{1}, 32)
-	htmx    = http.Header{"Hx-Request": {"true"}}
-)
+var htmx = http.Header{"Hx-Request": {"true"}}
+
+// later keeps directly created test links usable for any test's duration.
+var later = time.Now().Add(time.Hour)
 
 type app struct {
 	url   string
@@ -43,11 +42,8 @@ type app struct {
 // whole management subtree behind Require, inside origin and session middleware.
 func newApp(t *testing.T) *app {
 	t.Helper()
-	db := testdb.Open(t, &auth.User{}, &auth.Session{}, &links.Link{})
-	store, err := links.New(db, testKey)
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := testdb.Open(t, &auth.User{}, &auth.Session{}, &links.Link{}, &settings.Settings{})
+	store := links.New(db)
 	sqlDB, err := db.DB()
 	if err != nil {
 		t.Fatal(err)
@@ -59,7 +55,7 @@ func newApp(t *testing.T) *app {
 		t.Fatal(err)
 	}
 	child := http.NewServeMux()
-	if err := RegisterRoutes(child, store); err != nil {
+	if err := RegisterRoutes(child, store, settings.New(db), auth.Staff); err != nil {
 		t.Fatal(err)
 	}
 	root := http.NewServeMux()
@@ -131,15 +127,35 @@ func (a *app) list(t *testing.T) []links.Entry {
 	return entries
 }
 
+// requireRegistry compares what List can return: never a token, and creation
+// times differ in precision from Create's.
 func (a *app) requireRegistry(t *testing.T, want ...links.Entry) {
 	t.Helper()
-	if got := a.list(t); !slices.Equal(got, want) {
+	listed := func(entries []links.Entry) []links.Entry {
+		out := make([]links.Entry, len(entries))
+		for i, e := range entries {
+			out[i] = links.Entry{ID: e.ID, Name: e.Name, Status: e.Status, CreatedBy: e.CreatedBy, CanceledBy: e.CanceledBy}
+		}
+		return out
+	}
+	if got := a.list(t); !slices.Equal(listed(got), listed(want)) {
 		t.Fatalf("registry = %+v, want %+v", got, want)
 	}
 }
 
 func writePaths(id string) []string {
-	return []string{"/management/links", "/management/links/" + id + "/cancel", "/management/links/cancel"}
+	return []string{"/management/links", "/management/links/" + id + "/cancel", "/management/links/cancel", "/management/settings"}
+}
+
+// createdToken returns the one customer URL token a creating response shows.
+func createdToken(t *testing.T, body string) string {
+	t.Helper()
+	if strings.Count(body, `href="/customer/`) != 1 {
+		t.Fatalf("creating response must show exactly one customer URL: %s", body)
+	}
+	_, rest, _ := strings.Cut(body, `href="/customer/`)
+	token, _, _ := strings.Cut(rest, `"`)
+	return token
 }
 
 // requirePage checks a full page lists exactly want, in order, plus notice.
@@ -155,8 +171,9 @@ func requirePage(t *testing.T, res *http.Response, body, notice string, want []l
 	requireRows(t, body[start:end], want)
 }
 
-// requireRows checks rendered rows match want, in order, and that legacy rows
-// never get a fabricated URL or copy control.
+// requireRows checks rendered rows match want, in order: status, name, audit
+// names, and expiry are shown, only an entry's creating response shows its
+// URL, and only usable links offer a cancel control.
 func requireRows(t *testing.T, html string, want []links.Entry) {
 	t.Helper()
 	rows := strings.Split(html, `<li class="management-link">`)[1:]
@@ -165,10 +182,20 @@ func requireRows(t *testing.T, html string, want []links.Entry) {
 	}
 	for i, entry := range want {
 		row := rows[i]
-		ok := strings.Contains(row, `action="/management/links/`+entry.ID+`/cancel"`) && strings.Contains(row, entry.Name)
+		ok := strings.Contains(row, string(entry.Status)) && strings.Contains(row, entry.Name)
+		cancelable := strings.Contains(row, `action="/management/links/`+entry.ID+`/cancel"`)
+		ok = ok && cancelable == entry.Cancelable()
+		if entry.Status != links.Canceled {
+			expiry := " · expired"
+			if entry.Cancelable() {
+				expiry = " · expires"
+			}
+			ok = ok && strings.Contains(row, expiry)
+		}
+		ok = ok && strings.Contains(row, "</time> by "+entry.CreatedBy) == (entry.CreatedBy != "")
+		ok = ok && strings.Contains(row, "canceled by "+entry.CanceledBy) == (entry.CanceledBy != "")
 		if entry.Token == "" {
-			ok = ok && strings.Contains(row, "Original URL unavailable for this existing link.") &&
-				!strings.Contains(row, "<a ") && !strings.Contains(row, "data-copy-link")
+			ok = ok && !strings.Contains(row, "<a ") && !strings.Contains(row, "data-copy-link")
 		} else {
 			ok = ok && strings.Contains(row, `href="/customer/`+entry.Token+`"`) && strings.Contains(row, "data-copy-link")
 		}
@@ -180,7 +207,7 @@ func requireRows(t *testing.T, html string, want []links.Entry) {
 
 func TestUnauthorizedRequestsCannotUseManagement(t *testing.T) {
 	a := newApp(t)
-	existing, err := a.store.Create(t.Context())
+	existing, err := a.store.Create(t.Context(), "seed", later)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +264,7 @@ func TestUnauthorizedRequestsCannotUseManagement(t *testing.T) {
 
 func TestCrossOriginWritesAreRejected(t *testing.T) {
 	a := newApp(t)
-	existing, err := a.store.Create(t.Context())
+	existing, err := a.store.Create(t.Context(), "seed", later)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,87 +297,171 @@ func TestCrossOriginWritesAreRejected(t *testing.T) {
 	}
 }
 
-func TestStaffShareLinkList(t *testing.T) {
+func TestStaffShareLinkStatuses(t *testing.T) {
 	a := newApp(t)
-	digest := sha256.Sum256([]byte("link issued before encrypted recovery"))
-	if err := a.db.WithContext(t.Context()).Create(&links.Link{TokenHash: digest[:], Name: "Legacy customer"}).Error; err != nil {
-		t.Fatal(err)
-	}
-	legacy := links.Entry{ID: hex.EncodeToString(digest[:]), Name: "Legacy customer"}
+	ctx := t.Context()
 	admin := a.signIn(t, "admin")
 	worker := a.signIn(t, "worker")
 
 	res, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmx)
-	entries := a.list(t)
-	if len(entries) != 2 || entries[0] != legacy {
-		t.Fatalf("registry after HTMX create = %+v", entries)
-	}
 	if res.StatusCode != http.StatusOK || strings.Contains(body, "<!doctype html>") ||
 		!strings.Contains(body, `hx-swap-oob="innerHTML">Link created.</p>`) {
-		t.Fatalf("HTMX create: status = %d, want status fragment: %s", res.StatusCode, body)
+		t.Fatalf("HTMX create: status = %d, want row fragment: %s", res.StatusCode, body)
 	}
-	requireRows(t, body, entries[1:]) // Only the appended row, never the whole list.
+	firstToken := createdToken(t, body)
+	created := a.list(t)
+	created[0].Token = firstToken
+	requireRows(t, body, created) // Only the appended row, never the whole list.
 
 	res, body = a.send(t, admin, http.MethodPost, "/management/links", nil, nil)
-	previous, entries := entries, a.list(t)
-	if len(entries) != 3 || !slices.Equal(entries[:2], previous) {
-		t.Fatalf("ordinary create did not append: %+v", entries)
+	secondToken := createdToken(t, body)
+	created = a.list(t)
+	if len(created) != 2 {
+		t.Fatalf("ordinary create left %d links, want 2", len(created))
 	}
-	requirePage(t, res, body, "Link created.", entries)
+	created[1].Token = secondToken // The first row's URL is gone after its creating response.
+	requirePage(t, res, body, "Link created.", created)
 
+	// Customers progress through their own links.
+	if saved, err := a.store.Submit(ctx, firstToken, "Ana Pérez"); err != nil || !saved {
+		t.Fatalf("save name: saved=%v, err=%v", saved, err)
+	}
+	if link, err := a.store.Open(ctx, secondToken); err != nil || link == nil {
+		t.Fatalf("open link: link=%v, err=%v", link, err)
+	}
+	entries := a.list(t)
+	if entries[0].Status != links.Finished || entries[1].Status != links.Opened {
+		t.Fatalf("statuses = %q, %q; want Finished, Opened", entries[0].Status, entries[1].Status)
+	}
 	for name, browser := range map[string]*http.Client{"admin": admin, "worker": worker} {
 		t.Run(name+" fresh page", func(t *testing.T) {
 			res, body := a.send(t, browser, http.MethodGet, "/management/", nil, nil)
 			requirePage(t, res, body, "", entries)
+			if !strings.Contains(body, "<span>"+name+"</span>") || !strings.Contains(body, `action="/management/logout"`) {
+				t.Errorf("header must show %s and a sign-out form: %s", name, body)
+			}
 		})
 	}
 
-	res, body = a.send(t, worker, http.MethodPost, "/management/links/"+entries[1].ID+"/cancel", nil, nil)
-	requirePage(t, res, body, "Link canceled.", []links.Entry{legacy, entries[2]})
-
-	res, body = a.send(t, admin, http.MethodPost, "/management/links/"+legacy.ID+"/cancel", nil, htmx)
-	if res.StatusCode != http.StatusOK || strings.Contains(body, "<li") ||
-		!strings.Contains(body, `hx-swap-oob="innerHTML">Link canceled.</p>`) {
-		t.Fatalf("HTMX cancel: status = %d, want status-only fragment: %s", res.StatusCode, body)
+	res, body = a.send(t, worker, http.MethodPost, "/management/links/"+entries[0].ID+"/cancel", nil, nil)
+	entries = a.list(t)
+	if entries[0].Status != links.Canceled || entries[0].Name != "Ana Pérez" || entries[1].Status != links.Opened {
+		t.Fatalf("cancel one: registry = %+v", entries)
 	}
-	a.requireRegistry(t, entries[2])
+	requirePage(t, res, body, "Link canceled.", entries)
 
+	// An HTMX cancel refreshes every row, not just the canceled one.
+	res, body = a.send(t, admin, http.MethodPost, "/management/links/"+entries[1].ID+"/cancel", nil, htmx)
+	if res.StatusCode != http.StatusOK || strings.Contains(body, "<!doctype html>") ||
+		!strings.Contains(body, `hx-swap-oob="innerHTML">Link canceled.</p>`) {
+		t.Fatalf("HTMX cancel: status = %d, want registry fragment: %s", res.StatusCode, body)
+	}
+	entries = a.list(t)
+	requireRows(t, body, entries)
+
+	if res, body := a.send(t, worker, http.MethodPost, "/management/links", nil, htmx); res.StatusCode != http.StatusOK {
+		t.Fatalf("worker create: status = %d: %s", res.StatusCode, body)
+	}
 	res, body = a.send(t, worker, http.MethodPost, "/management/links/cancel", nil, nil)
-	requirePage(t, res, body, "All links canceled.", nil)
-	a.requireRegistry(t)
+	entries = a.list(t)
+	for _, entry := range entries {
+		if entry.Status != links.Canceled {
+			t.Fatalf("cancel all left %+v", entry)
+		}
+	}
+	if len(entries) != 3 || entries[0].Name != "Ana Pérez" {
+		t.Fatalf("cancel all must keep submitted data: %+v", entries)
+	}
+	requirePage(t, res, body, "All links canceled.", entries)
+
+	// Each action records the session's account, and cancel all keeps earlier cancelers.
+	for i, want := range []struct{ createdBy, canceledBy string }{
+		{"admin", "worker"},
+		{"admin", "admin"},
+		{"worker", "worker"},
+	} {
+		if entries[i].CreatedBy != want.createdBy || entries[i].CanceledBy != want.canceledBy {
+			t.Errorf("link %d: created by %q, canceled by %q; want %q, %q",
+				i, entries[i].CreatedBy, entries[i].CanceledBy, want.createdBy, want.canceledBy)
+		}
+	}
 }
 
 func TestListFailureIsServerError(t *testing.T) {
 	db := testdb.Open(t, &links.Link{})
-	issuer, err := links.New(db, testKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := issuer.Create(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	// Under another key the saved URL fails authentication, so List fails as a whole.
-	wrongKey, err := links.New(db, bytes.Repeat([]byte{2}, 32))
-	if err != nil {
+	failed := db.WithContext(t.Context()).Begin()
+	if err := failed.Rollback().Error; err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	if err := RegisterRoutes(mux, wrongKey); err != nil {
+	if err := RegisterRoutes(mux, links.New(failed), settings.New(failed), auth.Staff); err != nil {
 		t.Fatal(err)
 	}
 
-	requests := []struct{ name, method, path string }{
-		{"page", http.MethodGet, "/management/"},
-		{"ordinary create", http.MethodPost, "/management/links"},
-		{"ordinary cancel", http.MethodPost, "/management/links/" + strings.Repeat("0", 64) + "/cancel"},
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/management/", nil))
+	if w.Code != http.StatusInternalServerError || strings.Contains(w.Body.String(), "generated-links") {
+		t.Fatalf("status = %d, want 500 without a link list: %s", w.Code, w.Body.String())
 	}
-	for _, tc := range requests {
-		t.Run(tc.name, func(t *testing.T) {
-			w := httptest.NewRecorder()
-			mux.ServeHTTP(w, httptest.NewRequest(tc.method, tc.path, nil))
-			if w.Code != http.StatusInternalServerError || strings.Contains(w.Body.String(), "generated-links") {
-				t.Fatalf("status = %d, want 500 without a link list: %s", w.Code, w.Body.String())
+}
+
+func TestSettingsLifetimeAppliesOnlyToNewLinks(t *testing.T) {
+	a := newApp(t)
+	admin := a.signIn(t, "admin")
+	create := func() links.Entry {
+		t.Helper()
+		if res, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmx); res.StatusCode != http.StatusOK {
+			t.Fatalf("create: status = %d: %s", res.StatusCode, body)
+		}
+		entries := a.list(t)
+		return entries[len(entries)-1]
+	}
+	requireLifetime := func(entry links.Entry, days int) {
+		t.Helper()
+		want := time.Duration(days) * 24 * time.Hour
+		if got := entry.ExpiresAt.Sub(entry.CreatedAt); (got - want).Abs() > time.Second {
+			t.Fatalf("link lifetime = %v, want %v", got, want)
+		}
+	}
+	requireSlider := func(body string, days int) {
+		t.Helper()
+		if !strings.Contains(body, `type="range" min="2" max="14" step="1"`) || !strings.Contains(body, fmt.Sprintf(`value="%d"`, days)) {
+			t.Fatalf("settings page must show a 2-14 day slider at %d: %s", days, body)
+		}
+	}
+
+	sent := create()
+	requireLifetime(sent, settings.DefaultLinkLifetimeDays)
+	res, body := a.send(t, admin, http.MethodGet, "/management/settings", nil, nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("settings page: status = %d: %s", res.StatusCode, body)
+	}
+	requireSlider(body, settings.DefaultLinkLifetimeDays)
+
+	res, body = a.send(t, admin, http.MethodPost, "/management/settings", url.Values{"lifetime": {"10"}}, nil)
+	if res.StatusCode != http.StatusSeeOther || res.Header.Get("Location") != "/management/settings?saved" {
+		t.Fatalf("save: status = %d, Location %q: %s", res.StatusCode, res.Header.Get("Location"), body)
+	}
+	_, body = a.send(t, admin, http.MethodGet, "/management/settings?saved", nil, nil)
+	requireSlider(body, 10)
+	if !strings.Contains(body, "Saved.") || !strings.Contains(body, "Last changed by admin") {
+		t.Fatalf("saved page must confirm and name who changed it: %s", body)
+	}
+
+	for _, bad := range []string{"1", "15", "ten", ""} {
+		t.Run("rejects "+bad, func(t *testing.T) {
+			res, body := a.send(t, admin, http.MethodPost, "/management/settings", url.Values{"lifetime": {bad}}, nil)
+			if res.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(body, `role="alert"`) {
+				t.Fatalf("status = %d, want 422 with an error: %s", res.StatusCode, body)
 			}
+			requireSlider(body, 10)
 		})
+	}
+
+	requireLifetime(create(), 10)
+	if already := a.list(t)[0]; already.ID != sent.ID {
+		t.Fatalf("registry order changed: %+v", already)
+	} else {
+		requireLifetime(already, settings.DefaultLinkLifetimeDays) // Moving the slider never changes links already sent.
 	}
 }

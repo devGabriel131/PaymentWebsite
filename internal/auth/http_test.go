@@ -17,10 +17,14 @@ import (
 
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/management"
+	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/testdb"
 )
 
 const cookieName = "management_session"
+
+// later keeps the seeded link usable for any test's duration.
+var later = time.Now().Add(time.Hour)
 
 func TestSignIn(t *testing.T) {
 	t.Parallel()
@@ -121,14 +125,44 @@ func TestCredentialChangesEndSessions(t *testing.T) {
 	mustSignIn(t, app, "alice", "third password")
 }
 
-func newAuthDatabase(t *testing.T) *gorm.DB {
-	t.Helper()
-	db := testdb.Open(t, &User{}, &Session{}, &links.Link{})
-	store, err := links.New(db, make([]byte, 32))
-	if err != nil {
+func TestSignOutEndsOnlyThisBrowser(t *testing.T) {
+	t.Parallel()
+	db := newAuthDatabase(t)
+	app, manager := newApp(t, db)
+	manager.limiter = rate.NewLimiter(rate.Inf, 0)
+	if err := createUser(t.Context(), db, "alice", "first password"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Create(t.Context()); err != nil {
+	laptop := mustSignIn(t, app, "alice", "first password")
+	desktop := mustSignIn(t, app, "alice", "first password")
+
+	rec := serve(app, newRequest(t, http.MethodPost, "/management/logout"), laptop)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/management/" {
+		t.Fatalf("sign out: status %d, Location %q", rec.Code, rec.Header().Get("Location"))
+	}
+	cleared := false
+	for _, issued := range rec.Result().Cookies() {
+		cleared = cleared || issued.Name == cookieName && issued.MaxAge < 0
+	}
+	if !cleared {
+		t.Errorf("sign out did not tell the browser to drop its cookie: %v", rec.Result().Cookies())
+	}
+	// Replaying the old cookie proves the session ended on the server, not just in the browser.
+	requireSignedOut(t, app, laptop)
+	requireSignedIn(t, app, desktop)
+
+	for name, cookie := range map[string]*http.Cookie{"repeated": laptop, "signed out": nil} {
+		if rec := serve(app, newRequest(t, http.MethodPost, "/management/logout"), cookie); rec.Code != http.StatusSeeOther {
+			t.Errorf("%s sign out: status %d, want 303", name, rec.Code)
+		}
+	}
+	requireSignedIn(t, app, desktop)
+}
+
+func newAuthDatabase(t *testing.T) *gorm.DB {
+	t.Helper()
+	db := testdb.Open(t, &User{}, &Session{}, &links.Link{}, &settings.Settings{})
+	if _, err := links.New(db).Create(t.Context(), "seed", later); err != nil {
 		t.Fatal(err)
 	}
 	return db
@@ -153,12 +187,8 @@ func newApp(t *testing.T, db *gorm.DB) (http.Handler, *Manager) {
 	}
 	mux := http.NewServeMux()
 	manager.RegisterRoutes(mux)
-	store, err := links.New(db, make([]byte, 32))
-	if err != nil {
-		t.Fatal(err)
-	}
 	managementMux := http.NewServeMux()
-	if err := management.RegisterRoutes(managementMux, store); err != nil {
+	if err := management.RegisterRoutes(managementMux, links.New(db), settings.New(db), Staff); err != nil {
 		t.Fatal(err)
 	}
 	mux.Handle("/management/", manager.Require(managementMux))
@@ -214,7 +244,7 @@ func requireRejected(t *testing.T, app http.Handler, username, password string) 
 func requireSignedIn(t *testing.T, app http.Handler, cookie *http.Cookie) {
 	t.Helper()
 	rec := serve(app, newRequest(t, http.MethodGet, "/management/"), cookie)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `href="/customer/`) {
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `<li class="management-link">`) {
 		t.Fatalf("signed-in visit: status %d, body %q", rec.Code, rec.Body.String())
 	}
 	if issued := rec.Result().Cookies(); len(issued) != 0 {

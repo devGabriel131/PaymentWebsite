@@ -36,7 +36,9 @@ type Manager struct {
 	sessions  *scs.SessionManager
 	page      *template.Template
 	dummyHash string
-	// ponytail: global login limit; use per-account limits if staff concurrency grows
+	// ponytail: one limit shared by every client bounds guessing and Argon2's
+	// 64 MiB per check. Accepted risk: an outsider who keeps it spent blocks new
+	// staff sign-ins; key it per client IP if that ever happens.
 	limiter *rate.Limiter
 }
 
@@ -62,21 +64,31 @@ func New(db *gorm.DB, sessions *scs.SessionManager) (*Manager, error) {
 
 func (m *Manager) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /management/login", m.login)
+	mux.HandleFunc("POST /management/logout", m.logout)
+}
+
+type staffKey struct{}
+
+// Staff returns the username Require verified for this request, or "" for a
+// request that didn't pass through Require.
+func Staff(ctx context.Context) string {
+	username, _ := ctx.Value(staffKey{}).(string)
+	return username
 }
 
 // Require serves next only for a session whose account still exists with the
-// auth version recorded at sign-in.
+// auth version recorded at sign-in, exposing the account through Staff.
 func (m *Manager) Require(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ok, err := m.authenticated(r.Context())
+		username, err := m.authenticated(r.Context())
 		if err != nil {
 			log.Printf("check management session: %v", err)
 			http.Error(w, "Could not check your sign-in. Please try again.", http.StatusInternalServerError)
 			return
 		}
 		switch {
-		case ok:
-			next.ServeHTTP(w, r)
+		case username != "":
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), staffKey{}, username)))
 		case r.Header.Get("HX-Request") == "true":
 			// A swapped-in sign-in form would replace the link list, so send htmx to the full page.
 			w.Header().Set("HX-Redirect", "/management/")
@@ -90,19 +102,31 @@ func (m *Manager) Require(next http.Handler) http.Handler {
 	})
 }
 
-func (m *Manager) authenticated(ctx context.Context) (bool, error) {
+// authenticated returns the session's username, or "" when it is signed out.
+func (m *Manager) authenticated(ctx context.Context) (string, error) {
 	username := m.sessions.GetString(ctx, usernameKey)
 	if username == "" {
-		return false, nil
+		return "", nil
 	}
 	user, err := findUser(ctx, m.db, username)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	if user != nil && user.AuthVersion == m.sessions.GetString(ctx, versionKey) {
-		return true, nil
+		return user.Username, nil
 	}
-	return false, m.sessions.Destroy(ctx)
+	return "", m.sessions.Destroy(ctx)
+}
+
+// logout ends only this browser's session; other devices stay signed in.
+// Signed-out requests have nothing to end and are redirected the same way.
+func (m *Manager) logout(w http.ResponseWriter, r *http.Request) {
+	if err := m.sessions.Destroy(r.Context()); err != nil {
+		log.Printf("sign out: %v", err)
+		http.Error(w, "Could not sign out. Please try again.", http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/management/", http.StatusSeeOther)
 }
 
 func (m *Manager) login(w http.ResponseWriter, r *http.Request) {
