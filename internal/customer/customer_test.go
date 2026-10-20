@@ -3,13 +3,19 @@
 package customer
 
 import (
+	"bufio"
 	"html/template"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/testdb"
@@ -30,14 +36,7 @@ func TestErrorResponsesKeepNameForm(t *testing.T) {
 		t.Fatalf("save existing name: saved=%v, err=%v", saved, err)
 	}
 
-	failedTx := db.WithContext(t.Context()).Begin()
-	if failedTx.Error != nil {
-		t.Fatal(failedTx.Error)
-	}
-	if err := failedTx.Rollback().Error; err != nil {
-		t.Fatal(err)
-	}
-	failedStore := links.New(failedTx)
+	failedStore := failingStore(t, db)
 	muxes := map[bool]*http.ServeMux{}
 	for failed, s := range map[bool]*links.Store{false: store, true: failedStore} {
 		mux := http.NewServeMux()
@@ -169,7 +168,7 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 		t.Fatalf("status after locked changes = %q, want %q", got, links.Finished)
 	}
 
-	if err := store.Cancel(t.Context(), entry.ID, "staff"); err != nil {
+	if _, err := store.Cancel(t.Context(), entry.ID, "staff"); err != nil {
 		t.Fatal(err)
 	}
 	if w := send(http.MethodPost, path+"/draft", "After cancel"); w.Code != http.StatusNotFound || w.Header().Get("HX-Refresh") != "true" {
@@ -203,4 +202,211 @@ func TestExpiredLinkShowsNotFound(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestHeadChecksLinkWithoutChangingIt follows one link through its life. HEAD
+// only reports whether it opens; GET still records the customer's first visit.
+func TestHeadChecksLinkWithoutChangingIt(t *testing.T) {
+	db := testdb.Open(t, &links.Link{})
+	store := links.New(db)
+	entry, err := store.Create(t.Context(), "staff", later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := serve(t, store)
+	path := "/customer/" + entry.Token
+	client := &http.Client{Timeout: httpTimeout}
+	// send makes a request carrying a name, as a stray edit would.
+	send := func(t *testing.T, method, target string) int {
+		t.Helper()
+		r, err := http.NewRequestWithContext(t.Context(), method, server.URL+target, strings.NewReader("name=Changed"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := client.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	headKeeps(t, db, server, path, http.StatusOK)
+	if entries, err := store.List(t.Context()); err != nil || len(entries) != 1 || entries[0].Status != links.NotOpened {
+		t.Fatalf("after HEAD: entries %+v, err %v; want one %q", entries, err, links.NotOpened)
+	}
+
+	if status := send(t, http.MethodGet, path); status != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200", status)
+	}
+	if stored(t, db)[0].OpenedAt == nil {
+		t.Fatal("GET did not record the first visit")
+	}
+	headKeeps(t, db, server, path, http.StatusOK)
+
+	if saved, err := store.SaveDraft(t.Context(), entry.Token, "Ana"); err != nil || !saved {
+		t.Fatalf("save draft: saved=%v, err=%v", saved, err)
+	}
+	headKeeps(t, db, server, path, http.StatusOK)
+
+	// Autosave and the page answer no other methods, so none can edit the draft.
+	before := stored(t, db)
+	for _, tc := range []struct{ name, method, target string }{
+		{"HEAD autosave", http.MethodHead, path + "/draft"},
+		{"GET autosave", http.MethodGet, path + "/draft"},
+		{"PUT page", http.MethodPut, path},
+		{"DELETE page", http.MethodDelete, path},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if status := send(t, tc.method, tc.target); status != http.StatusMethodNotAllowed {
+				t.Errorf("status = %d, want 405", status)
+			}
+		})
+	}
+	if after := stored(t, db); !reflect.DeepEqual(after, before) {
+		t.Fatalf("unsupported methods changed stored links from %+v to %+v", before, after)
+	}
+
+	// A submitted link still opens read-only: HEAD answers 200, not the 409 that locks edits.
+	if saved, err := store.Submit(t.Context(), entry.Token, "Ana Pérez"); err != nil || !saved {
+		t.Fatalf("submit: saved=%v, err=%v", saved, err)
+	}
+	headKeeps(t, db, server, path, http.StatusOK)
+
+	// A failed lookup is a server error, never a guess about the link.
+	headKeeps(t, db, serve(t, failingStore(t, db)), path, http.StatusInternalServerError)
+}
+
+func TestHeadRejectsUnusableLinks(t *testing.T) {
+	db := testdb.Open(t, &links.Link{})
+	store := links.New(db)
+	canceled, err := store.Create(t.Context(), "staff", later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Cancel(t.Context(), canceled.ID, "staff"); err != nil {
+		t.Fatal(err)
+	}
+	expired, err := store.Create(t.Context(), "staff", time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := serve(t, store)
+	for _, tc := range []struct{ name, token string }{
+		{"unknown", strings.Repeat("A", len(canceled.Token))},
+		{"malformed", "not-a-token"},
+		{"canceled", canceled.Token},
+		{"expired", expired.Token},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			headKeeps(t, db, server, "/customer/"+tc.token, http.StatusNotFound)
+		})
+	}
+}
+
+// httpTimeout bounds each HTTP exchange, so a stuck handler fails its test.
+const httpTimeout = 10 * time.Second
+
+// serve runs the customer routes behind a real HTTP server.
+func serve(t *testing.T, store *links.Store) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	if err := RegisterRoutes(mux, store); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	return server
+}
+
+// failingStore returns a store whose every query fails: its transaction is
+// already rolled back.
+func failingStore(t *testing.T, db *gorm.DB) *links.Store {
+	t.Helper()
+	tx := db.WithContext(t.Context()).Begin()
+	if tx.Error != nil {
+		t.Fatal(tx.Error)
+	}
+	if err := tx.Rollback().Error; err != nil {
+		t.Fatal(err)
+	}
+	return links.New(tx)
+}
+
+// stored reads every link directly, never through Open, so checks record no visit.
+func stored(t *testing.T, db *gorm.DB) []links.Link {
+	t.Helper()
+	var all []links.Link
+	if err := db.WithContext(t.Context()).Order("token_hash").Find(&all).Error; err != nil {
+		t.Fatal(err)
+	}
+	return all
+}
+
+// headKeeps sends HEAD for path, plain and from HTMX, expecting want each
+// time, and fails if any stored link changed.
+func headKeeps(t *testing.T, db *gorm.DB, server *httptest.Server, path string, want int) {
+	t.Helper()
+	before := stored(t, db)
+	for _, htmx := range []bool{false, true} {
+		if got := head(t, server, path, htmx); got != want {
+			t.Fatalf("HEAD %s (htmx=%v): status = %d, want %d", path, htmx, got, want)
+		}
+	}
+	if after := stored(t, db); !reflect.DeepEqual(after, before) {
+		t.Fatalf("HEAD %s changed stored links from %+v to %+v", path, before, after)
+	}
+}
+
+// head sends one HEAD request for path, checks the customer response headers,
+// and returns the status. http.Client never reads a HEAD response body, so
+// head reads the raw connection: the request asks the server to close it after
+// replying, and any byte after the headers would be a body.
+func head(t *testing.T, server *httptest.Server, path string, htmx bool) int {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", server.Listener.Addr().String(), httpTimeout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(httpTimeout)); err != nil {
+		t.Fatal(err)
+	}
+	r, err := http.NewRequestWithContext(t.Context(), http.MethodHead, server.URL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Close = true
+	if htmx {
+		r.Header.Set("HX-Request", "true")
+	}
+	if err := r.Write(conn); err != nil {
+		t.Fatal(err)
+	}
+	wire := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(wire, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if body, err := io.ReadAll(wire); err != nil || len(body) != 0 {
+		t.Fatalf("HEAD %s (htmx=%v) sent body %q, read error %v", path, htmx, body, err)
+	}
+	refresh := ""
+	if htmx && resp.StatusCode == http.StatusNotFound {
+		refresh = "true"
+	}
+	for name, want := range map[string]string{
+		"Cache-Control":   "no-store",
+		"Referrer-Policy": "no-referrer",
+		"Vary":            "HX-Request",
+		"Content-Type":    "text/html; charset=utf-8",
+		"HX-Refresh":      refresh,
+	} {
+		if got := resp.Header.Get(name); got != want {
+			t.Errorf("HEAD %s (htmx=%v): %s = %q, want %q", path, htmx, name, got, want)
+		}
+	}
+	return resp.StatusCode
 }

@@ -156,6 +156,8 @@ func (s *Store) Create(ctx context.Context, staff string, expiresAt time.Time) (
 }
 
 // List returns every link, canceled and expired ones included, oldest first.
+// ponytail: unbounded retained history suits two staff and small mock data;
+// paginate before sustained growth.
 func (s *Store) List(ctx context.Context) ([]Entry, error) {
 	var records []Link
 	if err := s.db.WithContext(ctx).Order("created_at, token_hash").Find(&records).Error; err != nil {
@@ -168,8 +170,9 @@ func (s *Store) List(ctx context.Context) ([]Entry, error) {
 	return entries, nil
 }
 
-// Open returns the usable link for token, recording the customer's first visit.
-func (s *Store) Open(ctx context.Context, token string) (*Link, error) {
+// Lookup returns the usable link for token, submitted ones included, without
+// changing it: it records no visit. Tokens that open nothing return nil.
+func (s *Store) Lookup(ctx context.Context, token string) (*Link, error) {
 	digest, ok := tokenDigest(token)
 	if !ok {
 		return nil, nil
@@ -179,12 +182,21 @@ func (s *Store) Open(ctx context.Context, token string) (*Link, error) {
 	if result.Error != nil || result.RowsAffected == 0 {
 		return nil, result.Error
 	}
+	return &link, nil
+}
+
+// Open returns the usable link for token, recording the customer's first visit.
+func (s *Store) Open(ctx context.Context, token string) (*Link, error) {
+	link, err := s.Lookup(ctx, token)
+	if err != nil || link == nil {
+		return nil, err
+	}
 	if link.OpenedAt == nil {
-		if err := s.active(ctx, digest).Where("opened_at IS NULL").Update("opened_at", gorm.Expr("now()")).Error; err != nil {
+		if err := s.active(ctx, link.TokenHash).Where("opened_at IS NULL").Update("opened_at", gorm.Expr("now()")).Error; err != nil {
 			return nil, err
 		}
 	}
-	return &link, nil
+	return link, nil
 }
 
 // SaveDraft stores an autosaved name without finishing the form.
@@ -208,18 +220,28 @@ func (s *Store) update(ctx context.Context, token string, values map[string]any)
 	return result.RowsAffected == 1, result.Error
 }
 
-// Cancel revokes the link whose Entry.ID is id on behalf of staff. IDs that
-// cannot name a link are already satisfied, so they are no-ops like unknown or
-// canceled IDs.
-func (s *Store) Cancel(ctx context.Context, id, staff string) error {
+// Cancel revokes the link whose Entry.ID is id on behalf of staff and returns
+// it as saved, without its token. Links canceled earlier keep who canceled
+// them and when, and expired links stay expired. IDs that cannot name a link
+// are already satisfied, so like unknown IDs they return nil.
+func (s *Store) Cancel(ctx context.Context, id, staff string) (*Entry, error) {
 	if staff == "" {
-		return errNoStaff
+		return nil, errNoStaff
 	}
 	digest, err := hex.DecodeString(id)
 	if err != nil || len(digest) != sha256.Size {
-		return nil
+		return nil, nil
 	}
-	return s.active(ctx, digest).Updates(canceledBy(staff)).Error
+	if err := s.active(ctx, digest).Updates(canceledBy(staff)).Error; err != nil {
+		return nil, err
+	}
+	var link Link
+	result := s.db.WithContext(ctx).Where(&Link{TokenHash: digest}).Limit(1).Find(&link)
+	if result.Error != nil || result.RowsAffected == 0 {
+		return nil, result.Error
+	}
+	entry := link.entry()
+	return &entry, nil
 }
 
 // CancelAll revokes every usable link on behalf of staff; links canceled

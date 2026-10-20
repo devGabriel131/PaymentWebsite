@@ -33,7 +33,8 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 
 	// handle serves the page, its final submit, and (when draft) blur autosave,
 	// which responds only with save status so it never redraws fields in use.
-	// Once submitted, the form is locked and shown read-only.
+	// Once submitted, the form is locked and shown read-only. HEAD only checks
+	// that the link opens: it records no visit and validates no form.
 	handle := func(draft bool) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-store")
@@ -60,6 +61,9 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 				}
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(status)
+				if r.Method == http.MethodHead {
+					return
+				}
 				if err := page.ExecuteTemplate(w, name, data); err != nil {
 					log.Printf("render customer page: %v", err)
 				}
@@ -67,7 +71,11 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 
 			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
-			link, err := store.Open(ctx, token)
+			lookup := store.Open
+			if r.Method == http.MethodHead {
+				lookup = store.Lookup
+			}
+			link, err := lookup(ctx, token)
 			if err != nil {
 				log.Printf("look up customer link: %v", err)
 				data.Error = "Could not open this link. Please try again."
@@ -79,7 +87,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 				return
 			}
 			data.Name, data.Submitted = link.Name, link.SubmittedAt != nil
-			if r.Method == http.MethodGet {
+			if r.Method == http.MethodGet || r.Method == http.MethodHead {
 				show(http.StatusOK)
 				return
 			}

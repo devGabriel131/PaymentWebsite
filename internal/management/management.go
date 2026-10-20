@@ -19,10 +19,12 @@ import (
 var templates embed.FS
 
 type pageData struct {
-	Links   []links.Entry
-	Created links.Entry
-	Notice  string
-	Staff   string
+	Links []links.Entry
+	// Link is the row an HTMX create or cancel returns alone; a full page
+	// uses it only to retain a newly created token.
+	Link   links.Entry
+	Notice string
+	Staff  string
 }
 
 type settingsData struct {
@@ -51,16 +53,23 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, config *settings.Sto
 		}
 	}
 
-	// Full pages and cancel fragments render the whole registry so every status
-	// is fresh; an HTMX create returns only its new row. A token is never stored,
-	// so only the response that created it can show it.
+	// fragment reports whether r is an HTMX action, answered with only the
+	// rows it changed rather than a full page.
+	fragment := func(r *http.Request) bool {
+		return r.Method == http.MethodPost && r.Header.Get("HX-Request") == "true"
+	}
+
+	// Full pages and cancel-all fragments render the whole registry so every
+	// status is fresh; an HTMX create or single cancel returns only its own row,
+	// so other rows keep their one-time URLs. A token is never stored, so only
+	// the response that created it can show it.
 	render := func(ctx context.Context, w http.ResponseWriter, r *http.Request, data pageData) {
-		fragment := r.Method == http.MethodPost && r.Header.Get("HX-Request") == "true"
+		partial := fragment(r)
 		name := "index.html"
-		if fragment {
+		if partial {
 			name = "result"
 		}
-		if !fragment || data.Created.ID == "" {
+		if !partial || data.Link.ID == "" {
 			var err error
 			if data.Links, err = store.List(ctx); err != nil {
 				log.Printf("list customer links: %v", err)
@@ -68,8 +77,8 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, config *settings.Sto
 				return
 			}
 			for i := range data.Links {
-				if data.Links[i].ID == data.Created.ID {
-					data.Links[i] = data.Created
+				if data.Link.Token != "" && data.Links[i].ID == data.Link.ID {
+					data.Links[i] = data.Link
 				}
 			}
 		}
@@ -96,18 +105,27 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, config *settings.Sto
 			return
 		}
 
-		render(ctx, w, r, pageData{Created: created, Notice: "Link created."})
+		render(ctx, w, r, pageData{Link: created, Notice: "Link created."})
 	})
 	mux.HandleFunc("POST /management/links/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		if err := store.Cancel(ctx, r.PathValue("id"), staff(r.Context())); err != nil {
+		canceled, err := store.Cancel(ctx, r.PathValue("id"), staff(r.Context()))
+		if err != nil {
 			log.Printf("cancel customer link: %v", err)
 			http.Error(w, "Could not cancel this link. Please try again.", http.StatusInternalServerError)
 			return
 		}
 
-		render(ctx, w, r, pageData{Notice: "Link canceled."})
+		data := pageData{Notice: "Link canceled."}
+		if canceled != nil {
+			data.Link = *canceled
+		} else if fragment(r) {
+			// The ID names no link, so there is no row to replace.
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		render(ctx, w, r, data)
 	})
 	mux.HandleFunc("POST /management/links/cancel", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)

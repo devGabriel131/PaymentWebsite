@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"unicode/utf8"
 
 	"golang.org/x/term"
 	"gorm.io/gorm"
@@ -22,7 +23,7 @@ const Usage = `Usage:
   paymentwebsite user list               List account usernames.
 
 Usernames are 1-64 ASCII letters, digits, ".", "_" or "-" and are case-insensitive.
-Passwords are 12-1024 bytes, entered twice at a hidden terminal prompt.
+Passwords: at least 4 characters, at most 1024 bytes; entered twice at a hidden terminal prompt.
 `
 
 var errUsage = errors.New("invalid command\n\n" + Usage)
@@ -81,8 +82,9 @@ func readNewPassword() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(password) < 12 || len(password) > 1024 {
-		return "", errors.New("password must be 12-1024 bytes")
+	// Temporary development minimum; raise it before production.
+	if len(password) > 1024 || utf8.RuneCount(password) < 4 {
+		return "", errors.New("password must be at least 4 characters and at most 1024 bytes")
 	}
 	confirmation, err := promptPassword(fd, "Confirm password: ")
 	if err != nil {

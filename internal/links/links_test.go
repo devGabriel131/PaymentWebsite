@@ -100,7 +100,7 @@ func TestIssuedTokenBoundary(t *testing.T) {
 }
 
 func TestStatusFollowsCustomerProgress(t *testing.T) {
-	_, store, ctx := testStore(t)
+	db, store, ctx := testStore(t)
 	link, err := store.Create(ctx, staff, later)
 	if err != nil {
 		t.Fatal(err)
@@ -118,6 +118,13 @@ func TestStatusFollowsCustomerProgress(t *testing.T) {
 			return nil
 		}
 	}
+	lookedUp := func() error {
+		// Open's first-visit update scopes by the returned digest.
+		if found, err := store.Lookup(ctx, link.Token); err != nil || found == nil || !bytes.Equal(found.TokenHash, digestOf(link.Token)) {
+			return fmt.Errorf("lookup did not return the usable link: link=%+v, err=%v", found, err)
+		}
+		return nil
+	}
 
 	steps := []struct {
 		name   string
@@ -126,27 +133,43 @@ func TestStatusFollowsCustomerProgress(t *testing.T) {
 		saved  string
 	}{
 		{"issued", func() error { return nil }, NotOpened, ""},
+		{"looked up before opening", lookedUp, NotOpened, ""},
 		{"opened", func() error { _, err := store.Open(ctx, link.Token); return err }, Opened, ""},
 		{"reopened", func() error { _, err := store.Open(ctx, link.Token); return err }, Opened, ""},
 		{"autosaved", func() error { _, err := store.SaveDraft(ctx, link.Token, "Ana"); return err }, InProgress, "Ana"},
 		{"reopened draft", func() error { _, err := store.Open(ctx, link.Token); return err }, InProgress, "Ana"},
 		{"submitted", func() error { _, err := store.Submit(ctx, link.Token, name); return err }, Finished, name},
+		{"looked up after submit", lookedUp, Finished, name},
 		{"autosave after submit is refused", refused(store.SaveDraft), Finished, name},
 		{"second submit is refused", refused(store.Submit), Finished, name},
-		{"canceled keeps data", func() error { return store.Cancel(ctx, link.ID, staff) }, Canceled, name},
+		{"canceled keeps data", func() error { _, err := store.Cancel(ctx, link.ID, staff); return err }, Canceled, name},
 		{"canceled link cannot be reopened", func() error { _, err := store.Open(ctx, link.Token); return err }, Canceled, name},
 	}
+	// The first visit is recorded once; no later step may move it.
+	var firstVisit *time.Time
 	for _, step := range steps {
-		if err := step.act(); err != nil {
-			t.Fatalf("%s: %v", step.name, err)
-		}
-		listed := listByID(t, store, ctx)
-		got := listed[link.ID]
-		if got.Status != step.status || got.Name != step.saved || got.Token != "" {
-			t.Fatalf("%s: listed %+v, want status %q, name %q, no token", step.name, got, step.status, step.saved)
-		}
-		if listed[other.ID].Status != NotOpened {
-			t.Fatalf("%s: other link changed to %q", step.name, listed[other.ID].Status)
+		if !t.Run(step.name, func(t *testing.T) {
+			if err := step.act(); err != nil {
+				t.Fatal(err)
+			}
+			listed := listByID(t, store, ctx)
+			got := listed[link.ID]
+			if got.Status != step.status || got.Name != step.saved || got.Token != "" {
+				t.Fatalf("listed %+v, want status %q, name %q, no token", got, step.status, step.saved)
+			}
+			if listed[other.ID].Status != NotOpened {
+				t.Fatalf("other link changed to %q", listed[other.ID].Status)
+			}
+			var row Link
+			if err := db.WithContext(ctx).Where("token_hash = ?", digestOf(link.Token)).Take(&row).Error; err != nil {
+				t.Fatal(err)
+			}
+			if firstVisit != nil && (row.OpenedAt == nil || !row.OpenedAt.Equal(*firstVisit)) {
+				t.Fatalf("first visit %v changed to %v", *firstVisit, row.OpenedAt)
+			}
+			firstVisit = row.OpenedAt
+		}) {
+			return
 		}
 	}
 }
@@ -263,7 +286,7 @@ func TestCustomerNameIsolationAndRevocation(t *testing.T) {
 }
 
 func TestCancel(t *testing.T) {
-	_, store, ctx := testStore(t)
+	db, store, ctx := testStore(t)
 	var entries [2]Entry
 	for i := range entries {
 		entry, err := store.Create(ctx, staff, later)
@@ -272,25 +295,61 @@ func TestCancel(t *testing.T) {
 		}
 		entries[i] = entry
 	}
-	const name = "Still active"
-	if saved, err := store.SaveDraft(ctx, entries[1].Token, name); err != nil || !saved {
-		t.Fatalf("save other link's name: saved=%v, err=%v", saved, err)
+	const canceledName, name = "Canceled customer", "Still active"
+	for i, saved := range []string{canceledName, name} {
+		if ok, err := store.SaveDraft(ctx, entries[i].Token, saved); err != nil || !ok {
+			t.Fatalf("save link %d name: saved=%v, err=%v", i, ok, err)
+		}
 	}
 
+	t.Run("database failure returns no row", func(t *testing.T) {
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		if got, err := store.Cancel(cancelled, entries[0].ID, staff); err == nil || got != nil {
+			t.Fatalf("entry=%+v, err=%v; want an error and no row", got, err)
+		}
+	})
+
+	// The first cancellation's persisted time; repeats must not move it.
+	var canceledAt *time.Time
 	for _, tc := range []struct {
-		name string
-		id   string
+		name, id, staff string
+		found           bool
 	}{
-		{"issued link", entries[0].ID},
-		{"already canceled link", entries[0].ID},
-		{"unknown link", strings.Repeat("0", hex.EncodedLen(sha256.Size))},
-		{"malformed ID", "not-issued"},
-		{"customer token is not an ID", entries[1].Token},
-		{"SQL-like input", strings.Repeat("'", hex.EncodedLen(sha256.Size))},
+		{"issued link", entries[0].ID, "alice", true},
+		{"already canceled link keeps its audit", entries[0].ID, "bob", true},
+		{"unknown link", strings.Repeat("0", hex.EncodedLen(sha256.Size)), staff, false},
+		{"malformed ID", "not-issued", staff, false},
+		{"customer token is not an ID", entries[1].Token, staff, false},
+		{"SQL-like input", strings.Repeat("'", hex.EncodedLen(sha256.Size)), staff, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := store.Cancel(ctx, tc.id, staff); err != nil {
+			got, err := store.Cancel(ctx, tc.id, tc.staff)
+			if err != nil {
 				t.Fatal(err)
+			}
+			if !tc.found {
+				if got != nil {
+					t.Fatalf("returned %+v for an ID naming no link", got)
+				}
+				return
+			}
+			if got == nil || got.ID != entries[0].ID || got.Status != Canceled || got.Name != canceledName ||
+				got.CreatedBy != staff || got.CanceledBy != "alice" || got.Token != "" || got.Cancelable() {
+				t.Fatalf("returned %+v; want the saved row canceled by alice, without its token", got)
+			}
+			var row Link
+			if err := db.WithContext(ctx).Where("token_hash = ?", digestOf(entries[0].Token)).Take(&row).Error; err != nil {
+				t.Fatal(err)
+			}
+			if row.CanceledAt == nil {
+				t.Fatal("canceled link has no persisted cancellation time")
+			}
+			if canceledAt == nil {
+				canceledAt = row.CanceledAt
+			}
+			if !row.CanceledAt.Equal(*canceledAt) {
+				t.Fatalf("canceled_at moved from %v to %v", *canceledAt, *row.CanceledAt)
 			}
 		})
 	}
@@ -365,7 +424,7 @@ func TestAuditRecordsStaff(t *testing.T) {
 		}
 		issued[i] = entry
 	}
-	if err := store.Cancel(ctx, issued[0].ID, "bob"); err != nil {
+	if _, err := store.Cancel(ctx, issued[0].ID, "bob"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CancelAll(ctx, "alice"); err != nil {
@@ -376,8 +435,8 @@ func TestAuditRecordsStaff(t *testing.T) {
 		if _, err := store.Create(ctx, "", later); !errors.Is(err, errNoStaff) {
 			t.Errorf("Create: err = %v, want errNoStaff", err)
 		}
-		if err := store.Cancel(ctx, issued[1].ID, ""); !errors.Is(err, errNoStaff) {
-			t.Errorf("Cancel: err = %v, want errNoStaff", err)
+		if got, err := store.Cancel(ctx, issued[1].ID, ""); !errors.Is(err, errNoStaff) || got != nil {
+			t.Errorf("Cancel: entry = %+v, err = %v; want no row, errNoStaff", got, err)
 		}
 		if err := store.CancelAll(ctx, ""); !errors.Is(err, errNoStaff) {
 			t.Errorf("CancelAll: err = %v, want errNoStaff", err)
@@ -441,8 +500,10 @@ func TestExpiredLinksStopWorking(t *testing.T) {
 		})
 	}
 
-	if err := store.Cancel(ctx, midForm.ID, "bob"); err != nil {
-		t.Fatal(err)
+	// Cancel returns the expired row as saved; it never turns into Canceled.
+	if got, err := store.Cancel(ctx, midForm.ID, "bob"); err != nil || got == nil || got.ID != midForm.ID ||
+		got.Status != Expired || got.Name != "Half done" || got.CanceledBy != "" || got.Token != "" {
+		t.Fatalf("cancel expired link: entry=%+v, err=%v; want it expired with its saved name, without a token", got, err)
 	}
 	if err := store.CancelAll(ctx, "bob"); err != nil {
 		t.Fatal(err)

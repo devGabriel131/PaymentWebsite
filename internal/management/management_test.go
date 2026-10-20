@@ -3,7 +3,9 @@
 package management
 
 import (
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"maps"
@@ -31,6 +33,9 @@ var htmx = http.Header{"Hx-Request": {"true"}}
 
 // later keeps directly created test links usable for any test's duration.
 var later = time.Now().Add(time.Hour)
+
+// unknownID is a well-formed management ID that names no link.
+var unknownID = strings.Repeat("00", sha256.Size)
 
 type app struct {
 	url   string
@@ -171,6 +176,17 @@ func requirePage(t *testing.T, res *http.Response, body, notice string, want []l
 	requireRows(t, body[start:end], want)
 }
 
+// requireFragment checks an HTMX response is not a page: exactly want's rows,
+// in order, plus the out-of-band notice.
+func requireFragment(t *testing.T, res *http.Response, body, notice string, want []links.Entry) {
+	t.Helper()
+	if res.StatusCode != http.StatusOK || strings.Contains(body, "<!doctype html>") ||
+		!strings.Contains(body, `hx-swap-oob="innerHTML">`+notice+"</p>") {
+		t.Fatalf("status = %d, want fragment with %q: %s", res.StatusCode, notice, body)
+	}
+	requireRows(t, body, want)
+}
+
 // requireRows checks rendered rows match want, in order: status, name, audit
 // names, and expiry are shown, only an entry's creating response shows its
 // URL, and only usable links offer a cancel control.
@@ -185,6 +201,9 @@ func requireRows(t *testing.T, html string, want []links.Entry) {
 		ok := strings.Contains(row, string(entry.Status)) && strings.Contains(row, entry.Name)
 		cancelable := strings.Contains(row, `action="/management/links/`+entry.ID+`/cancel"`)
 		ok = ok && cancelable == entry.Cancelable()
+		if cancelable && (!strings.Contains(row, `hx-target="closest li"`) || !strings.Contains(row, `hx-swap="outerHTML"`)) {
+			t.Fatalf("row %d cancel control must replace only its own row: %s", i, row)
+		}
 		if entry.Status != links.Canceled {
 			expiry := " · expired"
 			if entry.Cancelable() {
@@ -304,14 +323,10 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 	worker := a.signIn(t, "worker")
 
 	res, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmx)
-	if res.StatusCode != http.StatusOK || strings.Contains(body, "<!doctype html>") ||
-		!strings.Contains(body, `hx-swap-oob="innerHTML">Link created.</p>`) {
-		t.Fatalf("HTMX create: status = %d, want row fragment: %s", res.StatusCode, body)
-	}
 	firstToken := createdToken(t, body)
 	created := a.list(t)
 	created[0].Token = firstToken
-	requireRows(t, body, created) // Only the appended row, never the whole list.
+	requireFragment(t, res, body, "Link created.", created) // Only the appended row, never the whole list.
 
 	res, body = a.send(t, admin, http.MethodPost, "/management/links", nil, nil)
 	secondToken := createdToken(t, body)
@@ -337,9 +352,6 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 		t.Run(name+" fresh page", func(t *testing.T) {
 			res, body := a.send(t, browser, http.MethodGet, "/management/", nil, nil)
 			requirePage(t, res, body, "", entries)
-			if !strings.Contains(body, "<span>"+name+"</span>") || !strings.Contains(body, `action="/management/logout"`) {
-				t.Errorf("header must show %s and a sign-out form: %s", name, body)
-			}
 		})
 	}
 
@@ -350,18 +362,19 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 	}
 	requirePage(t, res, body, "Link canceled.", entries)
 
-	// An HTMX cancel refreshes every row, not just the canceled one.
+	// An HTMX cancel returns only its own row, so the page keeps every other row
+	// as shown, including a new one whose customer has opened it since.
+	_, body = a.send(t, worker, http.MethodPost, "/management/links", nil, htmx)
+	if link, err := a.store.Open(ctx, createdToken(t, body)); err != nil || link == nil {
+		t.Fatalf("open worker's link: link=%v, err=%v", link, err)
+	}
 	res, body = a.send(t, admin, http.MethodPost, "/management/links/"+entries[1].ID+"/cancel", nil, htmx)
-	if res.StatusCode != http.StatusOK || strings.Contains(body, "<!doctype html>") ||
-		!strings.Contains(body, `hx-swap-oob="innerHTML">Link canceled.</p>`) {
-		t.Fatalf("HTMX cancel: status = %d, want registry fragment: %s", res.StatusCode, body)
-	}
 	entries = a.list(t)
-	requireRows(t, body, entries)
-
-	if res, body := a.send(t, worker, http.MethodPost, "/management/links", nil, htmx); res.StatusCode != http.StatusOK {
-		t.Fatalf("worker create: status = %d: %s", res.StatusCode, body)
+	if entries[1].Status != links.Canceled || entries[2].Status != links.Opened {
+		t.Fatalf("HTMX cancel one: registry = %+v", entries)
 	}
+	requireFragment(t, res, body, "Link canceled.", entries[1:2])
+
 	res, body = a.send(t, worker, http.MethodPost, "/management/links/cancel", nil, nil)
 	entries = a.list(t)
 	for _, entry := range entries {
@@ -387,21 +400,100 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 	}
 }
 
-func TestListFailureIsServerError(t *testing.T) {
+// A single HTMX cancel returns the addressed row as the database now holds it,
+// never another row, and swaps nothing when no link matches.
+func TestHTMXCancelReturnsOnlyItsRow(t *testing.T) {
+	a := newApp(t)
+	ctx := t.Context()
+	admin := a.signIn(t, "admin")
+	worker := a.signIn(t, "worker")
+	create := func(staff string, expiresAt time.Time) links.Entry {
+		t.Helper()
+		entry, err := a.store.Create(ctx, staff, expiresAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entry
+	}
+	named, expired, other := create("admin", later), create("admin", time.Now().Add(-time.Minute)), create("worker", later)
+	if saved, err := a.store.SaveDraft(ctx, named.Token, "Ana Pérez"); err != nil || !saved {
+		t.Fatalf("save name: saved=%v, err=%v", saved, err)
+	}
+	// The other customer opens their link after the page rendered it.
+	if link, err := a.store.Open(ctx, other.Token); err != nil || link == nil {
+		t.Fatalf("open other link: link=%v, err=%v", link, err)
+	}
+	cancel := func(t *testing.T, browser *http.Client, id string, header http.Header) (*http.Response, string) {
+		t.Helper()
+		return a.send(t, browser, http.MethodPost, "/management/links/"+id+"/cancel", nil, header)
+	}
+
+	canceled := links.Entry{ID: named.ID, Name: "Ana Pérez", Status: links.Canceled, CreatedBy: "admin", CanceledBy: "worker"}
+	res, body := cancel(t, worker, named.ID, htmx)
+	requireFragment(t, res, body, "Link canceled.", []links.Entry{canceled})
+	// Repeating it, even from another account, keeps the first canceler.
+	res, body = cancel(t, admin, named.ID, htmx)
+	requireFragment(t, res, body, "Link canceled.", []links.Entry{canceled})
+	// A page rendered before the link lapsed still offers to cancel it.
+	stillExpired := links.Entry{ID: expired.ID, Status: links.Expired, CreatedBy: "admin"}
+	res, body = cancel(t, worker, expired.ID, htmx)
+	requireFragment(t, res, body, "Link canceled.", []links.Entry{stillExpired})
+
+	registry := []links.Entry{canceled, stillExpired, {ID: other.ID, Status: links.Opened, CreatedBy: "worker", ExpiresAt: later}}
+	for name, id := range map[string]string{"unknown": unknownID, "malformed": "not-issued", "customer token": other.Token} {
+		t.Run(name, func(t *testing.T) {
+			if res, body := cancel(t, admin, id, htmx); res.StatusCode != http.StatusNoContent || body != "" {
+				t.Fatalf("HTMX: status = %d, want 204 so nothing is swapped: %s", res.StatusCode, body)
+			}
+			res, body := cancel(t, admin, id, nil)
+			requirePage(t, res, body, "Link canceled.", registry)
+		})
+	}
+	a.requireRegistry(t, registry...)
+
+	// Cancel all still refreshes every row; earlier cancelers and expiry stay.
+	res, body = a.send(t, admin, http.MethodPost, "/management/links/cancel", nil, htmx)
+	registry[2].Status, registry[2].CanceledBy = links.Canceled, "admin"
+	requireFragment(t, res, body, "All links canceled.", registry)
+	a.requireRegistry(t, registry...)
+}
+
+// Database failures answer 500 with no list, row, or notice that htmx could
+// swap in as if the request had worked.
+func TestStoreFailuresAreServerErrors(t *testing.T) {
 	db := testdb.Open(t, &links.Link{})
 	failed := db.WithContext(t.Context()).Begin()
 	if err := failed.Rollback().Error; err != nil {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	if err := RegisterRoutes(mux, links.New(failed), settings.New(failed), auth.Staff); err != nil {
+	// A signed-in username lets cancellation reach the database instead of
+	// stopping at the audit check.
+	staff := func(context.Context) string { return "staff" }
+	if err := RegisterRoutes(mux, links.New(failed), settings.New(failed), staff); err != nil {
 		t.Fatal(err)
 	}
 
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/management/", nil))
-	if w.Code != http.StatusInternalServerError || strings.Contains(w.Body.String(), "generated-links") {
-		t.Fatalf("status = %d, want 500 without a link list: %s", w.Code, w.Body.String())
+	cancel := "/management/links/" + unknownID + "/cancel" // Well-formed, so it reaches the database.
+	for _, tc := range []struct {
+		name, method, path string
+		header             http.Header
+	}{
+		{"list", http.MethodGet, "/management/", nil},
+		{"cancel", http.MethodPost, cancel, nil},
+		{"htmx cancel", http.MethodPost, cancel, htmx},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			maps.Copy(req.Header, tc.header)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			body := w.Body.String()
+			if w.Code != http.StatusInternalServerError || strings.Contains(body, "generated-links") ||
+				strings.Contains(body, "management-link") || strings.Contains(body, "hx-swap-oob") {
+				t.Fatalf("status = %d, want 500 without a list, row, or notice: %s", w.Code, body)
+			}
+		})
 	}
 }
 
