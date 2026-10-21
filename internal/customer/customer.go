@@ -8,11 +8,10 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
-	"unicode/utf8"
 
 	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/students"
 )
 
 //go:embed templates/*.html
@@ -33,8 +32,8 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 
 	// handle serves the page, its final submit, and (when draft) blur autosave,
 	// which responds only with save status so it never redraws fields in use.
-	// Once submitted, the form is locked and shown read-only. HEAD only checks
-	// that the link opens: it records no visit and validates no form.
+	// Completion replaces the form with confirmation. GET records a visit;
+	// HEAD and POST lookup without mutating the link before any save.
 	handle := func(draft bool) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-store")
@@ -50,14 +49,14 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 					if r.Header.Get("HX-Request") == "true" {
 						w.Header().Set("HX-Refresh", "true")
 					}
-				case status == http.StatusConflict: // Locked: reload into the read-only page.
+				case status == http.StatusConflict: // Stale draft: reload into confirmation.
 					if r.Header.Get("HX-Request") == "true" {
 						w.Header().Set("HX-Refresh", "true")
 					}
 				case draft:
 					name = "save-status"
 				case r.Method == http.MethodPost && r.Header.Get("HX-Request") == "true":
-					name = "name-form"
+					name = "customer-response"
 				}
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.WriteHeader(status)
@@ -68,12 +67,20 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 					log.Printf("render customer page: %v", err)
 				}
 			}
+			showCompletion := func() {
+				data.Name, data.Submitted = "", true
+				status := http.StatusOK
+				if draft {
+					status = http.StatusConflict
+				}
+				show(status)
+			}
 
 			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
-			lookup := store.Open
-			if r.Method == http.MethodHead {
-				lookup = store.Lookup
+			lookup := store.Lookup
+			if r.Method == http.MethodGet {
+				lookup = store.Open
 			}
 			link, err := lookup(ctx, token)
 			if err != nil {
@@ -86,13 +93,16 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 				show(http.StatusNotFound)
 				return
 			}
-			data.Name, data.Submitted = link.Name, link.SubmittedAt != nil
+			data.Submitted = link.SubmittedAt != nil
+			if !data.Submitted {
+				data.Name = link.Name
+			}
 			if r.Method == http.MethodGet || r.Method == http.MethodHead {
 				show(http.StatusOK)
 				return
 			}
 			if data.Submitted {
-				show(http.StatusConflict)
+				showCompletion()
 				return
 			}
 
@@ -107,14 +117,10 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 				show(status)
 				return
 			}
-			data.Name = strings.TrimSpace(r.PostForm.Get("name"))
-			switch {
-			case !utf8.ValidString(data.Name) || strings.ContainsRune(data.Name, 0):
-				data.Error = "Enter a valid name."
-			case data.Name == "" && !draft: // Drafts mirror the box, even when cleared.
-				data.Error = "Enter your name."
-			}
-			if data.Error != "" {
+			data.Name = r.PostForm.Get("name")
+			name, err := students.ParseName(data.Name, !draft)
+			if err != nil {
+				data.Error = err.Error()
 				show(http.StatusUnprocessableEntity)
 				return
 			}
@@ -123,7 +129,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 			if draft {
 				save = store.SaveDraft
 			}
-			saved, err := save(ctx, token, data.Name)
+			saved, err := save(ctx, token, name)
 			if err != nil {
 				log.Printf("save customer name: %v", err)
 				data.Error = "Could not save your name. Please try again."
@@ -131,23 +137,25 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 				return
 			}
 			if !saved {
-				// Since Open, another tab submitted, staff canceled, or the link expired.
-				link, err = store.Open(ctx, token)
+				// Since lookup, another tab submitted, staff canceled, or the link expired.
+				link, err = store.Lookup(ctx, token)
 				switch {
 				case err != nil:
 					log.Printf("look up customer link: %v", err)
 					data.Error = "Could not save your name. Please try again."
 					show(http.StatusInternalServerError)
 				case link != nil && link.SubmittedAt != nil:
-					data.Name, data.Submitted = link.Name, true
-					show(http.StatusConflict)
+					showCompletion()
 				default:
 					show(http.StatusNotFound)
 				}
 				return
 			}
-			data.Submitted = !draft
-			show(http.StatusOK)
+			if draft {
+				show(http.StatusOK)
+			} else {
+				showCompletion()
+			}
 		}
 	}
 

@@ -15,15 +15,17 @@ import (
 	"github.com/alexedwards/scs/v2"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 
 	"paymentwebsite/internal/auth"
 	"paymentwebsite/internal/customer"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/management"
 	"paymentwebsite/internal/settings"
+	"paymentwebsite/internal/students"
 )
 
-//go:embed static/styles.css static/logo.png static/management.js
+//go:embed static
 var assets embed.FS
 
 func main() {
@@ -53,7 +55,14 @@ func run() error {
 	if dsn == "" {
 		return errors.New("DATABASE_URL is required")
 	}
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{DisableAutomaticPing: true})
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
+		DisableAutomaticPing: true,
+		Logger: logger.New(log.New(os.Stderr, "", log.LstdFlags), logger.Config{
+			SlowThreshold:        200 * time.Millisecond,
+			LogLevel:             logger.Warn,
+			ParameterizedQueries: true,
+		}),
+	})
 	if err != nil {
 		return fmt.Errorf("open PostgreSQL: %w", err)
 	}
@@ -108,12 +117,15 @@ func run() error {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /static/", http.FileServerFS(assets))
+	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFileFS(w, r, assets, "static/favicon.ico")
+	})
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/management/", http.StatusFound)
 	})
 	authentication.RegisterRoutes(mux)
 	managementMux := http.NewServeMux()
-	if err := management.RegisterRoutes(managementMux, store, settings.New(db), auth.Staff); err != nil {
+	if err := management.RegisterRoutes(managementMux, store, students.New(db), settings.New(db), auth.Staff); err != nil {
 		return fmt.Errorf("register management routes: %w", err)
 	}
 	mux.Handle("/management/", authentication.Require(managementMux))

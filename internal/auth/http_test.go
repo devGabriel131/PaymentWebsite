@@ -18,6 +18,7 @@ import (
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/management"
 	"paymentwebsite/internal/settings"
+	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
 )
 
@@ -161,7 +162,7 @@ func TestSignOutEndsOnlyThisBrowser(t *testing.T) {
 
 func newAuthDatabase(t *testing.T) *gorm.DB {
 	t.Helper()
-	db := testdb.Open(t, &User{}, &Session{}, &links.Link{}, &settings.Settings{})
+	db := testdb.Open(t, &User{}, &Session{}, &links.Link{}, &students.Student{}, &settings.Settings{})
 	if _, err := links.New(db).Create(t.Context(), "seed", later); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +189,7 @@ func newApp(t *testing.T, db *gorm.DB) (http.Handler, *Manager) {
 	mux := http.NewServeMux()
 	manager.RegisterRoutes(mux)
 	managementMux := http.NewServeMux()
-	if err := management.RegisterRoutes(managementMux, links.New(db), settings.New(db), Staff); err != nil {
+	if err := management.RegisterRoutes(managementMux, links.New(db), students.New(db), settings.New(db), Staff); err != nil {
 		t.Fatal(err)
 	}
 	mux.Handle("/management/", manager.Require(managementMux))

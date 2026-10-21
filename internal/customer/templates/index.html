@@ -3,27 +3,36 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Your name</title>
+  <title>{{if .Submitted}}Submission complete | Masterminds{{else}}Your name{{end}}</title>
+  <link rel="icon" type="image/vnd.microsoft.icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
   <meta name="htmx-config" content='{"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}'>
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js"
     integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg"
     crossorigin="anonymous" defer></script>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400..700&amp;display=swap">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body class="customer">
   <main>
-    <h1>What's your name?</h1>
-    {{template "name-form" .}}
+    {{template "customer-content" .}}
   </main>
 </body>
 </html>
 
-{{define "name-form"}}
+{{define "customer-response"}}
+{{if .Submitted}}<title>Submission complete | Masterminds</title>{{end}}
+{{template "customer-content" .}}
+{{end}}
+
+{{define "customer-content"}}
+<section id="customer-content">
 {{if .Submitted}}
-<p role="status">Thanks, {{.Name}}. Your name has been saved.</p>
+<h1>Thank you</h1>
+<p role="status">Your information has been saved.</p>
 {{else}}
+<h1>What's your name?</h1>
 {{/* hx-disinherit keeps the form's swap and disabling off the autosaving input. */}}
-<form action="{{.Path}}" method="post" hx-post="{{.Path}}" hx-target="this"
+<form action="{{.Path}}" method="post" hx-post="{{.Path}}" hx-target="#customer-content"
   hx-swap="outerHTML" hx-disabled-elt="button" hx-disinherit="*">
   <label for="name">Name</label>
   <input id="name" name="name" type="text" autocomplete="name" required value="{{.Name}}"
@@ -36,6 +45,7 @@
   <button type="submit">Submit</button>
 </form>
 {{end}}
+</section>
 {{end}}
 
 {{define "save-status"}}{{with .Error}}Not saved. {{.}}{{else}}Saved.{{end}}{{end}}

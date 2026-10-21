@@ -18,6 +18,7 @@ import (
 	"gorm.io/gorm"
 
 	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
 )
 
@@ -25,7 +26,7 @@ import (
 var later = time.Now().Add(time.Hour)
 
 func TestErrorResponsesKeepNameForm(t *testing.T) {
-	db := testdb.Open(t, &links.Link{})
+	db := testdb.Open(t, &links.Link{}, &students.Student{})
 	store := links.New(db)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -56,6 +57,9 @@ func TestErrorResponsesKeepNameForm(t *testing.T) {
 		{"malformed form", http.MethodPost, "name=%zz", http.StatusBadRequest, false},
 		{"oversized ASCII form", http.MethodPost, "name=" + strings.Repeat("a", 4100), http.StatusRequestEntityTooLarge, false},
 		{"oversized encoded Unicode form", http.MethodPost, url.Values{"name": {strings.Repeat("é", 683)}}.Encode(), http.StatusRequestEntityTooLarge, false},
+		{"blank final name", http.MethodPost, "name=+", http.StatusUnprocessableEntity, false},
+		{"NUL name", http.MethodPost, "name=A%00", http.StatusUnprocessableEntity, false},
+		{"invalid UTF-8 name", http.MethodPost, "name=%FF", http.StatusUnprocessableEntity, false},
 		{"lookup failure on submission", http.MethodPost, "name=Ada", http.StatusInternalServerError, true},
 		{"lookup failure on entry", http.MethodGet, "", http.StatusInternalServerError, true},
 	}
@@ -81,8 +85,12 @@ func TestErrorResponsesKeepNameForm(t *testing.T) {
 					!strings.Contains(body, `name="name"`) || !strings.Contains(body, `type="submit"`) {
 					t.Fatalf("error response lost the retryable name form: %s", body)
 				}
-				if !strings.Contains(body, `role="alert"`) || strings.Contains(body, "has been saved") {
-					t.Errorf("error response must show an inline error, not saved confirmation: %s", body)
+				if strings.Count(body, `<section id="customer-content">`) != 1 ||
+					!strings.Contains(body, `hx-target="#customer-content"`) || !strings.Contains(body, `hx-swap="outerHTML"`) {
+					t.Fatalf("error response lost its retryable section target: %s", body)
+				}
+				if !strings.Contains(body, `role="alert"`) {
+					t.Errorf("error response lost its inline error: %s", body)
 				}
 				wantPage := mode == "ordinary" || tc.method != http.MethodPost
 				if fullPage := strings.Contains(body, "<!doctype html>"); fullPage != wantPage {
@@ -94,7 +102,8 @@ func TestErrorResponsesKeepNameForm(t *testing.T) {
 }
 
 func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
-	store := links.New(testdb.Open(t, &links.Link{}))
+	db := testdb.Open(t, &links.Link{}, &students.Student{})
+	store := links.New(db)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
 		t.Fatal(err)
@@ -123,18 +132,18 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 	steps := []struct {
 		name, method, target, value string
 		code                        int
-		// body must appear in the response; field is the reloaded input value.
-		body, field string
-		status      links.Status
+		// field is the reloaded input value.
+		field  string
+		status links.Status
 	}{
-		{"blur saves a draft", http.MethodPost, path + "/draft", "Ana", http.StatusOK, "Saved.", "Ana", links.InProgress},
-		{"invalid draft is not saved", http.MethodPost, path + "/draft", "A\x00", http.StatusUnprocessableEntity, "Not saved.", "Ana", links.InProgress},
-		{"cleared box is mirrored", http.MethodPost, path + "/draft", " ", http.StatusOK, "Saved.", "", links.Opened},
+		{"blur saves a draft", http.MethodPost, path + "/draft", "Ana", http.StatusOK, "Ana", links.InProgress},
+		{"invalid draft is not saved", http.MethodPost, path + "/draft", "A\x00", http.StatusUnprocessableEntity, "Ana", links.InProgress},
+		{"cleared box is mirrored", http.MethodPost, path + "/draft", " ", http.StatusOK, "", links.Opened},
 	}
 	for _, step := range steps {
 		w := send(step.method, step.target, step.value)
-		if w.Code != step.code || !strings.Contains(w.Body.String(), step.body) {
-			t.Fatalf("%s: status = %d, body %q; want %d containing %q", step.name, w.Code, w.Body.String(), step.code, step.body)
+		if w.Code != step.code {
+			t.Fatalf("%s: status = %d, want %d: %s", step.name, w.Code, step.code, w.Body.String())
 		}
 		if step.target != path && strings.Contains(w.Body.String(), "<input") {
 			t.Fatalf("%s: autosave redrew the form: %s", step.name, w.Body.String())
@@ -149,21 +158,25 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 		}
 	}
 
-	// Submit finishes and locks the form; reload shows it read-only.
-	if w := send(http.MethodPost, path, "Ana Pérez"); w.Code != http.StatusOK ||
-		!strings.Contains(w.Body.String(), "Thanks, Ana Pérez") || strings.Contains(w.Body.String(), "<input") {
-		t.Fatalf("submit: status = %d, body %q; want read-only thanks", w.Code, w.Body.String())
+	if enrolled := studentRecords(t, db); len(enrolled) != 0 {
+		t.Fatalf("drafts created students: %+v", enrolled)
 	}
-	for name, target := range map[string]string{"autosave": path + "/draft", "submit": path} {
-		if w := send(http.MethodPost, target, "Changed after submit"); w.Code != http.StatusConflict || w.Header().Get("HX-Refresh") != "true" {
-			t.Fatalf("%s after submit: status = %d, HX-Refresh = %q; want 409 page refresh", name, w.Code, w.Header().Get("HX-Refresh"))
-		}
+
+	// Final submission replaces the whole question and form with confirmation.
+	w := send(http.MethodPost, path, "Ana Pérez")
+	if w.Code != http.StatusOK {
+		t.Fatalf("submit: status = %d, body %q", w.Code, w.Body.String())
+	}
+	requireCompletion(t, w.Body.String(), false, "Ana Pérez")
+	if enrolled := studentRecords(t, db); len(enrolled) != 1 || enrolled[0].Name != "Ana Pérez" {
+		t.Fatalf("submit students = %+v, want one completed answer", enrolled)
+	}
+	if w := send(http.MethodPost, path+"/draft", "Changed after submit"); w.Code != http.StatusConflict || w.Header().Get("HX-Refresh") != "true" {
+		t.Fatalf("draft after submit: status = %d, HX-Refresh = %q; want 409 page refresh", w.Code, w.Header().Get("HX-Refresh"))
 	}
 	reload := httptest.NewRecorder()
 	mux.ServeHTTP(reload, httptest.NewRequest(http.MethodGet, path, nil))
-	if body := reload.Body.String(); !strings.Contains(body, "Thanks, Ana Pérez") || strings.Contains(body, "<input") {
-		t.Fatalf("reload after submit must be read-only: %s", body)
-	}
+	requireCompletion(t, reload.Body.String(), true, "Ana Pérez")
 	if got := status(); got != links.Finished {
 		t.Fatalf("status after locked changes = %q, want %q", got, links.Finished)
 	}
@@ -171,13 +184,23 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 	if _, err := store.Cancel(t.Context(), entry.ID, "staff"); err != nil {
 		t.Fatal(err)
 	}
-	if w := send(http.MethodPost, path+"/draft", "After cancel"); w.Code != http.StatusNotFound || w.Header().Get("HX-Refresh") != "true" {
-		t.Fatalf("canceled draft: status = %d, HX-Refresh = %q; want 404 page refresh", w.Code, w.Header().Get("HX-Refresh"))
+	if w := send(http.MethodPost, path+"/draft", "After attempted cancel"); w.Code != http.StatusConflict || w.Header().Get("HX-Refresh") != "true" {
+		t.Fatalf("finished draft after cancel: status = %d, HX-Refresh = %q; want 409 page refresh", w.Code, w.Header().Get("HX-Refresh"))
+	}
+	canceled, err := store.Create(t.Context(), "staff", later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Cancel(t.Context(), canceled.ID, "staff"); err != nil {
+		t.Fatal(err)
+	}
+	if w := send(http.MethodPost, "/customer/"+canceled.Token+"/draft", "After cancel"); w.Code != http.StatusNotFound || w.Header().Get("HX-Refresh") != "true" {
+		t.Fatalf("canceled unfinished draft: status = %d, HX-Refresh = %q; want 404 page refresh", w.Code, w.Header().Get("HX-Refresh"))
 	}
 }
 
 func TestExpiredLinkShowsNotFound(t *testing.T) {
-	store := links.New(testdb.Open(t, &links.Link{}))
+	store := links.New(testdb.Open(t, &links.Link{}, &students.Student{}))
 	entry, err := store.Create(t.Context(), "staff", time.Now().Add(-time.Minute))
 	if err != nil {
 		t.Fatal(err)
@@ -204,10 +227,183 @@ func TestExpiredLinkShowsNotFound(t *testing.T) {
 	}
 }
 
+func TestSubmissionFailureRollsBackAndAllowsRetry(t *testing.T) {
+	for _, mode := range []string{"ordinary", "htmx"} {
+		t.Run(mode, func(t *testing.T) {
+			db := testdb.Open(t, &links.Link{}, &students.Student{})
+			store := links.New(db)
+			entry, err := store.Create(t.Context(), "staff", later)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if saved, err := store.SaveDraft(t.Context(), entry.Token, "Original draft"); err != nil || !saved {
+				t.Fatalf("save draft: saved=%v, err=%v", saved, err)
+			}
+			if err := db.WithContext(t.Context()).Exec("ALTER TABLE students ADD CONSTRAINT customer_submit_rejected CHECK (name <> 'Reject completion')").Error; err != nil {
+				t.Fatal(err)
+			}
+			mux := http.NewServeMux()
+			if err := RegisterRoutes(mux, store); err != nil {
+				t.Fatal(err)
+			}
+			path := "/customer/" + entry.Token
+			attempted := "  Reject completion  "
+			send := func() *httptest.ResponseRecorder {
+				r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(url.Values{"name": {attempted}}.Encode()))
+				r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				if mode == "htmx" {
+					r.Header.Set("HX-Request", "true")
+				}
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, r)
+				return w
+			}
+			before := stored(t, db)
+			w := send()
+			if w.Code != http.StatusInternalServerError {
+				t.Fatalf("rejected insert: status = %d, body %s", w.Code, w.Body.String())
+			}
+			body := w.Body.String()
+			if strings.Count(body, `<section id="customer-content">`) != 1 ||
+				!strings.Contains(body, `hx-target="#customer-content"`) || !strings.Contains(body, `hx-swap="outerHTML"`) ||
+				!strings.Contains(body, `value="`+template.HTMLEscapeString(attempted)+`"`) ||
+				!strings.Contains(body, `role="alert"`) || !strings.Contains(body, `type="submit"`) {
+				t.Fatalf("failed completion lost its retryable form or attempted name: %s", body)
+			}
+			if fullPage := strings.Contains(body, "<!doctype html>"); fullPage != (mode == "ordinary") {
+				t.Fatalf("failed completion full page = %v, mode %s", fullPage, mode)
+			}
+			if after := stored(t, db); !reflect.DeepEqual(after, before) {
+				t.Fatalf("failed student insert changed link from %+v to %+v", before, after)
+			}
+			if enrolled := studentRecords(t, db); len(enrolled) != 0 {
+				t.Fatalf("failed student insert retained students: %+v", enrolled)
+			}
+
+			if err := db.WithContext(t.Context()).Exec("ALTER TABLE students DROP CONSTRAINT customer_submit_rejected").Error; err != nil {
+				t.Fatal(err)
+			}
+			w = send()
+			if w.Code != http.StatusOK {
+				t.Fatalf("retry: status = %d, body %s", w.Code, w.Body.String())
+			}
+			requireCompletion(t, w.Body.String(), mode == "ordinary", attempted, strings.TrimSpace(attempted))
+			completed := stored(t, db)[0]
+			enrolled := studentRecords(t, db)
+			if completed.Name != strings.TrimSpace(attempted) || completed.SubmittedAt == nil ||
+				len(enrolled) != 1 || enrolled[0].Name != completed.Name ||
+				!enrolled[0].CreatedAt.Equal(*completed.SubmittedAt) ||
+				completed.ExpiresAt.Sub(*completed.SubmittedAt) != 168*time.Hour {
+				t.Fatalf("retry did not commit matching completion and student: link %+v, students %+v", completed, enrolled)
+			}
+		})
+	}
+}
+
+func TestCompletedAccessAndReplay(t *testing.T) {
+	db := testdb.Open(t, &links.Link{}, &students.Student{})
+	store := links.New(db)
+	entry, err := store.Create(t.Context(), "staff", later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const submittedName = "Submission snapshot"
+	const canonicalName = "Edited student name"
+	// Submit directly so replay must not even fill in the absent first-visit time.
+	if saved, err := store.Submit(t.Context(), entry.Token, submittedName); err != nil || !saved {
+		t.Fatalf("submit: saved=%v, err=%v", saved, err)
+	}
+	enrolled := studentRecords(t, db)
+	if len(enrolled) != 1 {
+		t.Fatalf("students = %+v, want one", enrolled)
+	}
+	if _, err := students.New(db).UpdateField(t.Context(), enrolled[0].ID, "name", canonicalName); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	if err := RegisterRoutes(mux, store); err != nil {
+		t.Fatal(err)
+	}
+	path := "/customer/" + entry.Token
+	before, studentsBefore := stored(t, db), studentRecords(t, db)
+	for _, mode := range []string{"ordinary", "htmx"} {
+		for _, tc := range []struct {
+			name, suffix, body string
+			status             int
+		}{
+			{"malformed final replay", "", "name=%zz", http.StatusOK},
+			{"oversized final replay", "", "name=" + strings.Repeat("x", 5000), http.StatusOK},
+			{"stale draft", "/draft", "name=%zz", http.StatusConflict},
+		} {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				r := httptest.NewRequest(http.MethodPost, path+tc.suffix, strings.NewReader(tc.body))
+				r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				if mode == "htmx" {
+					r.Header.Set("HX-Request", "true")
+				}
+				w := httptest.NewRecorder()
+				mux.ServeHTTP(w, r)
+				if w.Code != tc.status {
+					t.Fatalf("status = %d, want %d: %s", w.Code, tc.status, w.Body.String())
+				}
+				refresh := ""
+				if mode == "htmx" && tc.status == http.StatusConflict {
+					refresh = "true"
+				}
+				if got := w.Header().Get("HX-Refresh"); got != refresh {
+					t.Fatalf("HX-Refresh = %q, want %q", got, refresh)
+				}
+				requireCompletion(t, w.Body.String(), mode == "ordinary" || tc.status == http.StatusConflict, submittedName, canonicalName)
+				if after := stored(t, db); !reflect.DeepEqual(after, before) {
+					t.Fatalf("completed POST changed link from %+v to %+v", before, after)
+				}
+				if after := studentRecords(t, db); !reflect.DeepEqual(after, studentsBefore) {
+					t.Fatalf("completed POST changed students from %+v to %+v", studentsBefore, after)
+				}
+			})
+		}
+	}
+	for _, htmx := range []bool{false, true} {
+		r := httptest.NewRequest(http.MethodGet, path, nil)
+		if htmx {
+			r.Header.Set("HX-Request", "true")
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("completed GET (htmx=%v): status = %d", htmx, w.Code)
+		}
+		requireCompletion(t, w.Body.String(), true, submittedName, canonicalName)
+	}
+	server := serve(t, store)
+	headKeeps(t, db, server, path, http.StatusOK)
+
+	if err := db.WithContext(t.Context()).Model(&links.Link{}).Where("token_hash = ?", before[0].TokenHash).Update("expires_at", time.Now().Add(-time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ method, suffix string }{
+		{http.MethodGet, ""},
+		{http.MethodPost, ""},
+		{http.MethodPost, "/draft"},
+	} {
+		r := httptest.NewRequest(tc.method, path+tc.suffix, strings.NewReader("name=Replacement"))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expired completion %s %s: status = %d", tc.method, tc.suffix, w.Code)
+		}
+	}
+	headKeeps(t, db, server, path, http.StatusNotFound)
+	if after := studentRecords(t, db); !reflect.DeepEqual(after, studentsBefore) {
+		t.Fatalf("completion access or expiry changed retained students from %+v to %+v", studentsBefore, after)
+	}
+}
+
 // TestHeadChecksLinkWithoutChangingIt follows one link through its life. HEAD
 // only reports whether it opens; GET still records the customer's first visit.
 func TestHeadChecksLinkWithoutChangingIt(t *testing.T) {
-	db := testdb.Open(t, &links.Link{})
+	db := testdb.Open(t, &links.Link{}, &students.Student{})
 	store := links.New(db)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -279,7 +475,7 @@ func TestHeadChecksLinkWithoutChangingIt(t *testing.T) {
 }
 
 func TestHeadRejectsUnusableLinks(t *testing.T) {
-	db := testdb.Open(t, &links.Link{})
+	db := testdb.Open(t, &links.Link{}, &students.Student{})
 	store := links.New(db)
 	canceled, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -342,6 +538,34 @@ func stored(t *testing.T, db *gorm.DB) []links.Link {
 		t.Fatal(err)
 	}
 	return all
+}
+
+func studentRecords(t *testing.T, db *gorm.DB) []students.Student {
+	t.Helper()
+	all, err := students.New(db).List(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return all
+}
+
+func requireCompletion(t *testing.T, body string, fullPage bool, private ...string) {
+	t.Helper()
+	if strings.Count(body, `<section id="customer-content">`) != 1 ||
+		!strings.Contains(body, "<h1>Thank you</h1>") ||
+		!strings.Contains(body, "Your information has been saved.") ||
+		!strings.Contains(body, "<title>Submission complete | Masterminds</title>") ||
+		strings.Count(body, "<title>") != 1 {
+		t.Fatalf("completion lost its section, confirmation or single title: %s", body)
+	}
+	if got := strings.Contains(body, "<!doctype html>"); got != fullPage {
+		t.Fatalf("completion full page = %v, want %v: %s", got, fullPage, body)
+	}
+	for _, hidden := range append(private, "<input", "<form", "What's your name?") {
+		if strings.Contains(body, hidden) {
+			t.Fatalf("completion exposed %q: %s", hidden, body)
+		}
+	}
 }
 
 // headKeeps sends HEAD for path, plain and from HTMX, expecting want each

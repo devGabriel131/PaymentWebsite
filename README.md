@@ -4,21 +4,23 @@ A company payment application with separate management and customer interfaces, 
 
 ## Current status
 
-The runnable slice implements CLI-managed staff access, persistent sign-in, hash-only customer links with progress status and configurable expiry, clipboard copying, cancellation, and an autosaving customer name form that locks on submit:
+The runnable slice implements CLI-managed staff access, persistent sign-in, hash-only customer links with progress status and configurable initial expiry, clipboard copying, unfinished-link cancellation, an autosaving customer name form, and a retained, editable Students archive:
 
-- `/` redirects to `/management/`. Signed-out staff see a login form; signed-in staff see a dark workspace with **Customer links** and **Settings** navigation, their username, and **Sign out**. The shared link registry shows status badges and an empty state; navigation moves above the content on small screens. Only existing link and settings workflows are exposed.
-- **Settings** (`/management/settings`) has a slider for how long new customer links stay usable: 2–14 days in one-day steps, 7 by default. Saving records who changed it. Each link's expiry is fixed when it's created, so moving the slider never changes links already sent.
+- `/` redirects to `/management/`. Signed-out staff see a login form; signed-in staff see a dark workspace with **Customer links**, **Students**, and **Settings** at the top of the desktop sidebar, **Trash** anchored at the bottom-left even while scrolling, their username, and **Sign out**. The shared link registry is horizontally centered in the viewport, with status badges and an empty state. At widths of 960px and below, all navigation moves above the content and wraps normally.
+- **Settings** (`/management/settings`) has a slider for initial access to new, unfinished customer forms: 2–14 days in one-day steps, 7 by default. Saving records who changed it. Existing unfinished links keep their issued expiry when the slider changes. Completing a form replaces that deadline with exactly seven days of success-page access from completion.
 - Staff accounts are created through the CLI, not a registration page. Passwords use Argon2id; SCS stores sessions in PostgreSQL for a fixed 14 days. Password changes, revocation, and account removal invalidate existing sessions.
 - **Create & copy link** appends and copies a new URL. The URL is shown only in that creating response: PostgreSQL stores just its digest, so it can't be recovered later. A lost URL is replaced by creating a new link.
-- Every staff account sees the same saved list after reloads and server restarts. Rows show the customer's saved name, creation and expiry times in the viewer's time zone, and a status: **Not opened**, **Opened** (first visit recorded), **In progress** (autosaved data, not yet submitted), **Finished** (customer pressed **Submit**), **Expired** (lapsed before the customer finished), or **Canceled**. Once payments exist, **Finished** will mean a completed payment. The list shows every link ever issued, without paging: deliberate for two staff and small mock data, and it needs pagination before history grows.
-- `POST /management/links` persists the random token's digest, then returns a row fragment for HTMX or the complete list for ordinary form submissions.
-- `POST /management/links/{id}/cancel` revokes one link by its management ID; `POST /management/links/cancel` revokes every link still usable when its database update runs, so links created afterward, from any tab or account, stay active. Revocation keeps the row and submitted name visible as **Canceled**; there is no deletion UI. Expired links can't be canceled and keep showing **Expired**.
-- An HTMX single cancel replaces only its own row, showing the link as PostgreSQL now holds it: saved name, creator, and first canceler kept, and **Expired** if it lapsed. Other rows are untouched, so a newly created row keeps its URL and **Copy link**; their statuses refresh on the next reload. An unknown or malformed ID answers HTTP 204, so nothing is swapped, and a failed cancellation answers HTTP 500 without a row or success notice. Ordinary form submissions, **Cancel all**, reloads, and navigation render the complete list, which drops any one-time URLs still on screen.
+- Every staff account sees the same saved links after reloads and server restarts. **Customer links** shows **Not opened**, **Opened** (first visit recorded), **In progress** (autosaved data, not yet submitted), and **Finished** (submission committed with its student record). Finished links leave this page at 24 hours after completion, on the next load or relevant render; they never enter Trash. **Trash** (`/management/trash`) shows only **Canceled** and **Expired** unfinished links, retaining saved names and audit history without creation or cancellation controls. There is no timer, polling, or deletion job. Rows show creation, completion, and access-expiry times in the viewer's time zone.
+- **Students** (`/management/students`) immediately lists every completed submission, newest first, with its editable canonical **Name** and **Submitted** time. Each completion creates one record tied to its source link, not a deduplicated person: submitting the same name through two links creates two records. Students remains available after the source link leaves the main page or its success URL expires. Link and student history are deliberately unpaginated for two staff and small mock data; add pagination before sustained growth.
+- Open a student through its name link or row to see centered native-dialog details; the pencil edits one field, **Save** persists it and updates the table row, and **Cancel** reloads the saved field. Editing the student's canonical name never rewrites `Link.Name`, the original submission snapshot, or unlocks the customer's form. Real links and ordinary forms provide full detail/edit pages without JavaScript.
+- `POST /management/links` persists the random token's digest, then returns a row fragment for HTMX or the filtered main-page list for ordinary form submissions.
+- `POST /management/links/{id}/cancel` revokes one usable, unfinished link by its management ID; `POST /management/links/cancel` revokes every usable, unfinished link matched when its database update runs, so links created afterward, from any tab or account, stay active. Revocation moves the row to **Trash** as **Canceled**, keeping its draft and audit history; there is no deletion UI. Finished links cannot be canceled by either endpoint, even from a stale page or direct request. Expired unfinished links remain **Expired**.
+- An HTMX single cancel changes only its addressed row, removing it if canceled, expired, or already archived by the 24-hour rule. Other rows are untouched, so a newly created row keeps its URL and **Copy link**; their statuses refresh on the next reload. An unknown or malformed ID answers HTTP 204, so nothing is swapped, and a failed cancellation answers HTTP 500 without a row or success notice. Ordinary form submissions, **Cancel all unfinished links**, reloads, and navigation render the relevant filtered list, dropping any one-time URLs still on screen.
 - While a create or cancel request is in flight, the page disables its buttons, so the normal UI sends one change at a time. This is not request serialization: other tabs, other staff, and direct requests can still interleave, and each is applied on its own.
-- Each row is an audit trail: "created … by gabriel · canceled by worker". The username comes from the verified server-side session, never from form input, and the store refuses creation or cancellation without one. **Cancel all** records its canceler only on links that were still active. Links from before auditing show no names.
-- `/customer/{token}` remains public to anyone holding an issued URL. Unknown, modified, canceled, and expired tokens all return the same branded HTTP 404 page. Its name form autosaves when the customer leaves a changed box and finishes on **Submit**, which locks it: afterwards the customer sees a read-only confirmation and can't change their answers.
+- Each row is an audit trail: "created … by gabriel · canceled by worker". The username comes from the verified server-side session, never from form input, and the store refuses creation or cancellation without one. **Cancel all unfinished links** records its canceler only on usable, unfinished links it cancels.
+- `/customer/{token}` remains public to anyone holding an issued URL. Unknown, modified, canceled, and expired tokens all return the same branded HTTP 404 page. The name form autosaves when the customer leaves a changed box. **Submit** atomically commits the final name, completion timestamp, seven-day access deadline, and student record before showing **Thank you / Your information has been saved.** Completed GETs and repeated final POSTs return the same HTTP 200 success page without changing answers or deadlines; stale draft POSTs return HTTP 409. At the seven-day deadline, even a completed URL returns 404; its student record stays retained.
 
-Links are not customer- or invoice-bound yet; the name still belongs to an issued link. Full customer records, invoices, and payments remain outside this slice. Sign-in expiry does not expire customer links.
+Links are not invoice-bound or matched to a unique person yet. Students holds the canonical name for each completed submission; broader customer identity/phone records, invoices, and payments remain outside this slice. Sign-in expiry does not expire customer links.
 
 **Test/development only:** management is authenticated, but invoice and payment workflows are not implemented. Use disposable data, never real customer/payment data.
 
@@ -42,17 +44,23 @@ Keep `SESSION_COOKIE_SECURE=false` in private `.env` for local HTTP. Air loads i
 
 The database credentials in `compose.yaml` and `.env.example` are for local development only. PostgreSQL is bound to `127.0.0.1:5432`; its named volume preserves issued links between container restarts. Start the Compose service before Air if it is not already running.
 
-`DATABASE_URL` is required in both server and CLI modes. `SESSION_COOKIE_SECURE` defaults to true when unset. GORM connects and runs `AutoMigrate` for links, users, settings, and the SCS-compatible sessions table on startup. The links migration also drops the `token_ciphertext` column left by the removed encrypted URL recovery, and backfills columns it adds to existing rows, once, when each column first appears: existing named links are marked submitted, since names were only saved by submitting before autosave, and existing links expire 7 days after creation. Models define the tables and constraints; there are no versioned migration files.
+`DATABASE_URL` is required in both server and CLI modes. `SESSION_COOKIE_SECURE` defaults to true when unset. Startup migrates users, settings, and the SCS-compatible sessions table, then runs `links.Migrate` for links and students. Models define the tables and constraints; there are no versioned migration files.
+
+**One-time mock-data loss:** if the `students` table is absent, the links migration drops the existing mock `links` table, if present, then creates/migrates links and students in one transaction. All old mock URLs, drafts, and submissions are intentionally lost; users, sessions, and settings are preserved. There is no legacy submission/expiry backfill. Once `students` exists, subsequent startups only run idempotent `AutoMigrate` and preserve retained rows. If the cutover fails, the table reset and schema creation roll back together.
 
 Restart an existing Air process after changing its environment so it reloads `.env`. Keep one instance running. Without Air, export the required variables before `go run .`; the application never loads `.env` itself or silently falls back to local credentials.
 
 Use one server or Air instance at a time: they share port 3000, and Air instances also share `tmp/main`. Keep the Air dev server running and reuse it (see `AGENTS.md`).
 
-Open <http://127.0.0.1:3000/management/> and sign in using a CLI-created account. **Create & copy link** copies the same-origin URL and appends it; **Copy link** on that new row recopies it until the page reloads or **Cancel all** refreshes the list. Clipboard access requires JavaScript and HTTPS or localhost. If blocked, the new URL remains visible for manual copying; failed creation leaves the clipboard unchanged.
+Open <http://127.0.0.1:3000/management/> and sign in using a CLI-created account. **Create & copy link** copies the same-origin URL and appends it; **Copy link** on that new row recopies it until the page reloads or **Cancel all unfinished links** refreshes the list. Clipboard access requires JavaScript and HTTPS or localhost. If blocked, the new URL remains visible for manual copying; failed creation leaves the clipboard unchanged.
 
 Air watches Go, HTML, CSS, and JavaScript files. Its generated defaults do not automatically refresh the browser; refresh manually. Use `go tool air`, not a separately installed global `air` command. The existing `.air.toml` was generated with `go tool air init`.
 
-Both interfaces load the shared `static/styles.css` stylesheet from `/static/styles.css`. Customer brand colors are defined on `:root`; management has a scoped dark palette and native dark controls, including sign-in and settings, regardless of the system color preference. Customer rules use `.customer` for the name form and `.customer-not-found` for the invalid-link page. Go embeds the stylesheet, the management clipboard script (`static/management.js`), and the existing Masterminds logo (`static/logo.png`) into the binary and serves them under `/static/`, so deployment needs no separate asset directory. CSS and JavaScript edits require a rebuild, which Air handles during development.
+Both interfaces load the shared `static/styles.css` stylesheet from `/static/styles.css`. Customer brand colors are defined on `:root`; management has a scoped dark palette and native dark controls, including sign-in and settings, regardless of the system color preference. Customer rules use `.customer` for the name form and `.customer-not-found` for the invalid-link page. Go embeds the `static/` directory into the binary and serves its files under `/static/`, with the favicon also available at `/favicon.ico`, so deployment needs no separate asset directory. Embedded asset edits require a rebuild; Air handles CSS and JavaScript changes during development.
+
+Every full page declares the same favicon: `static/favicon.ico`, using the original logo's bulb/brain emblem so it stays recognizable at tab size. The ICO contains 16×16, 32×32, and 48×48 images for standard and high-density displays; the full logo is unchanged. Restart Air after regenerating the ICO so the embedded asset is rebuilt.
+
+Typography currently uses **JetBrains Mono** across both interfaces, including form controls and management branding. Each full-page template loads variable weights 400–700 from Google Fonts alongside the shared stylesheet, rather than waiting for a CSS import, with `font-display: swap`; unavailable font requests fall back to the system monospace font.
 
 No frontend build step is required. Air's generated `tmp/` directory is ignored by Git.
 
@@ -84,7 +92,7 @@ The `PaymentWebsite` service in the existing `amused-light` project deploys `dev
 Service configuration:
 
 - `DATABASE_URL=${{Postgres.DATABASE_URL}}` references the project's PostgreSQL service over Railway's private network. Local `.env` credentials are not uploaded or reused.
-- `LINK_ENCRYPTION_KEY` is no longer read. After the first deployment that drops `token_ciphertext`, delete the variable and destroy any backup of it; without the key, older database backups that still contain ciphertext can't yield URLs.
+- `LINK_ENCRYPTION_KEY` is no longer read. After the mock-link cutover removes the old table containing `token_ciphertext`, delete the variable and destroy any backup of it; without the key, older database backups that still contain ciphertext can't yield URLs.
 - `SESSION_COOKIE_SECURE=true` keeps management cookies HTTPS-only.
 - `PORT=8080` makes the application listen on all interfaces for Railway routing. Without `PORT`, local startup is bound to `127.0.0.1:3000`.
 - The health check remains `/management/`: signed-out requests receive HTTP 200 with only the login form. PostgreSQL connection and migrations must succeed before HTTP starts.
@@ -120,8 +128,11 @@ Railpack currently builds `/app/out`; account commands ship in that same binary.
 .
 ├── main.go
 ├── static/
+│   ├── favicon.ico
 │   ├── logo.png
 │   ├── management.js
+│   ├── management-time.js
+│   ├── students.js
 │   └── styles.css
 ├── internal/
 │   ├── auth/
@@ -133,9 +144,13 @@ Railpack currently builds `/app/out`; account commands ship in that same binary.
 │   ├── management/
 │   │   ├── management.go
 │   │   ├── management_test.go
+│   │   ├── students.go
+│   │   ├── students_test.go
 │   │   └── templates/
 │   │       ├── index.html
-│   │       └── settings.html
+│   │       ├── settings.html
+│   │       ├── student.html
+│   │       └── students.html
 │   ├── customer/
 │   │   ├── customer.go
 │   │   ├── customer_test.go
@@ -148,6 +163,11 @@ Railpack currently builds `/app/out`; account commands ship in that same binary.
 │   ├── settings/
 │   │   ├── settings.go
 │   │   └── settings_test.go
+│   ├── students/
+│   │   ├── students.go
+│   │   ├── students_test.go
+│   │   ├── fields.go
+│   │   └── fields_test.go
 │   └── testdb/testdb.go
 ├── migrations/.gitkeep
 ├── compose.yaml
@@ -161,24 +181,27 @@ Railpack currently builds `/app/out`; account commands ship in that same binary.
 
 - `main.go`: configuration, GORM initialization and migration, bounded connection pool, route wiring, HTTP timeouts, and native cross-origin request protection.
 - `internal/auth/`: staff credentials/CLI, embedded login form, sign-out, account-version authorization exposing the verified username (`auth.Staff`), and SCS table model.
-- `internal/management/`: registry and settings handlers and embedded templates; `main.go` injects `auth.Staff` so every write records its account.
-- `internal/customer/`: issued-link validation on entry, autosave, and submission; name validation; the submit lock; and embedded customer form and invalid-link templates.
-- `internal/links/`: random issuance, digest-only storage, expiry, customer progress status, revocation, GORM model and migration, and PostgreSQL regressions.
+- `internal/management/`: shared link registry, settings, and authenticated Students routes/templates; `students.go` builds field views and handles detail/edit fragments, while `student.html` and `students.html` share detail, field, and table-row rendering. `main.go` injects `auth.Staff` for link/settings audit attribution.
+- `internal/customer/`: issued-link validation on entry, autosave, final submission/replay, the public submit lock, and embedded customer-content/success and invalid-link templates; name parsing is shared with Students.
+- `internal/links/`: random issuance, digest-only storage, initial/completed access expiry, progress status, unfinished-only revocation, atomic finalization/enrollment, GORM model and transactional mock cutover, and PostgreSQL lifecycle regressions.
 - `internal/settings/`: the single settings row, its link-lifetime range (enforced by the store and by database checks), and who last changed it.
+- `internal/students/`: retained per-completion model/store, typed field registry and shared name validation, and field-update regressions. Reads do not filter by source-link age or expiry; updates change only one allowlisted column, never the link snapshot.
 - `static/styles.css`: shared interface styles and scoped management/customer layout, embedded and served by the Go application.
-- `static/management.js`: management-only native clipboard copying, local-time display of row times, and request-failure feedback; creation and cancellation use declarative HTMX forms.
+- `static/management.js`: link-page-only native clipboard copying and request-failure/clipboard sequencing; creation and cancellation use declarative HTMX forms.
+- `static/management-time.js`: shared local-time formatting for link/Trash rows and Students/detail pages, including HTMX-swapped content.
+- `static/students.js`: student row activation, native dialog and editor focus, and scoped HTMX validation/network-failure handling; fetching, saving, and canceling remain declarative HTMX interactions.
 - `compose.yaml`: local PostgreSQL service and persistent development volume.
 - `.env.example`: local database connection template. Air loads the private `.env` copy.
 - `internal/testdb/`: integration-only isolated PostgreSQL schemas/pools, including SCS's SQL access.
 - `migrations/`: reserved for future versioned GORM migrations. This slice uses `AutoMigrate`; its `.gitkeep` only preserves the directory in version control.
 
-Both interfaces use the same link store. Dependencies are passed explicitly; there is no global database or `init()` setup. Folder separation is not an authorization boundary.
+Both public and management link flows use the same link store; management also receives the student store backed by the same database. Enrollment uses the link transaction, not a separate student-store transaction. Dependencies are passed explicitly; there is no global database or `init()` setup. Folder separation is not an authorization boundary.
 
 ## Cryptographic link design
 
 Each token uses 32 bytes from Go's `crypto/rand`: 256 bits of OS-backed randomness, encoded as 43 URL-safe Base64 characters without padding. Tokens contain no customer data, timestamps, or sequential IDs and are not JWTs.
 
-PostgreSQL stores the SHA-256 digest as a 32-byte binary primary key, the latest saved name, creation, first-visit, submission, cancellation, and expiry timestamps, and the creating and canceling staff usernames. The usable token is never stored in any form, so a database leak yields no working customer URL and staff can't redisplay one. Issuance returns a usable URL only after persistence succeeds.
+PostgreSQL stores the SHA-256 digest as a 32-byte binary primary key, the draft/final submission name, creation, first-visit, submission, cancellation, and expiry timestamps, and the creating and canceling staff usernames. Completion also inserts a student with a unique source-link digest, canonical name, and completion time; subsequent staff edits change only the student name. The usable token is never stored in any form, so a database leak yields no working customer URL and staff can't redisplay one. Issuance returns a usable URL only after persistence succeeds.
 
 SHA-256 is the lookup digest, not the source of randomness. Go 1.26's `crypto/rand.Read` terminates the process if the OS random source fails; there is no weaker fallback.
 
@@ -188,33 +211,55 @@ Customer entry, autosave, and submission hash the supplied token and check for a
 
 Tokens are bearer credentials: anyone possessing a usable URL can open it and edit its name without staff authentication until the form is submitted. Management routes require a current staff session, while generated-link and customer responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Login, management writes, and customer submissions retain Go's native cross-origin protection.
 
+GORM's parameterized SQL logs omit bound values. This is not a blanket PII-redaction guarantee: database error messages can themselves contain submitted values. Student field-save failures suppress SQL logging and report only record/field metadata and the error type.
+
 ### Name form
 
-The form accepts Unicode names, trims surrounding whitespace, and rejects invalid UTF-8 and NUL characters server-side. Form request bodies are limited to 4 KiB of encoded request bytes, not name characters.
+The form accepts Unicode names, trims surrounding whitespace, and rejects invalid UTF-8 and NUL characters server-side through the same typed name parser used by Students. Form request bodies are limited to 4 KiB of encoded request bytes, not name characters.
 
-Leaving a changed box sends it to `POST /customer/{token}/draft` (HTMX `change` trigger), so a reload or lost connection keeps every box saved so far. Autosave never sets `submitted_at` and replies only with the status line (**Saved.** or **Not saved.** plus the reason), never redrawing fields the customer may be typing in. Drafts mirror the box, including clearing it; a network failure shows **Not saved. Check your connection.** Text typed but never blurred, or blurred while offline, is not kept. Requests from one box are queued so an older draft can't overwrite a newer one.
+Leaving a changed box sends it to `POST /customer/{token}/draft` (HTMX `change` trigger). A successful draft persists across reloads without setting `submitted_at` or creating a student, and replies only with the status line (**Saved.** or **Not saved.** plus the reason), never redrawing the input. Drafts mirror the box, including clearing it; a network failure shows **Not saved. Check your connection.** Text typed but never blurred, or blurred while offline, is not kept. Requests from the box queue the latest pending change so an older draft cannot overwrite a newer one.
 
-**Submit** posts to `POST /customer/{token}`, additionally rejects a blank name, and records `submitted_at`. Invalid names return HTTP 422, malformed forms return HTTP 400, oversized bodies return HTTP 413, and database lookup or name-save failures return HTTP 500. Submission errors retain the form with an inline message: HTMX POST requests receive only the form fragment, while ordinary requests receive a complete page.
+**Submit** posts to `POST /customer/{token}` and additionally rejects a blank name. Invalid names return HTTP 422, malformed forms return HTTP 400, oversized bodies return HTTP 413, and database lookup or save failures return HTTP 500. Submission errors keep a retryable form with an inline message; validation/save failures retain the parsed attempted name. HTMX final POSTs return `customer-response`, containing the stable `#customer-content` section; the form swaps that whole section, including its heading, while drafts still target only `#save-status`. Ordinary requests receive a complete page.
 
-A successful submission replaces the form with a read-only confirmation and locks it. Reloading shows the same confirmation. Any later autosave or submit, including one from another tab, returns HTTP 409, and HTMX reloads into the read-only page. The database update itself only matches unsubmitted links, so two tabs racing can't change a submitted form either.
+A successful submission atomically commits the final name, `submitted_at`, exactly 168 hours of success-page access, and one student record. Insert or commit failure rolls all of those changes back, preserving the draft and initial expiry for retry. Only after commit does the form disappear, replaced by **Thank you / Your information has been saved.** and the title **Submission complete | Masterminds**.
+
+Reloads and repeated final POSTs return HTTP 200 success until the completion deadline. Final replays do not parse replacement answers, create another student, or move completion/access deadlines. A stale draft, including one from another tab, returns HTTP 409 with `HX-Refresh: true` for HTMX, reloading into success without claiming its text was saved. Conditional database writes prevent racing drafts or final submissions from changing a completed form. If cancellation wins before submission, no student is created; if submission wins, cancellation cannot revoke it.
+
+### Students details and field editing
+
+The Students table shows **Name** and **Submitted**, ordered newest completion first. Its name anchor supports Tab/Enter and ordinary navigation; pointer clicks elsewhere on the row activate it without replacing table semantics or interfering with selected text or other controls. With HTMX and JavaScript, details load into a centered native `<dialog>` with Close, Escape, and native focus containment. Closing resolves the initiating row anchor again and restores focus even after a save replaced that row. Without JavaScript, the same anchor opens a full detail page with **Back to students**, and pencil links, Save forms, and Cancel links still work.
+
+Each pencil opens only its addressed field. Save updates exactly one registered column using a bound value; an HTMX modal save returns the field plus an out-of-band table row, while standalone saves redirect to the full detail page. Validation returns HTTP 422 with the attempted value and accessible inline error, ready for correction; unknown fields or missing students return 404, malformed/oversized bodies return 400/413, and database failures return 500 rather than a saved notice. Field requests queue within the details panel. Other HTTP or network failures retain the current table, saved values, and unsaved input with a nearby retry message; expired staff sessions redirect to login instead of injecting login HTML into a field.
+
+Fields come from the ordered `students.Field` registry, not reflection, schema discovery, JSON/EAV storage, or arbitrary-column writes. To add a field, add a typed `Student` column and a field implementation/registry entry defining its label, input type, required state, value, and parser. Table headings/cells and detail/editor templates already iterate the registry. Customer collection for additional fields is a separate change; only Name exists today.
 
 ### Testing cancellation
 
-Sign in and click **Create & copy link** three times. The clipboard should hold the latest URL. Open all three customer links. On the first, type a name and press **Submit**; on the second, type a name and click outside the box, which shows **Saved.**, then reload: the name is still there. Reload management: no URL is shown again, and the rows show **Finished**, **In progress**, and **Opened**. A second staff account sees the same list and statuses.
+Sign in and click **Create & copy link** three times. The clipboard should hold the latest URL. Open all three customer links. On the first, type a name and press **Submit**: check the success heading/title and that **Students** immediately contains exactly one record. On the second, type a name and click outside the box, which shows **Saved.**, then reload: the draft is still there without a student. Reload management: no URL is shown again, and the rows show **Finished**, **In progress**, and **Opened**. The finished row has no cancel button; a second staff account sees the same shared list and student.
 
-Click **Cancel link** on one row. A confirmation dialog must ask whether you are sure you want to cancel that link. Dismiss it first: no cancellation request should be sent, and the row and customer link must remain active. Click again and confirm. That row changes to **Canceled**, keeps its saved name, and loses its cancel button; the other link must remain usable. Opening or submitting the canceled customer URL must return HTTP 404 with the centered logo and Spanish invalid-link message. Check the title **Enlace no válido | Masterminds** and accents in **válido** and **comuníquese**. A canceled HTMX submission refreshes the whole customer page instead of swapping the error into the name form.
+Click **Cancel link** on the unfinished **In progress** row. A confirmation dialog must ask whether you are sure you want to cancel that link. Dismiss it first: no cancellation request should be sent, and the row and customer link must remain active. Click again and confirm. That row disappears from the main page and appears in **Trash** as **Canceled**, keeping its saved draft and audit history without a cancel button; the other unfinished link and the finished success page remain usable. Opening or submitting the canceled customer URL must return HTTP 404 with the centered logo and Spanish invalid-link message. Check the title **Enlace no válido | Masterminds** and accents in **válido** and **comuníquese**. A canceled HTMX submission refreshes the whole customer page instead of swapping the error into the name form.
 
-To check that cancellation keeps unrelated URLs, create two links without reloading, then cancel the first. It shows **Canceled**, while the second row keeps its URL and **Copy link**, which still copies a working customer URL. A status change on another row, such as its customer opening it, appears after a reload.
+To check that cancellation keeps unrelated URLs, create two links without reloading, then cancel the first. It disappears from the main page, while the second row keeps its URL and **Copy link**, which still copies a working customer URL. A status change on another row, such as its customer opening it, appears after a reload.
 
 With clipboard completion deliberately delayed for the second link, cancel the first link before clipboard work settles. The second link stays usable, and delayed clipboard success or failure must not overwrite **Link canceled.** Any newer management request invalidates earlier clipboard feedback when it starts, even before its HTTP response arrives.
 
-Click **Cancel all links** and confirm to revoke all active links, including those created before the current page was opened. The status becomes **All links canceled.** and each previously usable row shows **Canceled** with its saved name; expired rows keep their status. The whole list refreshes, so any URL still shown disappears. Creating a new link afterward must still copy a working URL with an empty customer name form.
+Click **Cancel all unfinished links** and confirm to revoke all usable unfinished links, including those created before the current page was opened. The status becomes **All unfinished links canceled.** and those rows move to **Trash** as **Canceled**, keeping saved drafts; expired rows keep their status. Finished links, their success pages, student records, and cancellation audit remain unchanged. The main list refreshes, so any URL still shown disappears. Creating a new link afterward must still copy a working URL with an empty customer name form.
 
-Cancellation never deletes rows or submitted names; remove unwanted rows directly in PostgreSQL. Repeating cancellation is safe and keeps the first canceler. Cancellation is not a lifetime or expiration setting.
+Cancellation never deletes rows or saved drafts; Trash retains them. Repeating cancellation is safe and keeps the first canceler. Cancellation is not a lifetime or expiration setting.
 
 ### Testing expiry
 
-Open **Settings**, move the slider to 3 days with the mouse or arrow keys, and **Save**: the page shows **Saved.** and who changed it. Create a link: its row says it expires 3 days after creation, while older rows keep their original expiry. To see the cutoff without waiting, set a link's `expires_at` to the past in PostgreSQL while its customer page is open, then edit the name and click outside the box: the page switches to the 404 page, and management shows **Expired** with the name saved before the cutoff.
+Open **Settings**, move the slider to 3 days with the mouse or arrow keys, and **Save**: the page shows **Saved.** and who changed it. Create a link: its row says it expires 3 days after creation, while older unfinished rows keep their original expiry. Submit one such link: the finished row must instead show success-page expiry seven days after completion, regardless of the slider.
+
+For disposable local data only, set an unfinished link's `expires_at` to the past in PostgreSQL while its customer page is open, then edit the name and click outside the box: the page switches to the 404 page. Reload management: the link is absent from **Customer links** and appears in **Trash** as **Expired**, with the name saved before the cutoff and no student.
+
+To check retention without waiting, set a completed link's `submitted_at` to 25 hours ago and its student's `created_at` to the same instant, keeping `expires_at` seven days after that completion. The already-open main page does not poll; reload it and the finished row must disappear without entering Trash. Students must retain it, and the customer URL must still show success. Then set that completed link's `expires_at` to the past: GET/HEAD and final POST return 404, but its student remains available and editable.
+
+### Testing Students
+
+Submit two links with the same name and check that Students shows two separate records. Open one by pointer and again with Tab/Enter; test Close and Escape, including focus returning to the initiating anchor. Use the pencil, submit a whitespace-only name to exercise server-side 422, correct it to a Unicode name, and save: the field and table row update without closing the dialog and remain changed after reload. The other student and original link submission snapshot must remain unchanged. Reopen the pencil, type a different value, then **Cancel**: the saved name returns.
+
+With a field editor open and unsaved text present, block its request or disconnect the browser and try Save/Cancel: a nearby error must appear without losing the input, saved table row, or existing details. Restore the connection and retry. Repeat the edit/save/cancel flow with JavaScript disabled through the full detail page. Check desktop and mobile layouts, table scrolling without whole-page overflow, dialog internal scrolling, and visible keyboard focus. Keep link clipboard/cancel checks separate from Students: its pages must not load link-only clipboard behavior.
 
 ## Verification
 
@@ -233,19 +278,32 @@ go vet -tags=integration ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 ```
 
-Each integration test creates its own PostgreSQL schema/pool and drops only that schema afterward. Tests guard that no stored column contains a usable token, that migration drops the old recoverable-token column and backfills submissions and expiries only once, token boundaries, status progression, that autosave survives reload without finishing the form, that a submitted form is locked, that expired links stop working even mid-form while keeping saved data, name isolation, that cancellation revokes access while keeping submitted data, and that every create/cancel records its account and anonymous ones are refused. Settings checks cover the default, the 2–14 day range in the store and the database, and the single settings row. Authentication checks cover credential failure, rate limiting, token rotation, persistence/expiry, password/revocation/removal invalidation, username recreation, and that sign-out ends only that browser's session on the server. Real management handlers verify authorization/CSRF boundaries, show-once URLs, shared statuses, audit names from each session, that an HTMX single cancel returns only its own row (saved name and first canceler kept, expired links still **Expired**) while unknown IDs swap nothing and database failures return 500 without a row or notice, that ordinary forms and **Cancel all** return the complete list, and that the slider changes only new links.
+Each integration test creates its own PostgreSQL schema/pool and drops only that schema afterward. Regression contracts include:
+
+- Digest-only storage and token boundaries; status progression, draft persistence without enrollment, independent link/name state, hard access cutoffs, and verified staff attribution for creation/cancellation.
+- First-Students-absent mock cutover, preserved user/session/settings sentinels, source-link foreign-key protection, and repeated migration preserving links and students.
+- Exactly one enrollment under concurrent final submissions; rollback of name/completion/expiry on student insert or deferred commit failure; successful retry; submission/cancellation races with either completion plus one student or cancellation plus none.
+- Completed GET/final-POST HTTP 200 replay without answer/deadline changes, stale-draft 409, retryable customer form fragments, and completed-access expiry without student loss.
+- The exact 24-hour completion boundary, next-render main-page archival, no completed records in Trash, stale cancel unable to reinsert an archived row, and Students retention after source expiry.
+- Student newest-first reads, typed field validation/allowlisting and escaped rendering, canonical-name edits isolated from the original link snapshot and other students, full-page/HTMX editor and modal/OOB-row contracts, rejected requests without mutation, and honest empty/error responses.
+- Real management authentication/CSRF boundaries including Students, show-once URLs, row-local cancellation, first-canceler preservation, missing-ID no-swap behavior, database failures without success fragments, and unfinished-only single/bulk cancellation.
+- Settings default, store/database 2–14 day constraints and singleton row, changes affecting only new unfinished access; authentication credential failure, rate limiting, token rotation, persistence/expiry, password/revocation/removal invalidation, username recreation, and browser-local sign-out.
 
 Customer HEAD regressions use real HTTP connections and direct persisted-row comparisons: fresh HEAD leaves **Not opened**, GET records the first visit, later HEAD preserves timestamps and draft/submitted data, unusable tokens return 404, and lookup failures remain 500. They check body suppression on the wire, customer response headers, and unsupported-method rejection.
 
 These checks do not prove randomness statistically. Cryptographic randomness comes from the standard library's OS-backed generator, not from a finite collision test.
 
+Browser smoke checks complement those server/database regressions: native dialog/focus behavior after an OOB row replacement, field validation/cancel/retry and intercepted-network input retention, clipboard isolation/sequencing, the next-load archive cutoff, and desktop/mobile layout need a real browser. They are not proved by HTML string assertions alone.
+
 ## Agreed first-part requirements (target workflow)
+
+The following describes the future customer/invoice/payment workflow, not additional implemented behavior. The Students archive above is per completion and does not yet supply this workflow's unique customer identity or invoice binding.
 
 ### Management and link lifetime
 
 Management enters a customer's phone number and generates an invoice link. Link lifetime is configured separately on the **management settings page**, so it does not need to be entered for every generation.
 
-Settings persist in PostgreSQL. The lifetime slider runs from 2 to 14 days in one-day steps, defaulting to 7. Each issued link has an explicit expiration timestamp fixed at creation, so later setting changes affect only new links.
+Settings persist in PostgreSQL. The lifetime slider runs from 2 to 14 days in one-day steps, defaulting to 7. Each issued link gets an explicit initial expiration timestamp; later setting changes affect only new links. In the current form slice, completion replaces initial access with seven days of success-page access. Future invoice/payment transitions must define their own behavior before implementation.
 
 ### Customers, invoices, and links
 
@@ -304,7 +362,7 @@ Provider webhooks may be appropriate for payment confirmation later. That is sep
 
 ## Implementation approach
 
-The current slice implements link issuance, validation, cancellation, and link-scoped name capture with autosave. Subsequent changes should remain small enough for line-by-line review for correctness, security, readability, and maintainability.
+The current slice implements link issuance, validation, unfinished-only cancellation, name autosave, atomic completion/enrollment, and the retained Students table/details with canonical-name editing. Subsequent changes should remain small enough for line-by-line review for correctness, security, readability, and maintainability.
 
 Implement complete, runnable slices rather than disconnected handlers or pretend functionality. Add database constraints and focused regression checks for critical contracts as the relevant behavior is implemented, including customer isolation, expiration boundaries, invoice reuse, and concurrent payment attempts.
 

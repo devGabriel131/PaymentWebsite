@@ -10,8 +10,9 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
-	"paymentwebsite/internal/settings"
+	"paymentwebsite/internal/students"
 )
 
 const tokenBytes = 32
@@ -25,16 +26,16 @@ type Link struct {
 	OpenedAt *time.Time
 	// SubmittedAt is the customer's final submit; autosave never sets it.
 	SubmittedAt *time.Time
-	// CanceledAt revokes the token but keeps submitted data for staff.
+	// CanceledAt revokes an unfinished token but keeps its draft for staff.
 	CanceledAt *time.Time
-	// ExpiresAt is fixed at creation; later setting changes don't move it.
-	// The default only lets the column be added to existing rows, and fails
-	// closed: a row inserted without an expiry is already expired.
+	// ExpiresAt starts with the configured lifetime; completion replaces it
+	// with seven days from SubmittedAt. Missing expiries fail closed.
 	ExpiresAt time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
 	// CreatedBy and CanceledBy are the staff usernames behind each action.
-	// Links from before auditing have neither.
-	CreatedBy  string `gorm:"not null;default:''"`
-	CanceledBy string `gorm:"not null;default:''"`
+	// Empty audit values mean the corresponding action has not occurred.
+	CreatedBy  string            `gorm:"not null;default:''"`
+	CanceledBy string            `gorm:"not null;default:''"`
+	Student    *students.Student `gorm:"foreignKey:SourceLinkHash;references:TokenHash;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
 }
 
 // Status is a link's customer progress as shown to staff.
@@ -45,8 +46,7 @@ const (
 	Opened    Status = "Opened"
 	// InProgress means autosaved data exists but the customer hasn't submitted.
 	InProgress Status = "In progress"
-	// Finished means the customer pressed the final submit. Once payments
-	// exist it means a completed payment.
+	// Finished means the final answers and student enrollment committed.
 	Finished Status = "Finished"
 	// Expired means the link lapsed before the customer finished.
 	Expired  Status = "Expired"
@@ -56,26 +56,42 @@ const (
 // Entry is a link as shown to staff. ID is the lowercase hex token digest.
 // Token is set only by Create: it is never stored, so it can't be shown again.
 type Entry struct {
-	ID         string
-	Token      string
-	Name       string
-	CreatedAt  time.Time
-	ExpiresAt  time.Time
-	CreatedBy  string
-	CanceledBy string
-	Status     Status
+	ID          string
+	Token       string
+	Name        string
+	CreatedAt   time.Time
+	ExpiresAt   time.Time
+	SubmittedAt *time.Time
+	CreatedBy   string
+	CanceledBy  string
+	Status      Status
 }
 
-// Cancelable reports whether staff can still revoke the link: its token
-// still opens the customer form.
+// Cancelable reports whether staff can still revoke an unfinished link.
 func (e Entry) Cancelable() bool {
-	return e.Status != Canceled && time.Now().Before(e.ExpiresAt)
+	return e.Status != Canceled && e.Status != Finished && !e.AccessExpired()
+}
+
+// AccessExpired reports whether the token's access deadline has passed.
+func (e Entry) AccessExpired() bool {
+	return !time.Now().Before(e.ExpiresAt)
+}
+
+// Archived reports whether completion is at least 24 hours old at now.
+func (e Entry) Archived(now time.Time) bool {
+	return e.Status == Finished && e.SubmittedAt != nil && !e.SubmittedAt.After(now.Add(-24*time.Hour))
+}
+
+// Trashed reports whether the link belongs in canceled or expired history.
+func (e Entry) Trashed() bool {
+	return e.Status == Canceled || e.Status == Expired
 }
 
 func (l Link) entry() Entry {
 	e := Entry{
 		ID: hex.EncodeToString(l.TokenHash), Name: l.Name, Status: NotOpened,
 		CreatedAt: l.CreatedAt, ExpiresAt: l.ExpiresAt, CreatedBy: l.CreatedBy, CanceledBy: l.CanceledBy,
+		SubmittedAt: l.SubmittedAt,
 	}
 	switch {
 	case l.CanceledAt != nil:
@@ -103,35 +119,17 @@ func New(db *gorm.DB) *Store {
 	return &Store{db: db}
 }
 
-// Migrate creates the links table, drops the encrypted token copies left by
-// the removed URL-recovery feature, and backfills columns added to existing
-// rows: submissions from before autosave, when a saved name always meant a
-// submitted form, and expiries from before link lifetimes existed.
+// Migrate atomically replaces pre-enrollment mock links on first cutover.
+// Once students exists, later migrations preserve every retained record.
 func Migrate(db *gorm.DB) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		m := tx.Migrator()
-		// Only when each column is first added: later values are real data.
-		existing := m.HasTable(&Link{})
-		backfillSubmitted := existing && !m.HasColumn(&Link{}, "submitted_at")
-		backfillExpiry := existing && !m.HasColumn(&Link{}, "expires_at")
-		if err := tx.AutoMigrate(&Link{}); err != nil {
-			return err
-		}
-		if backfillSubmitted {
-			if err := tx.Model(&Link{}).Where("name <> ''").Update("submitted_at", gorm.Expr("now()")).Error; err != nil {
+		if !m.HasTable(&students.Student{}) && m.HasTable(&Link{}) {
+			if err := m.DropTable(&Link{}); err != nil {
 				return err
 			}
 		}
-		if backfillExpiry {
-			expiry := gorm.Expr("created_at + make_interval(days => ?)", settings.DefaultLinkLifetimeDays)
-			if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Model(&Link{}).Update("expires_at", expiry).Error; err != nil {
-				return err
-			}
-		}
-		if m.HasColumn(&Link{}, "token_ciphertext") {
-			return m.DropColumn(&Link{}, "token_ciphertext")
-		}
-		return nil
+		return tx.AutoMigrate(&Link{}, &students.Student{})
 	})
 }
 
@@ -200,30 +198,50 @@ func (s *Store) Open(ctx context.Context, token string) (*Link, error) {
 }
 
 // SaveDraft stores an autosaved name without finishing the form.
-func (s *Store) SaveDraft(ctx context.Context, token, name string) (bool, error) {
-	return s.update(ctx, token, map[string]any{"name": name})
-}
-
-// Submit stores the final name and finishes, and so locks, the form.
-func (s *Store) Submit(ctx context.Context, token, name string) (bool, error) {
-	return s.update(ctx, token, map[string]any{"name": name, "submitted_at": gorm.Expr("now()")})
-}
-
-// update changes the usable link for token, reporting whether one matched.
 // Submitted forms never match: the customer's final answers are locked.
-func (s *Store) update(ctx context.Context, token string, values map[string]any) (bool, error) {
+func (s *Store) SaveDraft(ctx context.Context, token, name string) (bool, error) {
 	digest, ok := tokenDigest(token)
 	if !ok {
 		return false, nil
 	}
-	result := s.active(ctx, digest).Where("submitted_at IS NULL").Updates(values)
-	return result.RowsAffected == 1, result.Error
+	result := s.active(ctx, digest).Where("submitted_at IS NULL").Update("name", name)
+	return result.RowsAffected == 1 && result.Error == nil, result.Error
 }
 
-// Cancel revokes the link whose Entry.ID is id on behalf of staff and returns
-// it as saved, without its token. Links canceled earlier keep who canceled
-// them and when, and expired links stay expired. IDs that cannot name a link
-// are already satisfied, so like unknown IDs they return nil.
+// Submit commits final answers and a retained student together, locking the form.
+func (s *Store) Submit(ctx context.Context, token, name string) (bool, error) {
+	digest, ok := tokenDigest(token)
+	if !ok {
+		return false, nil
+	}
+	saved := false
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var completed Link
+		scoped := Store{db: tx}
+		result := scoped.active(ctx, digest).Model(&completed).Where("submitted_at IS NULL").
+			Clauses(clause.Returning{}).Updates(map[string]any{
+			"name": name, "submitted_at": gorm.Expr("now()"),
+			"expires_at": gorm.Expr("now() + interval '168 hours'"),
+		})
+		if result.Error != nil || result.RowsAffected == 0 {
+			return result.Error
+		}
+		student := students.Student{
+			SourceLinkHash: completed.TokenHash, Name: completed.Name, CreatedAt: *completed.SubmittedAt,
+		}
+		if err := tx.Create(&student).Error; err != nil {
+			return err
+		}
+		saved = true
+		return nil
+	})
+	return saved && err == nil, err
+}
+
+// Cancel revokes an unfinished link whose Entry.ID is id and returns its
+// persisted entry without a token. Finished, expired and previously canceled
+// links stay unchanged, preserving the first cancellation's audit.
+// Malformed and unknown IDs return nil.
 func (s *Store) Cancel(ctx context.Context, id, staff string) (*Entry, error) {
 	if staff == "" {
 		return nil, errNoStaff
@@ -232,7 +250,7 @@ func (s *Store) Cancel(ctx context.Context, id, staff string) (*Entry, error) {
 	if err != nil || len(digest) != sha256.Size {
 		return nil, nil
 	}
-	if err := s.active(ctx, digest).Updates(canceledBy(staff)).Error; err != nil {
+	if err := s.active(ctx, digest).Where("submitted_at IS NULL").Updates(canceledBy(staff)).Error; err != nil {
 		return nil, err
 	}
 	var link Link
@@ -244,13 +262,13 @@ func (s *Store) Cancel(ctx context.Context, id, staff string) (*Entry, error) {
 	return &entry, nil
 }
 
-// CancelAll revokes every usable link on behalf of staff; links canceled
-// earlier keep who canceled them, and expired links stay expired.
+// CancelAll revokes usable unfinished links on behalf of staff.
+// Finished, expired and previously canceled links stay unchanged.
 func (s *Store) CancelAll(ctx context.Context, staff string) error {
 	if staff == "" {
 		return errNoStaff
 	}
-	return s.usable(ctx).Updates(canceledBy(staff)).Error
+	return s.usable(ctx).Where("submitted_at IS NULL").Updates(canceledBy(staff)).Error
 }
 
 func canceledBy(staff string) map[string]any {
@@ -262,8 +280,8 @@ func (s *Store) active(ctx context.Context, digest []byte) *gorm.DB {
 	return s.usable(ctx).Where(&Link{TokenHash: digest})
 }
 
-// usable scopes a query to links whose tokens still open the customer form:
-// neither canceled nor expired. An expired link is dead even mid-form.
+// usable scopes a query to tokens that still open the form or success page:
+// neither canceled nor past their access deadline.
 func (s *Store) usable(ctx context.Context) *gorm.DB {
 	return s.db.WithContext(ctx).Model(&Link{}).Where("canceled_at IS NULL AND expires_at > now()")
 }

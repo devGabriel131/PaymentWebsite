@@ -1,6 +1,6 @@
 body {
   margin: 1rem;
-  font-family: system-ui, sans-serif;
+  font-family: "JetBrains Mono", monospace;
 }
 
 input,
@@ -41,12 +41,13 @@ a {
   margin: 0;
   background: var(--canvas);
   color: var(--text);
-  font: 0.9375rem/1.55 "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+  font-size: 0.9375rem;
+  line-height: 1.55;
 }
 
 .management-workspace {
   display: grid;
-  grid-template: "header header" auto "nav main" 1fr / 13rem minmax(0, 1fr);
+  grid-template: "header header header" auto "nav main ." 1fr / 14rem minmax(0, 1fr) 14rem;
   min-height: 100svh;
 }
 
@@ -98,7 +99,6 @@ a {
   align-items: center;
   gap: 0.75rem;
   color: var(--accent);
-  font-family: Georgia, "Times New Roman", serif;
   font-size: 1.5rem;
   letter-spacing: 0.01em;
   white-space: nowrap;
@@ -162,11 +162,18 @@ a {
   color: var(--accent);
 }
 
+.management-nav-trash {
+  position: sticky;
+  bottom: 1.5rem;
+  margin-top: auto;
+}
+
 .management-links {
   grid-area: main;
   box-sizing: border-box;
   width: 100%;
   max-width: 72.5rem;
+  margin-inline: auto;
   padding: clamp(1.75rem, 4vw, 3rem) var(--gutter) 4rem;
 }
 
@@ -564,7 +571,206 @@ button.management-button-danger:enabled:hover {
   color: var(--text);
 }
 
-@media (max-width: 720px) {
+.management-students {
+  min-width: 0;
+}
+
+.management .student-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  border-radius: inherit;
+}
+
+.management .student-table {
+  width: 100%;
+  min-width: 28rem;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.management .student-table :is(th, td) {
+  min-width: 12rem;
+  max-width: 32rem;
+  padding: 0.75rem var(--inset);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.management .student-table th {
+  padding-block: 1rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.management .student-table tbody tr {
+  border-top: 1px solid var(--line);
+}
+
+.management .student-table tr[data-student-id] {
+  cursor: pointer;
+}
+
+.management .student-table tbody tr:is(:hover, :focus-within) {
+  background: var(--canvas);
+}
+
+.management .student-table [data-student-link] {
+  display: inline-block;
+  box-sizing: border-box;
+  min-height: 44px;
+  padding-block: 0.625rem;
+  color: var(--accent);
+  text-underline-offset: 0.2em;
+}
+
+.management .student-table time {
+  display: inline-block;
+  padding-block: 0.625rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.management .student-empty {
+  padding: 2.5rem var(--inset);
+  color: var(--muted);
+}
+
+.management .student-empty h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 1rem;
+}
+
+.management .student-empty p {
+  max-width: 60ch;
+  margin: 0.5rem 0 0;
+}
+
+.management #student-dialog {
+  box-sizing: border-box;
+  width: min(40rem, calc(100vw - 2rem));
+  max-width: none;
+  max-height: calc(100dvh - 2rem);
+  margin: auto;
+  padding: 0;
+  overflow: auto;
+  color: var(--text);
+}
+
+.management #student-dialog::backdrop {
+  background: rgb(21 35 43 / 75%);
+}
+
+.management .student-details {
+  min-width: 0;
+  padding: var(--inset);
+}
+
+.management #student-dialog h1 {
+  font-size: 1.5rem;
+}
+
+.management .student-submitted {
+  margin: 0.5rem 0 1.5rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}
+
+.management .student-field {
+  min-width: 0;
+  padding-block: 1.25rem;
+  border-top: 1px solid var(--line);
+}
+
+.management .student-field-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.management .student-field-value {
+  margin: 0.5rem 0 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.management .student-edit-link {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0.5rem;
+  border: 1px solid var(--control);
+  border-radius: 0.5rem;
+  color: var(--accent);
+}
+
+.management .student-edit-link:hover {
+  background: var(--raised);
+}
+
+.management .student-field-editor {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.management .student-field-editor :is(input:not([type="hidden"]), select, textarea) {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--control);
+  border-radius: 0.5rem;
+  background: var(--canvas);
+  color: var(--text);
+  font: inherit;
+}
+
+.management .student-field-editor [aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.management .student-field-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.management .student-back-link {
+  margin: 0 0 1rem;
+}
+
+.management .student-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.management :is(.student-validation-error, .student-request-error, .student-saved) {
+  margin: 0.5rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.management .student-request-error:not([hidden]) {
+  margin-bottom: 1rem;
+}
+
+.management .student-saved {
+  color: var(--accent);
+  font-size: 0.875rem;
+}
+
+@media (max-width: 960px) {
   .management-workspace {
     grid-template: "header" auto "nav" auto "main" 1fr / minmax(0, 1fr);
   }
@@ -575,6 +781,11 @@ button.management-button-danger:enabled:hover {
     padding: 0.5rem calc(var(--gutter) - 0.875rem);
     border-right: 0;
     border-bottom: 1px solid var(--line);
+  }
+
+  .management-nav-trash {
+    position: static;
+    margin-top: 0;
   }
 
   .management-nav-link[aria-current="page"] {

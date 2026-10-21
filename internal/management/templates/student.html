@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Student details</title>
+  <link rel="icon" type="image/vnd.microsoft.icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
+  <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js"
+    integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg"
+    crossorigin="anonymous" defer></script>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400..700&amp;display=swap">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/management-time.js" defer></script>
+  <script src="/static/students.js" defer></script>
+</head>
+<body class="management management-workspace">
+  <a class="management-skip-link" href="#main-content">Skip to content</a>
+  {{template "header" .Staff}}
+  {{template "navigation" "students"}}
+  <main id="main-content" class="management-links management-students" tabindex="-1">
+    <p class="student-back-link"><a class="management-back-link" href="/management/students">Back to students</a></p>
+    <section class="management-panel" aria-labelledby="student-heading">
+      {{template "student-detail" .}}
+    </section>
+  </main>
+</body>
+</html>
+
+{{define "student-detail"}}
+<div class="student-details" hx-sync="closest .student-details:queue all">
+  <h1 id="student-heading">Student details</h1>
+  <p class="student-submitted">Submitted <time datetime="{{.Student.CreatedAt.UTC.Format "2006-01-02T15:04:05Z"}}">{{.Student.CreatedAt.UTC.Format "Jan 2, 2006 15:04 UTC"}}</time></p>
+  <p class="student-request-error" role="alert" hidden></p>
+  {{range .Student.Fields}}{{template "student-field" .}}{{end}}
+  {{if .Modal}}
+  <form method="dialog" class="student-dialog-actions">
+    <button type="submit">Close</button>
+  </form>
+  {{end}}
+</div>
+{{end}}
+
+{{define "student-field"}}
+<div class="student-field" id="student-field-{{.StudentID}}-{{.Key}}">
+  {{if .Editing}}{{template "student-field-editor" .}}{{else}}{{template "student-field-read" .}}{{end}}
+  <p class="student-request-error" role="alert" hidden></p>
+</div>
+{{end}}
+
+{{define "student-field-read"}}
+<div class="student-field-heading">
+  <h2>{{.Label}}</h2>
+  <a class="student-edit-link" data-student-edit aria-label="Edit {{.Label}}"
+    href="/management/students/{{.StudentID}}/fields/{{.Key}}?edit=1{{if .Modal}}&amp;modal=1{{end}}"
+    hx-get="/management/students/{{.StudentID}}/fields/{{.Key}}?edit=1{{if .Modal}}&amp;modal=1{{end}}"
+    hx-target="closest .student-field" hx-swap="outerHTML">
+    <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m16 3 5 5-13 13H3v-5L16 3Z"/><path d="m14 5 5 5"/></svg>
+  </a>
+</div>
+<p class="student-field-value">{{.Value}}</p>
+{{if .Saved}}<p class="student-saved" role="status">Saved.</p>{{end}}
+{{end}}
+
+{{define "student-field-editor"}}
+<form class="student-field-editor" method="post" action="/management/students/{{.StudentID}}/fields/{{.Key}}"
+  hx-post="/management/students/{{.StudentID}}/fields/{{.Key}}" hx-target="closest .student-field" hx-swap="outerHTML" hx-disabled-elt="find button">
+  <label for="student-input-{{.StudentID}}-{{.Key}}">{{.Label}}</label>
+  <input id="student-input-{{.StudentID}}-{{.Key}}" name="value" type="{{.InputType}}" value="{{.Value}}"{{if .Required}} required{{end}}{{if .Error}}
+    aria-invalid="true" aria-describedby="student-error-{{.StudentID}}-{{.Key}}"{{end}}>
+  {{if .Modal}}<input type="hidden" name="modal" value="1">{{end}}
+  {{if .Error}}<p class="student-validation-error student-field-error" id="student-error-{{.StudentID}}-{{.Key}}" role="alert">{{.Error}}</p>{{end}}
+  <div class="student-field-actions">
+    <button type="submit" class="management-button-primary">Save</button>
+    <a class="management-back-link" href="/management/students/{{.StudentID}}/fields/{{.Key}}{{if .Modal}}?modal=1{{end}}"
+      hx-get="/management/students/{{.StudentID}}/fields/{{.Key}}{{if .Modal}}?modal=1{{end}}"
+      hx-target="closest .student-field" hx-swap="outerHTML">Cancel</a>
+  </div>
+</form>
+{{end}}
+
+{{define "student-save"}}
+{{template "student-field" .Field}}
+{{if .Modal}}<template>{{template "student-row" .Student}}</template>{{end}}
+{{end}}

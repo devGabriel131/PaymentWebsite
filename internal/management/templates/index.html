@@ -3,23 +3,27 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Customer links</title>
+  <title>{{if .Trash}}Trash{{else}}Customer links{{end}}</title>
+  <link rel="icon" type="image/vnd.microsoft.icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js"
     integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg"
     crossorigin="anonymous" defer></script>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400..700&amp;display=swap">
   <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/management-time.js" defer></script>
   <script src="/static/management.js" defer></script>
 </head>
 <body class="management management-workspace">
   <a class="management-skip-link" href="#main-content">Skip to content</a>
   {{template "header" .Staff}}
-  {{template "navigation" "links"}}
+  {{if .Trash}}{{template "navigation" "trash"}}{{else}}{{template "navigation" "links"}}{{end}}
   <main id="main-content" class="management-links management-registry" tabindex="-1">
     <div class="management-page-heading">
       <div>
-        <h1>Customer links</h1>
-        <p class="management-page-description">Create a link for each customer and follow it from first open to finished.</p>
+        <h1>{{if .Trash}}Trash{{else}}Customer links{{end}}</h1>
+        <p class="management-page-description">{{if .Trash}}Canceled and expired unfinished links, with their saved data and history.{{else}}Active links and forms completed in the last 24 hours. Completed information stays in Students.{{end}}</p>
       </div>
+      {{if not .Trash}}
       <form id="create-link" class="management-create" action="/management/links" method="post"
         hx-post="/management/links" hx-target="#generated-links" hx-swap="beforeend"
         hx-disabled-elt="button">
@@ -28,26 +32,35 @@
           Create &amp; copy link
         </button>
       </form>
+      {{end}}
     </div>
     <section class="management-panel" aria-labelledby="link-registry-heading">
       <div class="management-panel-heading">
-        <h2 id="link-registry-heading">Link registry</h2>
-        <p>Each URL is shown only once, right after you create it.</p>
+        <h2 id="link-registry-heading">{{if .Trash}}Canceled and expired links{{else}}Link registry{{end}}</h2>
+        <p>{{if .Trash}}These links no longer open the customer form. Their data is kept.{{else}}Each URL is shown only once, right after you create it. Finished links stay here for 24 hours.{{end}}</p>
       </div>
       <p id="link-status" role="status">{{.Notice}}</p>
       <ul id="generated-links" role="list" aria-label="Generated customer links">{{range .Links}}{{template "link" .}}{{end}}</ul>
       <div class="management-empty">
+        {{if .Trash}}
+        {{template "trash-icon"}}
+        <h3>Trash is empty</h3>
+        <p>Canceled and expired unfinished links will appear here, with their saved data.</p>
+        {{else}}
         {{template "link-icon"}}
-        <h3>No links yet</h3>
-        <p>Choose Create &amp; copy link to make one. Each link appears here with its status.</p>
+        <h3>No active or recently completed links</h3>
+        <p>Create a customer link to get started. Completed information remains in Students.</p>
+        {{end}}
       </div>
       <div class="management-panel-footer">
-        <p class="management-retention-note">Canceling a link keeps its history.</p>
+        <p class="management-retention-note">{{if .Trash}}Links and their history are retained, not deleted.{{else}}Finished links leave this page after 24 hours; their information remains in Students. Canceled and expired unfinished links move to Trash.{{end}}</p>
+        {{if not .Trash}}
         <form class="management-cancel-all" action="/management/links/cancel" method="post"
           hx-post="/management/links/cancel" hx-target="#generated-links" hx-disabled-elt="button"
-          hx-confirm="Cancel all links? Existing customer links will return 404.">
-          <button type="submit" class="management-button-danger">Cancel all links</button>
+          hx-confirm="Cancel all unfinished links? Unfinished customer forms will no longer open. Completed submissions are kept.">
+          <button type="submit" class="management-button-danger">Cancel all unfinished links</button>
         </form>
+        {{end}}
       </div>
     </section>
   </main>
@@ -64,7 +77,9 @@
     <div class="management-link-meta">
       <span>Created <time datetime="{{.CreatedAt.UTC.Format "2006-01-02T15:04:05Z"}}">{{.CreatedAt.UTC.Format "Jan 2, 2006 15:04 UTC"}}</time>{{with .CreatedBy}} by {{.}}{{end}}</span>
       {{- if eq .Status "Canceled"}}{{with .CanceledBy}}<span> · canceled by {{.}}</span>{{end}}
-      {{- else}}<span> · {{if .Cancelable}}expires{{else}}expired{{end}}
+      {{- else}}
+        {{- with .SubmittedAt}}<span> · submitted <time datetime="{{.UTC.Format "2006-01-02T15:04:05Z"}}">{{.UTC.Format "Jan 2, 2006 15:04 UTC"}}</time></span>{{end}}
+        <span> · {{if eq .Status "Finished"}}success page {{end}}{{if .AccessExpired}}expired{{else}}expires{{end}}
         <time datetime="{{.ExpiresAt.UTC.Format "2006-01-02T15:04:05Z"}}">{{.ExpiresAt.UTC.Format "Jan 2, 2006 15:04 UTC"}}</time></span>{{end}}
     </div>
     {{with .Token}}<a class="management-link-url" href="/customer/{{.}}" target="_blank" rel="noopener noreferrer">/customer/{{.}}</a>{{end}}
@@ -83,7 +98,11 @@
 {{end}}
 
 {{define "result"}}
-{{if .Link.ID}}{{template "link" .Link}}{{else}}{{range .Links}}{{template "link" .}}{{end}}{{end}}
+{{if .Link.ID}}
+  {{if .ShowLink}}{{template "link" .Link}}{{end}}
+{{else}}
+  {{range .Links}}{{template "link" .}}{{end}}
+{{end}}
 <p id="link-status" hx-swap-oob="innerHTML">{{.Notice}}</p>
 {{end}}
 
@@ -108,11 +127,21 @@
     {{template "link-icon"}}
     Customer links
   </a>
+  <a class="management-nav-link" href="/management/students"{{if eq . "students"}} aria-current="page"{{end}}>
+    <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M21 20v-2a6 6 0 0 0-4-5.65"/></svg>
+    Students
+  </a>
   <a class="management-nav-link" href="/management/settings"{{if eq . "settings"}} aria-current="page"{{end}}>
     <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h10M18 18h2"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="16" cy="18" r="2"/></svg>
     Settings
+  </a>
+  <a class="management-nav-link management-nav-trash" href="/management/trash"{{if eq . "trash"}} aria-current="page"{{end}}>
+    {{template "trash-icon"}}
+    Trash
   </a>
 </nav>
 {{end}}
 
 {{define "link-icon"}}<svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>{{end}}
+
+{{define "trash-icon"}}<svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/></svg>{{end}}
