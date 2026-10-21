@@ -5,12 +5,12 @@ import (
 	"embed"
 	"errors"
 	"html/template"
-	"log"
 	"net/http"
 	"net/url"
 	"time"
 
 	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/students"
 )
 
@@ -64,7 +64,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 					return
 				}
 				if err := page.ExecuteTemplate(w, name, data); err != nil {
-					log.Printf("render customer page: %v", err)
+					logging.RecordError(r, "render", err)
 				}
 			}
 			showCompletion := func() {
@@ -102,7 +102,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 						result, err := save(ctx, token, name)
 						switch {
 						case err != nil:
-							log.Printf("save customer name: %v", err)
+							logging.RecordError(r, "save", err)
 							data.Error = "Could not save your name. Please try again."
 							show(http.StatusInternalServerError)
 						case result == links.AlreadySubmitted:
@@ -128,7 +128,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 			}
 			link, err := lookup(ctx, token)
 			if err != nil {
-				log.Printf("look up customer link: %v", err)
+				logging.RecordError(r, "lookup", err)
 				data.Error = "Could not open this link. Please try again."
 				show(http.StatusInternalServerError)
 				return
@@ -148,8 +148,8 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 		}
 	}
 
-	mux.HandleFunc("GET /customer/{token}", handle(false))
-	mux.HandleFunc("POST /customer/{token}", handle(false))
-	mux.HandleFunc("POST /customer/{token}/draft", handle(true))
+	mux.Handle("GET /customer/{token}", logging.Operation("link_read", handle(false)))
+	mux.Handle("POST /customer/{token}", logging.Operation("final_submit", handle(false)))
+	mux.Handle("POST /customer/{token}/draft", logging.Operation("draft_save", handle(true)))
 	return nil
 }

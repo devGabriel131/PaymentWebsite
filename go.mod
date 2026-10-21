@@ -1,8 +1,6 @@
 module paymentwebsite
 
-go 1.26.0
-
-toolchain go1.27.2
+go 1.27.3
 
 tool github.com/air-verse/air
 

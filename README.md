@@ -26,7 +26,7 @@ Links are not invoice-bound or matched to a unique person yet. Students holds th
 
 ## Stack and development
 
-- Go 1.26 or newer, using `net/http` and `html/template`; `go.mod` selects the patched Go 1.27.2 toolchain.
+- Go 1.27.3 or newer, using `net/http` and `html/template`. Keep `GOTOOLCHAIN=auto` so `go` selects the version required by `go.mod`.
 - HTMX for server-rendered interactions; mobile-first pages.
 - PostgreSQL for persistence, accessed through GORM and its PostgreSQL driver.
 - Railway hosts the shared test deployment; see [Railway test deployment](#railway-test-deployment).
@@ -85,9 +85,23 @@ The four-character minimum is temporary for mock-data development; raise it befo
 
 Both staff have the same access to the link registry; the separate accounts exist so each action records who did it. Sessions contain account identity/version, not link history. Persistent HttpOnly, SameSite=Lax cookies remember sign-in across tabs and browser restarts; ordinary visits do not extend the 14-day deadline. Production cookies are Secure even behind Railway's TLS proxy. Login attempts from every client share a per-process limit of two initial attempts, then one every 12 seconds. This bounds password guessing and Argon2 memory use; the accepted tradeoff is that anyone who keeps the limit spent blocks new staff sign-ins until they stop, while existing sessions keep working. There is no registration or email recovery.
 
-`auth.New(db, secureCookies)` owns SCS construction, cookie settings, and periodic expired-session cleanup. The `management_session` cookie is scoped to `/management/`; SCS wraps login/logout and protected management handlers only. The root redirect, customer routes, static files, and favicon bypass staff-session loading, even when sent a forged staff cookie. Protected requests still verify the current account version against PostgreSQL. `Manager.Close()` stops session cleanup, not the shared SQL pool.
+`auth.New(db, secureCookies, log)` owns SCS construction, cookie settings, and expired-session cleanup. The `management_session` cookie is scoped to `/management/`; SCS wraps login/logout and protected management handlers only. The root redirect, customer routes, static files, and favicon bypass staff-session loading, even when sent a forged staff cookie. Protected requests still verify the current account version against PostgreSQL. `Manager.Close()` cancels cleanup and waits for its worker, leaving the shared SQL pool open.
+
+Postgresstore still persists sessions synchronously, with its own cleanup worker disabled. Auth runs one expiry sweep every five minutes, without an immediate startup sweep, using the same `expiry < CURRENT_TIMESTAMP` predicate and a five-second database timeout. Failed sweeps emit safe `session_cleanup_failed` events; stopping the worker is quiet.
 
 **Sign out** posts to `POST /management/logout`, which deletes that browser's session row and expires its cookie; the account's other browsers stay signed in. To end every session for an account, use `user revoke`.
+
+## Operational logging
+
+- Server events are newline-delimited JSON on stdout: lowercase `level`, a stable event name in `message`, and numeric millisecond durations. Root metadata uses only the Railway service/environment/commit/deployment/replica allowlist; local fallbacks are `PaymentWebsite`, `local`, and `unknown`.
+- One outer request boundary returns `X-Request-ID`. It reuses a single `X-Railway-Request-Id` value only when it contains 1–128 ASCII letters, digits, `.`, `_`, or `-`; otherwise it generates a cryptographic ID. Client `X-Request-ID` is not a fallback. IDs aid diagnosis, not authentication.
+- A reported failure or HTTP 5xx emits at most one `request_failed` after the complete handler/session stack returns. It includes method, token-free registered route, bounded operation, stage, actual committed status, and elapsed time. Successful and expected 4xx requests emit nothing. Request cancellation and render-stage broken connections are Warn; other unexpected failures are Error.
+- Errors expose only `error_kind`, concrete `error_type`, and valid SQLSTATE when available. SQL, bind values, database messages, URLs, query strings, cookies, credentials, and submitted values never enter operational events. The stdlib HTTP diagnostic adapter discards raw panic values, addresses, and stacks without changing panic handling.
+- Successful GORM queries strictly slower than 200 ms accumulate count and worst duration per fixed operation. Every 30 seconds, nonempty buckets emit `database_slow_summary` at Warn: at most 21 lines per scheduled flush, plus startup/final partial flushes. Empty flushes are silent; SQL callbacks are never evaluated. Failures remain owned by their request, setup, CLI, or cleanup boundary rather than waiting for a summary.
+- Direct SCS persistence SQL remains outside GORM timing summaries. An isolated slow warning may wait one interval; SIGKILL can lose unflushed in-memory counts. There is no logging queue, exporter, or additional access-log stream.
+- `server_listening` follows a successful bind. Shutdown emits `shutdown_requested`, then exactly one `shutdown_completed` or `shutdown_failed`, preserving the ten-second drain. CLI diagnostic JSON uses stderr; human help, account output, prompts, and command errors retain their operator-facing format.
+- Use Railway's native HTTP logs for traffic, latency, and error-rate investigation. Scope application failures to the app service's structured Error events; PostgreSQL checkpoint LOG output belongs to the database service. Railway severity parsing and native correlation require a separately approved deployment to verify live.
+
 
 ## Railway test deployment
 
@@ -99,7 +113,7 @@ Service configuration:
 - `SESSION_COOKIE_SECURE=true` keeps management cookies HTTPS-only.
 - `PORT=8080` makes the application listen on all interfaces for Railway routing. Without `PORT`, local startup is bound to `127.0.0.1:3000`.
 - The health check remains `/management/`: signed-out requests receive HTTP 200 with only the login form. PostgreSQL connection and migrations must succeed before HTTP starts.
-- Railpack uses the preferred Go toolchain declared in `go.mod`; the deployed process does not run Air. Pushes to `master` trigger automatic deployments.
+- Railpack uses the Go version required by `go.mod`; the deployed process does not run Air. Pushes to `master` trigger automatic deployments.
 
 For a manual deployment from this directory:
 
@@ -149,6 +163,14 @@ Railpack currently builds `/app/out`; the launcher runs that deployed binary, no
 │   │   ├── http.go
 │   │   ├── http_test.go
 │   │   └── templates/login.html
+│   ├── logging/
+│   │   ├── logging.go
+│   │   ├── logging_test.go
+│   │   ├── http.go
+│   │   ├── http_test.go
+│   │   ├── http_integration_test.go
+│   │   ├── database.go
+│   │   └── database_test.go
 │   ├── management/
 │   │   ├── management.go
 │   │   ├── management_test.go
@@ -188,6 +210,7 @@ Railpack currently builds `/app/out`; the launcher runs that deployed binary, no
 - `main.go`: configuration, one current-model `AutoMigrate`, shared bounded SQL pool, route wiring, HTTP timeouts, native cross-origin request protection, and signal-driven graceful shutdown.
 - `user.fish`: local Railway SSH launcher for deployed staff account commands, preserving interactive password prompts without local database credentials.
 - `internal/auth/`: staff credentials/CLI, embedded login form, sign-out, account-version authorization exposing the verified username (`auth.Staff`), and ownership of SCS setup, scoped middleware, and session cleanup.
+- `internal/logging/`: the shared operational logging boundary for safe structured events, request correlation/outcomes, bounded GORM summaries, and stdlib HTTP diagnostics.
 - `internal/management/`: shared link registry, settings, and authenticated Students routes/templates; `students.go` builds field views and handles detail/edit fragments, while the single `students.html` template owns list/detail pages and shared field/table-row rendering. `main.go` injects `auth.Staff` for link/settings audit attribution.
 - `internal/customer/`: public GET/HEAD handling, parse-first autosave/final submission, authoritative save-result dispatch, completion replay/privacy, and embedded customer-content/success and invalid-link templates; name parsing is shared with Students.
 - `internal/links/`: random issuance, digest-only storage, initial/completed access expiry, progress status, unfinished-only revocation, authoritative write outcomes, atomic single-command finalization/enrollment, and current GORM model.
@@ -216,8 +239,6 @@ Customer reads and guarded writes hash the supplied token and check for a matchi
 `HEAD /customer/{token}` is a read-only usability check: HTTP 200 even after final submission, 404 for unknown, malformed, canceled, or expired tokens, and 500 for lookup failures. It returns no body, keeps the normal customer response headers, and never changes `opened_at`, saved names, or submission state. A later GET still records the first visit. GET-based previewers can therefore mark a link **Opened**; this is not proof of human interaction.
 
 Tokens are bearer credentials: anyone possessing a usable URL can open it and edit its name without staff authentication until the form is submitted. Management routes require a current staff session, while generated-link and customer responses use `Cache-Control: no-store` and `Referrer-Policy: no-referrer`. Login, management writes, and customer submissions retain Go's native cross-origin protection.
-
-GORM's parameterized SQL logs omit bound values. This is not a blanket PII-redaction guarantee: database error messages can themselves contain submitted values. Student field-save failures suppress SQL logging and report only record/field metadata and the error type.
 
 ### Name form
 
@@ -283,6 +304,7 @@ Run the checks:
 
 ```fish
 set -gx TEST_DATABASE_URL 'postgres://paymentwebsite:paymentwebsite@127.0.0.1:5432/paymentwebsite_test?sslmode=disable'
+go test -race ./internal/logging .
 go test -race -tags=integration ./...
 go vet -tags=integration ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
@@ -298,6 +320,8 @@ Each integration test creates its own PostgreSQL schema through one schema-scope
 - Student newest-first reads, typed field validation/allowlisting and escaped rendering, canonical-name edits isolated from the original link snapshot and other students, full-page/HTMX editor and modal/OOB-row contracts, rejected requests without mutation, and honest empty/error responses.
 - Real management authentication/CSRF boundaries including Students, show-once URLs, row-local cancellation, first-canceler preservation, missing-ID no-swap behavior, database failures without success fragments, and unfinished-only single/bulk cancellation.
 - Settings default, store/database 2–14 day constraints and singleton row, changes affecting only new unfinished access; authentication credential failure, rate limiting, token rotation, persistence/expiry, password/revocation/removal invalidation, username recreation, browser-local sign-out, and public customer access bypassing staff-session storage.
+- Production logging privacy/classification, first-failure/leaf-route ownership, actual SCS commit status, bounded exact slow-query counts under concurrent flushes, and silent successful/expected requests.
+- Expired-only session cleanup with safe failure/cancellation handling, plus real-listener graceful and forced shutdown with the unchanged ten-second drain and no signal-triggered request cancellation.
 
 Customer HEAD regressions use real HTTP connections and direct persisted-row comparisons: fresh HEAD leaves **Not opened**, GET records the first visit, later HEAD preserves timestamps and draft/submitted data, unusable tokens return 404, and lookup failures remain 500. They check body suppression on the wire, customer response headers, and unsupported-method rejection. Separate link-store regressions protect the populated first-GET result, unchanged repeat-open timestamp, and cancellation winning while the first-open update waits. POST never records a first visit.
 

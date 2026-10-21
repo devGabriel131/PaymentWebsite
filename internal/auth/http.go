@@ -6,9 +6,8 @@ import (
 	"embed"
 	"errors"
 	"html/template"
-	"log"
+	"log/slog"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/alexedwards/argon2id"
@@ -16,6 +15,8 @@ import (
 	"github.com/alexedwards/scs/v2"
 	"golang.org/x/time/rate"
 	"gorm.io/gorm"
+
+	"paymentwebsite/internal/logging"
 )
 
 //go:embed templates/login.html
@@ -35,12 +36,12 @@ type loginPage struct {
 }
 
 type Manager struct {
-	db        *gorm.DB
-	sessions  *scs.SessionManager
-	store     *postgresstore.PostgresStore
-	closeOnce sync.Once
-	page      *template.Template
-	dummyHash string
+	db          *gorm.DB
+	sessions    *scs.SessionManager
+	stopCleanup context.CancelFunc
+	cleanupDone chan struct{}
+	page        *template.Template
+	dummyHash   string
 	// ponytail: one limit shared by every client bounds guessing and Argon2's
 	// 64 MiB per check. Accepted risk: an outsider who keeps it spent blocks new
 	// staff sign-ins; key it per client IP if that ever happens.
@@ -48,7 +49,7 @@ type Manager struct {
 }
 
 // New owns staff-session configuration and expired-session cleanup, not the SQL pool.
-func New(db *gorm.DB, secureCookies bool) (*Manager, error) {
+func New(db *gorm.DB, secureCookies bool, log *slog.Logger) (*Manager, error) {
 	page, err := template.ParseFS(templates, "templates/login.html")
 	if err != nil {
 		return nil, err
@@ -62,7 +63,7 @@ func New(db *gorm.DB, secureCookies bool) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := postgresstore.New(sqlDB)
+	store := postgresstore.NewWithCleanupInterval(sqlDB, 0)
 	sessions := scs.New()
 	sessions.Store = store
 	sessions.Lifetime = 14 * 24 * time.Hour
@@ -74,24 +75,55 @@ func New(db *gorm.DB, secureCookies bool) (*Manager, error) {
 	sessions.Cookie.SameSite = http.SameSiteLaxMode
 	sessions.Cookie.Persist = true
 	sessions.Cookie.Secure = secureCookies
-	return &Manager{
-		db:        db,
-		sessions:  sessions,
-		store:     store,
-		page:      page,
-		dummyHash: dummyHash,
-		limiter:   rate.NewLimiter(rate.Every(loginInterval), 2),
-	}, nil
+	sessions.ErrorFunc = func(w http.ResponseWriter, r *http.Request, err error) {
+		logging.RecordError(r, "session", err)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+	}
+	ctx, stopCleanup := context.WithCancel(context.Background())
+	m := &Manager{
+		db:          db,
+		sessions:    sessions,
+		stopCleanup: stopCleanup,
+		cleanupDone: make(chan struct{}),
+		page:        page,
+		dummyHash:   dummyHash,
+		limiter:     rate.NewLimiter(rate.Every(loginInterval), 2),
+	}
+	go func() {
+		defer close(m.cleanupDone)
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				m.deleteExpiredSessions(ctx, log)
+			}
+		}
+	}()
+	return m, nil
 }
 
-// Close stops expired-session cleanup once, leaving the caller's SQL pool open.
+// Close stops expired-session cleanup, leaving the caller's SQL pool open.
 func (m *Manager) Close() {
-	m.closeOnce.Do(m.store.StopCleanup)
+	m.stopCleanup()
+	<-m.cleanupDone
+}
+
+func (m *Manager) deleteExpiredSessions(ctx context.Context, log *slog.Logger) {
+	cleanupCtx, cancel := context.WithTimeout(ctx, dbTimeout)
+	defer cancel()
+	err := m.db.WithContext(logging.WithOperation(cleanupCtx, "session_cleanup")).
+		Where("expiry < CURRENT_TIMESTAMP").Delete(&Session{}).Error
+	if err != nil && ctx.Err() == nil {
+		log.LogAttrs(ctx, slog.LevelError, "session_cleanup_failed", logging.ErrorAttrs(err)...)
+	}
 }
 
 func (m *Manager) RegisterRoutes(mux *http.ServeMux) {
-	mux.Handle("POST /management/login", m.sessions.LoadAndSave(http.HandlerFunc(m.login)))
-	mux.Handle("POST /management/logout", m.sessions.LoadAndSave(http.HandlerFunc(m.logout)))
+	mux.Handle("POST /management/login", logging.Operation("sign_in", m.sessions.LoadAndSave(http.HandlerFunc(m.login))))
+	mux.Handle("POST /management/logout", logging.Operation("sign_out", m.sessions.LoadAndSave(http.HandlerFunc(m.logout))))
 }
 
 type staffKey struct{}
@@ -106,10 +138,10 @@ func Staff(ctx context.Context) string {
 // Require serves next only for a session whose account still exists with the
 // auth version recorded at sign-in, exposing the account through Staff.
 func (m *Manager) Require(next http.Handler) http.Handler {
-	return m.sessions.LoadAndSave(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return logging.Operation("session_check", m.sessions.LoadAndSave(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		username, err := m.authenticated(r.Context())
 		if err != nil {
-			log.Printf("check management session: %v", err)
+			logging.RecordError(r, "authenticate", err)
 			http.Error(w, "Could not check your sign-in. Please try again.", http.StatusInternalServerError)
 			return
 		}
@@ -122,11 +154,11 @@ func (m *Manager) Require(next http.Handler) http.Handler {
 			http.Error(w, "Sign in required.", http.StatusUnauthorized)
 		case (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL.Path == "/management/":
 			// 200 keeps the Railway health check on /management/ passing while signed out.
-			m.render(w, http.StatusOK, loginPage{})
+			m.render(w, r, http.StatusOK, loginPage{})
 		default:
 			http.Redirect(w, r, "/management/", http.StatusSeeOther)
 		}
-	}))
+	})))
 }
 
 // authenticated returns the session's username, or "" when it is signed out.
@@ -149,7 +181,7 @@ func (m *Manager) authenticated(ctx context.Context) (string, error) {
 // Signed-out requests have nothing to end and are redirected the same way.
 func (m *Manager) logout(w http.ResponseWriter, r *http.Request) {
 	if err := m.sessions.Destroy(r.Context()); err != nil {
-		log.Printf("sign out: %v", err)
+		logging.RecordError(r, "logout", err)
 		http.Error(w, "Could not sign out. Please try again.", http.StatusInternalServerError)
 		return
 	}
@@ -164,14 +196,14 @@ func (m *Manager) login(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &tooLarge) {
 			status = http.StatusRequestEntityTooLarge
 		}
-		m.render(w, status, loginPage{Error: "Could not read your sign-in. Please try again."})
+		m.render(w, r, status, loginPage{Error: "Could not read your sign-in. Please try again."})
 		return
 	}
 	page := loginPage{Username: r.PostForm.Get("username")}
 	if !m.limiter.Allow() {
 		w.Header().Set("Retry-After", "12")
 		page.Error = "Too many sign-in attempts. Please wait a few seconds and try again."
-		m.render(w, http.StatusTooManyRequests, page)
+		m.render(w, r, http.StatusTooManyRequests, page)
 		return
 	}
 
@@ -182,14 +214,14 @@ func (m *Manager) login(w http.ResponseWriter, r *http.Request) {
 		err = m.sessions.RenewToken(ctx)
 	}
 	if err != nil {
-		log.Printf("sign in: %v", err)
+		logging.RecordError(r, "login", err)
 		page.Error = "Could not sign in. Please try again."
-		m.render(w, http.StatusInternalServerError, page)
+		m.render(w, r, http.StatusInternalServerError, page)
 		return
 	}
 	if user == nil {
 		page.Error = invalidCredentials
-		m.render(w, http.StatusUnauthorized, page)
+		m.render(w, r, http.StatusUnauthorized, page)
 		return
 	}
 	m.sessions.Put(ctx, usernameKey, user.Username)
@@ -217,12 +249,12 @@ func (m *Manager) verify(ctx context.Context, submittedUsername, password string
 	return user, nil
 }
 
-func (m *Manager) render(w http.ResponseWriter, status int, page loginPage) {
+func (m *Manager) render(w http.ResponseWriter, r *http.Request, status int, page loginPage) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.WriteHeader(status)
 	if err := m.page.Execute(w, page); err != nil {
-		log.Printf("render sign-in page: %v", err)
+		logging.RecordError(r, "render", err)
 	}
 }

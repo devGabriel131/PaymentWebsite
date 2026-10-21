@@ -7,7 +7,6 @@ import (
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
-	"gorm.io/gorm/logger"
 )
 
 type Student struct {
@@ -64,9 +63,8 @@ func (s *Store) UpdateField(ctx context.Context, id uint64, key, raw string) (*S
 		return nil, nil
 	}
 	var record Student
-	// SQL error logs can interpolate private field values; HTTP logs safe metadata.
-	result := s.db.WithContext(ctx).Session(&gorm.Session{Logger: logger.Discard}).
-		Model(&record).Where("id = ?", id).Clauses(clause.Returning{}).Update(field.Key, value)
+	result := s.db.WithContext(ctx).Model(&record).Where("id = ?", id).
+		Clauses(clause.Returning{}).Update(field.Key, value)
 	if result.Error != nil || result.RowsAffected == 0 {
 		return nil, result.Error
 	}

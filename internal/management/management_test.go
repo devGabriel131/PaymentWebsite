@@ -23,6 +23,7 @@ import (
 
 	"paymentwebsite/internal/auth"
 	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
@@ -48,7 +49,8 @@ func newApp(t *testing.T) *app {
 	t.Helper()
 	db := testdb.Open(t, &auth.User{}, &auth.Session{}, &links.Link{}, &students.Student{}, &settings.Settings{})
 	store := links.New(db)
-	manager, err := auth.New(db, false)
+	log := logging.New(io.Discard)
+	manager, err := auth.New(db, false, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +62,7 @@ func newApp(t *testing.T) *app {
 	root := http.NewServeMux()
 	manager.RegisterRoutes(root)
 	root.Handle("/management/", manager.Require(child))
-	server := httptest.NewServer(http.NewCrossOriginProtection().Handler(root))
+	server := httptest.NewServer(logging.Requests(log, http.NewCrossOriginProtection().Handler(root)))
 	t.Cleanup(server.Close)
 	return &app{url: server.URL, db: db, store: store}
 }
@@ -658,6 +660,7 @@ func TestStoreFailuresAreServerErrors(t *testing.T) {
 	if err := RegisterRoutes(mux, links.New(failed), students.New(failed), settings.New(failed), staff); err != nil {
 		t.Fatal(err)
 	}
+	handler := logging.Requests(logging.New(io.Discard), mux)
 
 	cancel := "/management/links/" + unknownID + "/cancel" // Well-formed, so it reaches the database.
 	for _, tc := range []struct {
@@ -674,7 +677,7 @@ func TestStoreFailuresAreServerErrors(t *testing.T) {
 			req := httptest.NewRequest(tc.method, tc.path, nil)
 			maps.Copy(req.Header, tc.header)
 			w := httptest.NewRecorder()
-			mux.ServeHTTP(w, req)
+			handler.ServeHTTP(w, req)
 			body := w.Body.String()
 			if w.Code != http.StatusInternalServerError || strings.Contains(body, "generated-links") ||
 				strings.Contains(body, "management-link") || strings.Contains(body, "student-table") ||

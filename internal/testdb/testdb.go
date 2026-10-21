@@ -13,6 +13,7 @@ import (
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // Open isolates each test in a schema, including queries through db.DB().
@@ -34,6 +35,7 @@ func Open(t *testing.T, models ...any) *gorm.DB {
 	db, err := gorm.Open(postgres.Open(parsed.String()), &gorm.Config{
 		DisableAutomaticPing:   true,
 		SkipDefaultTransaction: true,
+		Logger:                 logger.Discard,
 	})
 	if err != nil {
 		t.Fatal(err)

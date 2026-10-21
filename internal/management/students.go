@@ -3,12 +3,12 @@ package management
 import (
 	"context"
 	"errors"
-	"log"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
 
+	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/students"
 )
 
@@ -59,7 +59,7 @@ func (view *studentView) field(key string) *studentFieldView {
 	return nil
 }
 
-func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff func(context.Context) string, execute func(http.ResponseWriter, int, string, any)) {
+func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff func(context.Context) string, execute func(http.ResponseWriter, *http.Request, int, string, any)) {
 	notFound := func(w http.ResponseWriter) {
 		http.Error(w, "Student or field not found.", http.StatusNotFound)
 	}
@@ -71,7 +71,7 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 		}
 		record, err := roster.Get(ctx, id)
 		if err != nil {
-			log.Printf("load student %d: %v", id, err)
+			logging.RecordError(r, "load", err)
 			http.Error(w, "Could not load student. Please try again.", http.StatusInternalServerError)
 			return nil
 		}
@@ -81,12 +81,12 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 		return record
 	}
 
-	mux.HandleFunc("GET /management/students", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /management/students", logging.Operation("student_list", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		records, err := roster.List(ctx)
 		if err != nil {
-			log.Printf("list students: %v", err)
+			logging.RecordError(r, "list", err)
 			http.Error(w, "Could not load students. Please try again.", http.StatusInternalServerError)
 			return
 		}
@@ -94,10 +94,10 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 		for i, record := range records {
 			data.Students[i] = studentDisplay(record, false)
 		}
-		execute(w, http.StatusOK, "students.html", data)
-	})
+		execute(w, r, http.StatusOK, "students.html", data)
+	})))
 
-	mux.HandleFunc("GET /management/students/{id}", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /management/students/{id}", logging.Operation("student_get", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		record := load(ctx, w, r)
@@ -113,8 +113,8 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 		if modal {
 			name = "student-detail"
 		}
-		execute(w, http.StatusOK, name, data)
-	})
+		execute(w, r, http.StatusOK, name, data)
+	})))
 
 	fieldHandler := func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -155,8 +155,7 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 			case errors.As(err, &invalid):
 				status, editing, validation = http.StatusUnprocessableEntity, true, invalid.Message
 			case err != nil:
-				// Database error strings may contain the rejected submitted value.
-				log.Printf("save student %d field %s: %T", record.ID, field.Key, err)
+				logging.RecordError(r, "save", err)
 				http.Error(w, "Could not save this field. Please try again.", http.StatusInternalServerError)
 				return
 			case updated == nil:
@@ -180,16 +179,16 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 			data.Field.Value = attempted
 		}
 		if !partial {
-			execute(w, status, "students.html", data)
+			execute(w, r, status, "students.html", data)
 			return
 		}
 		if saved {
 			data.Student.OOB = modal
-			execute(w, status, "student-save", data)
+			execute(w, r, status, "student-save", data)
 			return
 		}
-		execute(w, status, "student-field", data.Field)
+		execute(w, r, status, "student-field", data.Field)
 	}
-	mux.HandleFunc("GET /management/students/{id}/fields/{field}", fieldHandler)
-	mux.HandleFunc("POST /management/students/{id}/fields/{field}", fieldHandler)
+	mux.Handle("GET /management/students/{id}/fields/{field}", logging.Operation("student_field_get", http.HandlerFunc(fieldHandler)))
+	mux.Handle("POST /management/students/{id}/fields/{field}", logging.Operation("student_update", http.HandlerFunc(fieldHandler)))
 }

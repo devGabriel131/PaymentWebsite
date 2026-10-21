@@ -3,6 +3,10 @@
 package auth
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,6 +19,7 @@ import (
 
 	"paymentwebsite/internal/customer"
 	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/management"
 	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
@@ -180,6 +185,82 @@ func TestPublicCustomerIgnoresStaffSessions(t *testing.T) {
 	}
 }
 
+func TestSessionCleanupDeletesOnlyExpired(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	log := logging.New(&out)
+	db := testdb.Open(t, &Session{}).Session(&gorm.Session{Logger: logging.NewDBLogger(log)})
+	manager := &Manager{db: db}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	sessions := []Session{
+		{Token: "PRIVATE-EXPIRED-TOKEN", Data: []byte("PRIVATE-EXPIRED-DATA"), Expiry: now.Add(-time.Hour)},
+		{Token: "PRIVATE-FUTURE-TOKEN", Data: []byte("PRIVATE-FUTURE-DATA"), Expiry: now.Add(time.Hour)},
+	}
+	if err := db.WithContext(t.Context()).Create(&sessions).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	manager.deleteExpiredSessions(t.Context(), log)
+	var remaining []Session
+	if err := db.WithContext(t.Context()).Find(&remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 || remaining[0].Token != sessions[1].Token ||
+		!bytes.Equal(remaining[0].Data, sessions[1].Data) || !remaining[0].Expiry.Equal(sessions[1].Expiry) {
+		t.Fatalf("cleanup changed future sessions or retained expired sessions: %#v", remaining)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("successful cleanup emitted logs: %s", out.Bytes())
+	}
+
+	if err := db.WithContext(t.Context()).Exec("ALTER TABLE sessions RENAME TO unavailable_cleanup_sessions").Error; err != nil {
+		t.Fatal(err)
+	}
+	manager.deleteExpiredSessions(t.Context(), log)
+	lines := bytes.Split(bytes.TrimSpace(out.Bytes()), []byte{'\n'})
+	if len(lines) != 1 || !bytes.HasSuffix(out.Bytes(), []byte{'\n'}) {
+		t.Fatalf("cleanup failure emitted %d lines, want one newline-terminated event: %s", len(lines), out.Bytes())
+	}
+	var event map[string]any
+	if err := json.Unmarshal(lines[0], &event); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]any{
+		"message":    "session_cleanup_failed",
+		"level":      "error",
+		"error_kind": "database",
+		"error_type": "*pgconn.PgError",
+		"sqlstate":   "42P01",
+	} {
+		if event[key] != want {
+			t.Errorf("%s = %v, want %v", key, event[key], want)
+		}
+	}
+	for key := range event {
+		switch key {
+		case "time", "message", "level", "error_kind", "error_type", "sqlstate":
+		default:
+			t.Errorf("unexpected cleanup event field %q", key)
+		}
+	}
+	for _, private := range []string{
+		"PRIVATE-EXPIRED-TOKEN", "PRIVATE-EXPIRED-DATA", "PRIVATE-FUTURE-TOKEN", "PRIVATE-FUTURE-DATA",
+		"sessions", "unavailable_cleanup_sessions", "expiry", "CURRENT_TIMESTAMP", "DELETE", "relation",
+	} {
+		if strings.Contains(out.String(), private) {
+			t.Errorf("cleanup log exposed private data %q: %s", private, out.Bytes())
+		}
+	}
+
+	out.Reset()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	manager.deleteExpiredSessions(ctx, log)
+	if out.Len() != 0 {
+		t.Fatalf("canceled cleanup emitted logs: %s", out.Bytes())
+	}
+}
+
 func newAuthDatabase(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := testdb.Open(t, &User{}, &Session{}, &links.Link{}, &students.Student{}, &settings.Settings{})
@@ -192,7 +273,8 @@ func newAuthDatabase(t *testing.T) *gorm.DB {
 // newApp wires auth like main: staff-only sessions, origin protection, and public customer routes.
 func newApp(t *testing.T, db *gorm.DB) (http.Handler, *Manager) {
 	t.Helper()
-	manager, err := New(db, false)
+	log := logging.New(io.Discard)
+	manager, err := New(db, false, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +290,7 @@ func newApp(t *testing.T, db *gorm.DB) (http.Handler, *Manager) {
 	if err := customer.RegisterRoutes(mux, store); err != nil {
 		t.Fatal(err)
 	}
-	return http.NewCrossOriginProtection().Handler(mux), manager
+	return logging.Requests(log, http.NewCrossOriginProtection().Handler(mux)), manager
 }
 
 func newRequest(t *testing.T, method, path string) *http.Request {

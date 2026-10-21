@@ -18,6 +18,7 @@ import (
 	"gorm.io/gorm"
 
 	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
 )
@@ -38,7 +39,7 @@ func TestErrorResponsesKeepNameForm(t *testing.T) {
 		t.Fatalf("save existing name: saved=%v, err=%v", saved, err)
 	}
 
-	muxes := map[bool]*http.ServeMux{
+	muxes := map[bool]http.Handler{
 		false: newMux(t, store),
 		true:  newMux(t, failingStore(t, db)),
 	}
@@ -485,13 +486,13 @@ func TestHeadRejectsUnusableLinks(t *testing.T) {
 // httpTimeout bounds each HTTP exchange, so a stuck handler fails its test.
 const httpTimeout = 10 * time.Second
 
-func newMux(t *testing.T, store *links.Store) *http.ServeMux {
+func newMux(t *testing.T, store *links.Store) http.Handler {
 	t.Helper()
 	mux := http.NewServeMux()
 	if err := RegisterRoutes(mux, store); err != nil {
 		t.Fatal(err)
 	}
-	return mux
+	return logging.Requests(logging.New(io.Discard), mux)
 }
 
 // serve runs the customer routes behind a real HTTP server.

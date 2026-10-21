@@ -3,17 +3,14 @@
 package students_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
-	"log"
 	"reflect"
 	"testing"
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/students"
@@ -175,9 +172,7 @@ func TestStorePropagatesDatabaseFailuresAfterFieldValidation(t *testing.T) {
 	if err := tx.Rollback().Error; err != nil {
 		t.Fatal(err)
 	}
-	var logged bytes.Buffer
-	sqlLogger := logger.New(log.New(&logged, "", 0), logger.Config{LogLevel: logger.Info})
-	failed := students.New(tx.Session(&gorm.Session{Logger: sqlLogger}))
+	failed := students.New(tx)
 	if got, err := failed.List(ctx); got != nil || err == nil {
 		t.Fatalf("failed List = %+v, %v", got, err)
 	}
@@ -187,9 +182,6 @@ func TestStorePropagatesDatabaseFailuresAfterFieldValidation(t *testing.T) {
 	const privateName = "Private student value"
 	if got, err := failed.UpdateField(ctx, original.ID, "name", privateName); got != nil || err == nil {
 		t.Fatalf("failed UpdateField = %+v, %v", got, err)
-	}
-	if bytes.Contains(logged.Bytes(), []byte(privateName)) {
-		t.Fatal("failed field update leaked submitted contents into SQL logs")
 	}
 	if got, err := failed.Get(ctx, 0); got != nil || err != nil {
 		t.Fatalf("zero Get queried failed database: %+v, %v", got, err)

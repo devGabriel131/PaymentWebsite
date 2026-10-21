@@ -6,13 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
-	"log"
 	"net/http"
 	"slices"
 	"strconv"
 	"time"
 
 	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
 )
@@ -41,14 +41,14 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 	if err != nil {
 		return err
 	}
-	execute := func(w http.ResponseWriter, status int, name string, data any) {
+	execute := func(w http.ResponseWriter, r *http.Request, status int, name string, data any) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Vary", "HX-Request")
 		w.WriteHeader(status)
 		if err := page.ExecuteTemplate(w, name, data); err != nil {
-			log.Printf("render management page: %v", err)
+			logging.RecordError(r, "render", err)
 		}
 	}
 	registerStudentRoutes(mux, roster, staff, execute)
@@ -74,7 +74,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 		} else {
 			var err error
 			if data.Links, err = store.List(ctx); err != nil {
-				log.Printf("list customer links: %v", err)
+				logging.RecordError(r, "list", err)
 				http.Error(w, "Could not load links. Please try again.", http.StatusInternalServerError)
 				return
 			}
@@ -94,20 +94,20 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			name = "index.html"
 			data.Staff = staff(r.Context())
 		}
-		execute(w, http.StatusOK, name, data)
+		execute(w, r, http.StatusOK, name, data)
 	}
 
-	mux.HandleFunc("GET /management/{$}", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /management/{$}", logging.Operation("link_list", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		render(ctx, w, r, pageData{}, nil)
-	})
-	mux.HandleFunc("GET /management/trash", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("GET /management/trash", logging.Operation("trash_list", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		render(ctx, w, r, pageData{Trash: true}, nil)
-	})
-	mux.HandleFunc("POST /management/links", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("POST /management/links", logging.Operation("link_create", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		current, err := config.Current(ctx)
@@ -116,19 +116,19 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			created, err = store.Create(ctx, staff(r.Context()), time.Now().Add(current.LinkLifetime()))
 		}
 		if err != nil {
-			log.Printf("generate customer link: %v", err)
+			logging.RecordError(r, "create", err)
 			http.Error(w, "Could not generate a link. Please try again.", http.StatusInternalServerError)
 			return
 		}
 
 		render(ctx, w, r, pageData{Notice: "Link created."}, &created)
-	})
-	mux.HandleFunc("POST /management/links/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("POST /management/links/{id}/cancel", logging.Operation("link_cancel", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		canceled, err := store.Cancel(ctx, r.PathValue("id"), staff(r.Context()))
 		if err != nil {
-			log.Printf("cancel customer link: %v", err)
+			logging.RecordError(r, "cancel", err)
 			http.Error(w, "Could not cancel this link. Please try again.", http.StatusInternalServerError)
 			return
 		}
@@ -144,32 +144,32 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			return
 		}
 		render(ctx, w, r, data, canceled)
-	})
-	mux.HandleFunc("POST /management/links/cancel", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("POST /management/links/cancel", logging.Operation("link_cancel_all", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		if err := store.CancelAll(ctx, staff(r.Context())); err != nil {
-			log.Printf("cancel all customer links: %v", err)
+			logging.RecordError(r, "cancel_all", err)
 			http.Error(w, "Could not cancel links. Please try again.", http.StatusInternalServerError)
 			return
 		}
 
 		render(ctx, w, r, pageData{Notice: "All unfinished links canceled."}, nil)
-	})
+	})))
 
 	// showSettings renders the settings page with the saved values.
 	showSettings := func(ctx context.Context, w http.ResponseWriter, r *http.Request, status int, data settingsData) {
 		var err error
 		if data.Current, err = config.Current(ctx); err != nil {
-			log.Printf("load settings: %v", err)
+			logging.RecordError(r, "load", err)
 			http.Error(w, "Could not load settings. Please try again.", http.StatusInternalServerError)
 			return
 		}
 		data.Min, data.Max = settings.MinLinkLifetimeDays, settings.MaxLinkLifetimeDays
 		data.Staff = staff(r.Context())
-		execute(w, status, "settings.html", data)
+		execute(w, r, status, "settings.html", data)
 	}
-	mux.HandleFunc("GET /management/settings", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /management/settings", logging.Operation("settings_load", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		var data settingsData
@@ -177,8 +177,8 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			data.Notice = "Saved."
 		}
 		showSettings(ctx, w, r, http.StatusOK, data)
-	})
-	mux.HandleFunc("POST /management/settings", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("POST /management/settings", logging.Operation("settings_update", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
@@ -196,9 +196,9 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 				Error: fmt.Sprintf("Choose between %d and %d days.", settings.MinLinkLifetimeDays, settings.MaxLinkLifetimeDays),
 			})
 		default:
-			log.Printf("save settings: %v", err)
+			logging.RecordError(r, "save", err)
 			http.Error(w, "Could not save settings. Please try again.", http.StatusInternalServerError)
 		}
-	})
+	})))
 	return nil
 }
