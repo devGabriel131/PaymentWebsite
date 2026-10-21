@@ -44,7 +44,7 @@ Keep `SESSION_COOKIE_SECURE=false` in private `.env` for local HTTP. Air loads i
 
 The database credentials in `compose.yaml` and `.env.example` are for local development only. PostgreSQL is bound to `127.0.0.1:5432`; its named volume preserves issued links between container restarts. Start the Compose service before Air if it is not already running.
 
-`DATABASE_URL` is required in both server and CLI modes. `SESSION_COOKIE_SECURE` defaults to true when unset. Startup migrates users, settings, and the SCS-compatible sessions table, then runs `links.Migrate` for links and students. Models define the tables and constraints; there are no versioned migration files.
+The Go binary requires `DATABASE_URL` in both server and CLI modes; the Railway launcher uses the deployed service's environment, not local credentials. `SESSION_COOKIE_SECURE` defaults to true when unset. Startup migrates users, settings, and the SCS-compatible sessions table, then runs `links.Migrate` for links and students. Models define the tables and constraints; there are no versioned migration files.
 
 **One-time mock-data loss:** if the `students` table is absent, the links migration drops the existing mock `links` table, if present, then creates/migrates links and students in one transaction. All old mock URLs, drafts, and submissions are intentionally lost; users, sessions, and settings are preserved. There is no legacy submission/expiry backfill. Once `students` exists, subsequent startups only run idempotent `AutoMigrate` and preserve retained rows. If the cutover fails, the table reset and schema creation roll back together.
 
@@ -66,7 +66,7 @@ No frontend build step is required. Air's generated `tmp/` directory is ignored 
 
 ## Staff accounts and sessions
 
-Create the two staff accounts explicitly. For the default local database:
+Create the two staff accounts explicitly. For hosted accounts, use the [Railway account launcher](#railway-account-commands). For the default local database:
 
 ```fish
 set -gx DATABASE_URL 'postgres://paymentwebsite:paymentwebsite@127.0.0.1:5432/paymentwebsite?sslmode=disable'
@@ -75,7 +75,7 @@ go run . user add worker
 go run . user list
 ```
 
-Replace example usernames as needed. Usernames are case-insensitive, normalized to lowercase, and accept 1–64 ASCII letters, digits, `.`, `_`, or `-`. Passwords require at least 4 Unicode characters and at most 1024 bytes, entered twice at a hidden terminal prompt. Password arguments, environment variables, and piped plaintext are not accepted. Account commands need `DATABASE_URL`, but not a running web server.
+Replace example usernames as needed. Usernames are case-insensitive, normalized to lowercase, and accept 1–64 ASCII letters, digits, `.`, `_`, or `-`. Passwords require at least 4 Unicode characters and at most 1024 bytes, entered twice at a hidden terminal prompt. Password arguments, environment variables, and piped plaintext are not accepted. The Go account commands need `DATABASE_URL` where they execute, but not a running web server.
 
 The four-character minimum is temporary for mock-data development; raise it before production.
 
@@ -106,27 +106,32 @@ railway up --project a0207263-4a1b-4174-b693-5830fd46e486 --environment producti
 
 The public HTTPS domain serves both management and customer routes. PostgreSQL traffic stays private. Do not copy Railway database credentials into `.env.example` or commit a local `.env`.
 
-Manage hosted accounts inside the deployed app container, where the private PostgreSQL URL works:
+### Railway account commands
+
+Manage hosted accounts from your computer with `./user.fish`. The launcher runs the existing account CLI inside the deployed app container over Railway SSH, where the private PostgreSQL URL works:
 
 ```fish
-railway ssh --project a0207263-4a1b-4174-b693-5830fd46e486 --environment production --service PaymentWebsite
+./user.fish add gabriel
+./user.fish add worker
+./user.fish list
 ```
 
-Then run these in the remote shell:
+Use `./user.fish passwd <username>`, `./user.fish revoke <username>`, and `./user.fish remove <username>` for the other account operations. `./user.fish --help` works without connecting to Railway.
 
-```sh
-/app/out user add gabriel
-/app/out user add worker
-/app/out user list
-```
+Prerequisites: Fish, the Railway CLI, authentication through `railway login`, and a registered SSH key through `railway ssh keys add`. If you have no SSH key, generate one with `ssh-keygen -t ed25519` first. The launcher needs neither a local Go toolchain nor `DATABASE_URL` or `.env`.
 
-Railpack currently builds `/app/out`; account commands ship in that same binary. Real staff enter their own passwords at the hidden prompts. The same remote commands support `passwd`, `revoke`, and `remove`. `railway run` and `railway shell` execute locally and do not make Railway's private database hostname reachable; do not expose PostgreSQL publicly or copy production credentials into local `.env` for this CLI.
+The target is explicitly `amused-light` / `PaymentWebsite`, defaulting to `production` independently of the CLI's linked context. To select another existing environment in that project, put `--environment <name>` before the account command.
+
+Real staff enter their own passwords at the hidden prompts. Both stdin and stdout must be terminals for `add` and `passwd`; do not pipe or redirect those commands. Railway output and exit status pass through unchanged.
+
+Railpack currently builds `/app/out`; the launcher runs that deployed binary, not local working-tree changes. `railway run` and `railway shell` execute locally and do not make Railway's private database hostname reachable; do not expose PostgreSQL publicly or copy production credentials into local `.env` for this CLI.
 
 ## Project structure
 
 ```text
 .
 ├── main.go
+├── user.fish
 ├── static/
 │   ├── favicon.ico
 │   ├── logo.png
@@ -180,6 +185,7 @@ Railpack currently builds `/app/out`; account commands ship in that same binary.
 ```
 
 - `main.go`: configuration, GORM initialization and migration, bounded connection pool, route wiring, HTTP timeouts, and native cross-origin request protection.
+- `user.fish`: local Railway SSH launcher for deployed staff account commands, preserving interactive password prompts without local database credentials.
 - `internal/auth/`: staff credentials/CLI, embedded login form, sign-out, account-version authorization exposing the verified username (`auth.Staff`), and SCS table model.
 - `internal/management/`: shared link registry, settings, and authenticated Students routes/templates; `students.go` builds field views and handles detail/edit fragments, while `student.html` and `students.html` share detail, field, and table-row rendering. `main.go` injects `auth.Staff` for link/settings audit attribution.
 - `internal/customer/`: issued-link validation on entry, autosave, final submission/replay, the public submit lock, and embedded customer-content/success and invalid-link templates; name parsing is shared with Students.
