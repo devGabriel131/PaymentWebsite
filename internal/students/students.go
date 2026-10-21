@@ -66,7 +66,7 @@ func (s *Store) UpdateField(ctx context.Context, id uint64, key, raw string) (*S
 	var record Student
 	// SQL error logs can interpolate private field values; HTTP logs safe metadata.
 	result := s.db.WithContext(ctx).Session(&gorm.Session{Logger: logger.Discard}).
-		Model(&record).Where("id = ?", id).Clauses(clause.Returning{}).Update(field.Key(), value)
+		Model(&record).Where("id = ?", id).Clauses(clause.Returning{}).Update(field.Key, value)
 	if result.Error != nil || result.RowsAffected == 0 {
 		return nil, result.Error
 	}

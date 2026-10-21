@@ -44,9 +44,9 @@ Keep `SESSION_COOKIE_SECURE=false` in private `.env` for local HTTP. Air loads i
 
 The database credentials in `compose.yaml` and `.env.example` are for local development only. PostgreSQL is bound to `127.0.0.1:5432`; its named volume preserves issued links between container restarts. Start the Compose service before Air if it is not already running.
 
-The Go binary requires `DATABASE_URL` in both server and CLI modes; the Railway launcher uses the deployed service's environment, not local credentials. `SESSION_COOKIE_SECURE` defaults to true when unset. Startup migrates users, settings, and the SCS-compatible sessions table, then runs `links.Migrate` for links and students. Models define the tables and constraints; there are no versioned migration files.
+The Go binary requires `DATABASE_URL` in both server and CLI modes; the Railway launcher uses the deployed service's environment, not local credentials. `SESSION_COOKIE_SECURE` defaults to true when unset. Startup runs one `AutoMigrate(&auth.User{}, &auth.Session{}, &settings.Settings{}, &links.Link{}, &students.Student{})` over the current models and their constraints. There are no versioned migration files, legacy backfills, or automatic destructive resets. If an obsolete local mock schema cannot migrate, explicitly reset only its disposable `students`/`links` tables as a one-off development operation; never reset live/shared data without separate authorization.
 
-**One-time mock-data loss:** if the `students` table is absent, the links migration drops the existing mock `links` table, if present, then creates/migrates links and students in one transaction. All old mock URLs, drafts, and submissions are intentionally lost; users, sessions, and settings are preserved. There is no legacy submission/expiry backfill. Once `students` exists, subsequent startups only run idempotent `AutoMigrate` and preserve retained rows. If the cutover fails, the table reset and schema creation roll back together.
+`main.go` owns the shared SQL pool and GORM configuration: maximum open and idle connections are both 10, and `SkipDefaultTransaction: true` avoids GORM's per-write transaction wrapper. PostgreSQL statement atomicity remains intact, including atomic completion/enrollment in one SQL command. Genuine multi-statement units still require explicit transactions. Writes are synchronous and acknowledged only after database success; there is no application cache, write queue, or background draft worker.
 
 Restart an existing Air process after changing its environment so it reloads `.env`. Keep one instance running. Without Air, export the required variables before `go run .`; the application never loads `.env` itself or silently falls back to local credentials.
 
@@ -55,6 +55,8 @@ Use one server or Air instance at a time: they share port 3000, and Air instance
 Open <http://127.0.0.1:3000/management/> and sign in using a CLI-created account. **Create & copy link** copies the same-origin URL and appends it; **Copy link** on that new row recopies it until the page reloads or **Cancel all unfinished links** refreshes the list. Clipboard access requires JavaScript and HTTPS or localhost. If blocked, the new URL remains visible for manual copying; failed creation leaves the clipboard unchanged.
 
 Air watches Go, HTML, CSS, and JavaScript files. Its generated defaults do not automatically refresh the browser; refresh manually. Use `go tool air`, not a separately installed global `air` command. The existing `.air.toml` was generated with `go tool air init`.
+
+On interrupt or SIGTERM, the server stops accepting new connections and allows in-flight handlers up to ten seconds to finish. A failed graceful shutdown force-closes remaining connections; auth session cleanup stops before the SQL pool closes. Active request contexts are not canceled just because shutdown starts. Air's forceful development rebuilds are not this production drain guarantee.
 
 Both interfaces load the shared `static/styles.css` stylesheet from `/static/styles.css`. Customer brand colors are defined on `:root`; management has a scoped dark palette and native dark controls, including sign-in and settings, regardless of the system color preference. Customer rules use `.customer` for the name form and `.customer-not-found` for the invalid-link page. Go embeds the `static/` directory into the binary and serves its files under `/static/`, with the favicon also available at `/favicon.ico`, so deployment needs no separate asset directory. Embedded asset edits require a rebuild; Air handles CSS and JavaScript changes during development.
 
@@ -83,6 +85,8 @@ The four-character minimum is temporary for mock-data development; raise it befo
 
 Both staff have the same access to the link registry; the separate accounts exist so each action records who did it. Sessions contain account identity/version, not link history. Persistent HttpOnly, SameSite=Lax cookies remember sign-in across tabs and browser restarts; ordinary visits do not extend the 14-day deadline. Production cookies are Secure even behind Railway's TLS proxy. Login attempts from every client share a per-process limit of two initial attempts, then one every 12 seconds. This bounds password guessing and Argon2 memory use; the accepted tradeoff is that anyone who keeps the limit spent blocks new staff sign-ins until they stop, while existing sessions keep working. There is no registration or email recovery.
 
+`auth.New(db, secureCookies)` owns SCS construction, cookie settings, and periodic expired-session cleanup. The `management_session` cookie is scoped to `/management/`; SCS wraps login/logout and protected management handlers only. The root redirect, customer routes, static files, and favicon bypass staff-session loading, even when sent a forged staff cookie. Protected requests still verify the current account version against PostgreSQL. `Manager.Close()` stops session cleanup, not the shared SQL pool.
+
 **Sign out** posts to `POST /management/logout`, which deletes that browser's session row and expires its cookie; the account's other browsers stay signed in. To end every session for an account, use `user revoke`.
 
 ## Railway test deployment
@@ -92,7 +96,6 @@ The `PaymentWebsite` service in the existing `amused-light` project deploys `dev
 Service configuration:
 
 - `DATABASE_URL=${{Postgres.DATABASE_URL}}` references the project's PostgreSQL service over Railway's private network. Local `.env` credentials are not uploaded or reused.
-- `LINK_ENCRYPTION_KEY` is no longer read. After the mock-link cutover removes the old table containing `token_ciphertext`, delete the variable and destroy any backup of it; without the key, older database backups that still contain ciphertext can't yield URLs.
 - `SESSION_COOKIE_SECURE=true` keeps management cookies HTTPS-only.
 - `PORT=8080` makes the application listen on all interfaces for Railway routing. Without `PORT`, local startup is bound to `127.0.0.1:3000`.
 - The health check remains `/management/`: signed-out requests receive HTTP 200 with only the login form. PostgreSQL connection and migrations must succeed before HTTP starts.
@@ -154,7 +157,6 @@ Railpack currently builds `/app/out`; the launcher runs that deployed binary, no
 │   │   └── templates/
 │   │       ├── index.html
 │   │       ├── settings.html
-│   │       ├── student.html
 │   │       └── students.html
 │   ├── customer/
 │   │   ├── customer.go
@@ -174,7 +176,6 @@ Railpack currently builds `/app/out`; the launcher runs that deployed binary, no
 │   │   ├── fields.go
 │   │   └── fields_test.go
 │   └── testdb/testdb.go
-├── migrations/.gitkeep
 ├── compose.yaml
 ├── go.mod
 ├── go.sum
@@ -184,24 +185,23 @@ Railpack currently builds `/app/out`; the launcher runs that deployed binary, no
 └── README.md
 ```
 
-- `main.go`: configuration, GORM initialization and migration, bounded connection pool, route wiring, HTTP timeouts, and native cross-origin request protection.
+- `main.go`: configuration, one current-model `AutoMigrate`, shared bounded SQL pool, route wiring, HTTP timeouts, native cross-origin request protection, and signal-driven graceful shutdown.
 - `user.fish`: local Railway SSH launcher for deployed staff account commands, preserving interactive password prompts without local database credentials.
-- `internal/auth/`: staff credentials/CLI, embedded login form, sign-out, account-version authorization exposing the verified username (`auth.Staff`), and SCS table model.
-- `internal/management/`: shared link registry, settings, and authenticated Students routes/templates; `students.go` builds field views and handles detail/edit fragments, while `student.html` and `students.html` share detail, field, and table-row rendering. `main.go` injects `auth.Staff` for link/settings audit attribution.
-- `internal/customer/`: issued-link validation on entry, autosave, final submission/replay, the public submit lock, and embedded customer-content/success and invalid-link templates; name parsing is shared with Students.
-- `internal/links/`: random issuance, digest-only storage, initial/completed access expiry, progress status, unfinished-only revocation, atomic finalization/enrollment, GORM model and transactional mock cutover, and PostgreSQL lifecycle regressions.
+- `internal/auth/`: staff credentials/CLI, embedded login form, sign-out, account-version authorization exposing the verified username (`auth.Staff`), and ownership of SCS setup, scoped middleware, and session cleanup.
+- `internal/management/`: shared link registry, settings, and authenticated Students routes/templates; `students.go` builds field views and handles detail/edit fragments, while the single `students.html` template owns list/detail pages and shared field/table-row rendering. `main.go` injects `auth.Staff` for link/settings audit attribution.
+- `internal/customer/`: public GET/HEAD handling, parse-first autosave/final submission, authoritative save-result dispatch, completion replay/privacy, and embedded customer-content/success and invalid-link templates; name parsing is shared with Students.
+- `internal/links/`: random issuance, digest-only storage, initial/completed access expiry, progress status, unfinished-only revocation, authoritative write outcomes, atomic single-command finalization/enrollment, and current GORM model.
 - `internal/settings/`: the single settings row, its link-lifetime range (enforced by the store and by database checks), and who last changed it.
-- `internal/students/`: retained per-completion model/store, typed field registry and shared name validation, and field-update regressions. Reads do not filter by source-link age or expiry; updates change only one allowlisted column, never the link snapshot.
+- `internal/students/`: retained per-completion model/store, concrete field metadata registry and shared name validation, and field-update regressions. Reads do not filter by source-link age or expiry; updates change only one allowlisted column, never the link snapshot.
 - `static/styles.css`: shared interface styles and scoped management/customer layout, embedded and served by the Go application.
 - `static/management.js`: link-page-only native clipboard copying and request-failure/clipboard sequencing; creation and cancellation use declarative HTMX forms.
 - `static/management-time.js`: shared local-time formatting for link/Trash rows and Students/detail pages, including HTMX-swapped content.
 - `static/students.js`: student row activation, native dialog and editor focus, and scoped HTMX validation/network-failure handling; fetching, saving, and canceling remain declarative HTMX interactions.
 - `compose.yaml`: local PostgreSQL service and persistent development volume.
 - `.env.example`: local database connection template. Air loads the private `.env` copy.
-- `internal/testdb/`: integration-only isolated PostgreSQL schemas/pools, including SCS's SQL access.
-- `migrations/`: reserved for future versioned GORM migrations. This slice uses `AutoMigrate`; its `.gitkeep` only preserves the directory in version control.
+- `internal/testdb/`: integration-only isolated PostgreSQL schemas, one schema-scoped SQL pool per test shared by GORM and SCS.
 
-Both public and management link flows use the same link store; management also receives the student store backed by the same database. Enrollment uses the link transaction, not a separate student-store transaction. Dependencies are passed explicitly; there is no global database or `init()` setup. Folder separation is not an authorization boundary.
+Both public and management link flows use the same link store; management also receives the student store backed by the same database. Enrollment belongs to the link store's atomic SQL command, not a separate student-store transaction. Dependencies are passed explicitly; there is no global database or `init()` setup. Folder separation is not an authorization boundary.
 
 ## Cryptographic link design
 
@@ -211,7 +211,7 @@ PostgreSQL stores the SHA-256 digest as a 32-byte binary primary key, the draft/
 
 SHA-256 is the lookup digest, not the source of randomness. Go 1.26's `crypto/rand.Read` terminates the process if the OS random source fails; there is no weaker fallback.
 
-Customer entry, autosave, and submission hash the supplied token and check for a matching database record that is neither canceled nor expired, through GORM's structured conditions. Expiry is compared with the database clock (`expires_at > now()`) on every request, so it is a hard cutoff: a customer mid-form whose link lapses gets the 404 page on their next autosave or submit, and keeps what was already saved. GET and POST record `opened_at` on the first usable-link lookup. Multiple issued tokens remain valid until canceled or expired; opening a link does not consume it. A database error does not grant access. Saving a name updates only the matching, usable, unsubmitted link; it cannot insert or revive a canceled or expired link.
+Customer reads and guarded writes hash the supplied token and check for a matching database record that is neither canceled nor expired, using bound SQL parameters. Expiry is compared with the database clock (`expires_at > now()`) on each database operation, so it is a hard cutoff: a customer mid-form whose link lapses gets the 404 page on their next autosave or submit, and keeps what was already saved. Only GET records `opened_at`; HEAD is read-only, and POST never records a visit. Repeat GETs of an already-opened link are SELECT-only. The first GET conditionally stamps and returns the first-visit row; if a concurrent open, cancellation, or expiry prevents that update, the store rereads usability rather than returning stale access. Multiple issued tokens remain valid until canceled or expired; opening a link does not consume it. A database error does not grant access. Saving a name updates only the matching, usable, unsubmitted link; it cannot insert or revive a canceled or expired link.
 
 `HEAD /customer/{token}` is a read-only usability check: HTTP 200 even after final submission, 404 for unknown, malformed, canceled, or expired tokens, and 500 for lookup failures. It returns no body, keeps the normal customer response headers, and never changes `opened_at`, saved names, or submission state. A later GET still records the first visit. GET-based previewers can therefore mark a link **Opened**; this is not proof of human interaction.
 
@@ -225,11 +225,15 @@ The form accepts Unicode names, trims surrounding whitespace, and rejects invali
 
 Leaving a changed box sends it to `POST /customer/{token}/draft` (HTMX `change` trigger). A successful draft persists across reloads without setting `submitted_at` or creating a student, and replies only with the status line (**Saved.** or **Not saved.** plus the reason), never redrawing the input. Drafts mirror the box, including clearing it; a network failure shows **Not saved. Check your connection.** Text typed but never blurred, or blurred while offline, is not kept. Requests from the box queue the latest pending change so an older draft cannot overwrite a newer one.
 
-**Submit** posts to `POST /customer/{token}` and additionally rejects a blank name. Invalid names return HTTP 422, malformed forms return HTTP 400, oversized bodies return HTTP 413, and database lookup or save failures return HTTP 500. Submission errors keep a retryable form with an inline message; validation/save failures retain the parsed attempted name. HTMX final POSTs return `customer-response`, containing the stable `#customer-content` section; the form swaps that whole section, including its heading, while drafts still target only `#save-status`. Ordinary requests receive a complete page.
+**Submit** posts to `POST /customer/{token}` and additionally rejects a blank name. Both customer POST handlers cap, parse, and validate the body before database access. Valid input calls `SaveDraft` or `Submit` directly, without an HTTP-layer preflight or post-save lookup. The store returns an authoritative `links.SaveResult`: `Saved` means this operation committed; `AlreadySubmitted` means the still-usable link was already finalized; `Unavailable` (zero) means malformed, unknown, canceled, or expired. Database errors return `Unavailable` plus an error, never a successful outcome.
 
-A successful submission atomically commits the final name, `submitted_at`, exactly 168 hours of success-page access, and one student record. Insert or commit failure rolls all of those changes back, preserving the draft and initial expiry for retry. Only after commit does the form disappear, replaced by **Thank you / Your information has been saved.** and the title **Submission complete | Masterminds**.
+`Saved` returns draft status-only HTTP 200 or final confirmation HTTP 200. `AlreadySubmitted` returns final confirmation HTTP 200 or stale-draft HTTP 409. `Unavailable` returns 404; database failures return a retryable 500 without claiming success. For malformed, oversized, or invalid input, a read-only lookup first resolves link state: unusable links still return 404, and usable completed links still return final 200 or draft 409, even for malformed/oversized bodies. Only usable unfinished links receive parse/validation errors: 400 for malformed forms, 413 for oversized bodies, and 422 for invalid names. Errors retain the saved draft name on 400/413 and the attempted name on validation/save failure.
 
-Reloads and repeated final POSTs return HTTP 200 success until the completion deadline. Final replays do not parse replacement answers, create another student, or move completion/access deadlines. A stale draft, including one from another tab, returns HTTP 409 with `HX-Refresh: true` for HTMX, reloading into success without claiming its text was saved. Conditional database writes prevent racing drafts or final submissions from changing a completed form. If cancellation wins before submission, no student is created; if submission wins, cancellation cannot revoke it.
+HTMX final POSTs return `customer-response`, containing the stable `#customer-content` section; the form swaps that whole section, including its heading, while drafts still target only `#save-status`. Ordinary requests receive a complete page. Responses retain `Vary: HX-Request`; HTMX 404/409 responses request a full refresh.
+
+A successful submission uses one PostgreSQL data-modifying CTE command: a guarded link UPDATE returns the final name/digest/timestamp directly into the student INSERT. It atomically commits the final name, `submitted_at`, exactly 168 hours of success-page access, and one student record. Insert or deferred commit failure rolls all changes back, preserving the draft and initial expiry for retry. Only after database success does the form disappear, replaced by **Thank you / Your information has been saved.** and the title **Submission complete | Masterminds**.
+
+Reloads and repeated final POSTs return HTTP 200 success until the completion deadline. Replays may parse replacement input in memory, but never save it, expose submitted/canonical names, create another student, or move completion/access deadlines. A stale draft, including one from another tab, returns HTTP 409 with `HX-Refresh: true` for HTMX, reloading into success without claiming its text was saved. Conditional database writes prevent racing drafts or final submissions from changing a completed form. If cancellation wins before submission, no student is created; if submission wins, cancellation cannot revoke it. On a no-op write only, the link store rereads active submission state to distinguish `AlreadySubmitted` from `Unavailable`.
 
 ### Students details and field editing
 
@@ -237,7 +241,7 @@ The Students table shows **Name** and **Submitted**, ordered newest completion f
 
 Each pencil opens only its addressed field. Save updates exactly one registered column using a bound value; an HTMX modal save returns the field plus an out-of-band table row, while standalone saves redirect to the full detail page. Validation returns HTTP 422 with the attempted value and accessible inline error, ready for correction; unknown fields or missing students return 404, malformed/oversized bodies return 400/413, and database failures return 500 rather than a saved notice. Field requests queue within the details panel. Other HTTP or network failures retain the current table, saved values, and unsaved input with a nearby retry message; expired staff sessions redirect to login instead of injecting login HTML into a field.
 
-Fields come from the ordered `students.Field` registry, not reflection, schema discovery, JSON/EAV storage, or arbitrary-column writes. To add a field, add a typed `Student` column and a field implementation/registry entry defining its label, input type, required state, value, and parser. Table headings/cells and detail/editor templates already iterate the registry. Customer collection for additional fields is a separate change; only Name exists today.
+Fields come from the ordered, package-owned `students.Field` metadata registry, not an interface, reflection, schema discovery, JSON/EAV storage, or arbitrary-column writes. `Field` is a concrete struct with `Key`, `Label`, `InputType`, `Required`, and `Value`/`Parse` functions; callers treat the registry as read-only. To add a field, add a typed `Student` column and a metadata entry defining its presentation, value, and parser. Table headings/cells and detail/editor templates already iterate the registry. Customer collection for additional fields is a separate change; only Name exists today.
 
 ### Testing cancellation
 
@@ -284,18 +288,18 @@ go vet -tags=integration ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 ```
 
-Each integration test creates its own PostgreSQL schema/pool and drops only that schema afterward. Regression contracts include:
+Each integration test creates its own PostgreSQL schema through one schema-scoped pool shared by GORM and direct SQL/SCS access. Cleanup closes the HTTP server, stops auth session cleanup when present, drops only the generated schema, then closes its pool. Regression contracts include:
 
 - Digest-only storage and token boundaries; status progression, draft persistence without enrollment, independent link/name state, hard access cutoffs, and verified staff attribution for creation/cancellation.
-- First-Students-absent mock cutover, preserved user/session/settings sentinels, source-link foreign-key protection, and repeated migration preserving links and students.
+- Source-link foreign-key protection against deletion/hash changes, and repeated current-model `AutoMigrate` preserving links and students.
 - Exactly one enrollment under concurrent final submissions; rollback of name/completion/expiry on student insert or deferred commit failure; successful retry; submission/cancellation races with either completion plus one student or cancellation plus none.
-- Completed GET/final-POST HTTP 200 replay without answer/deadline changes, stale-draft 409, retryable customer form fragments, and completed-access expiry without student loss.
+- Completed GET/final-POST HTTP 200 replay without answer/deadline changes, including invalid-body replay precedence, stale-draft 409, retryable customer form fragments with retained names, and completed-access expiry without student loss.
 - The exact 24-hour completion boundary, next-render main-page archival, no completed records in Trash, stale cancel unable to reinsert an archived row, and Students retention after source expiry.
 - Student newest-first reads, typed field validation/allowlisting and escaped rendering, canonical-name edits isolated from the original link snapshot and other students, full-page/HTMX editor and modal/OOB-row contracts, rejected requests without mutation, and honest empty/error responses.
 - Real management authentication/CSRF boundaries including Students, show-once URLs, row-local cancellation, first-canceler preservation, missing-ID no-swap behavior, database failures without success fragments, and unfinished-only single/bulk cancellation.
-- Settings default, store/database 2–14 day constraints and singleton row, changes affecting only new unfinished access; authentication credential failure, rate limiting, token rotation, persistence/expiry, password/revocation/removal invalidation, username recreation, and browser-local sign-out.
+- Settings default, store/database 2–14 day constraints and singleton row, changes affecting only new unfinished access; authentication credential failure, rate limiting, token rotation, persistence/expiry, password/revocation/removal invalidation, username recreation, browser-local sign-out, and public customer access bypassing staff-session storage.
 
-Customer HEAD regressions use real HTTP connections and direct persisted-row comparisons: fresh HEAD leaves **Not opened**, GET records the first visit, later HEAD preserves timestamps and draft/submitted data, unusable tokens return 404, and lookup failures remain 500. They check body suppression on the wire, customer response headers, and unsupported-method rejection.
+Customer HEAD regressions use real HTTP connections and direct persisted-row comparisons: fresh HEAD leaves **Not opened**, GET records the first visit, later HEAD preserves timestamps and draft/submitted data, unusable tokens return 404, and lookup failures remain 500. They check body suppression on the wire, customer response headers, and unsupported-method rejection. Separate link-store regressions protect the populated first-GET result, unchanged repeat-open timestamp, and cancellation winning while the first-open update waits. POST never records a first visit.
 
 These checks do not prove randomness statistically. Cryptographic randomness comes from the standard library's OS-backed generator, not from a finite collision test.
 

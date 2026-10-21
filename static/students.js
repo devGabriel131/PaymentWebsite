@@ -2,15 +2,6 @@ const studentDialog = document.querySelector("#student-dialog");
 const studentRequests = new WeakMap();
 let studentOpenerRowID;
 
-function studentRequestError(request) {
-  if (request.fieldID) {
-    return document.getElementById(request.fieldID)?.querySelector(".student-request-error");
-  }
-  for (const error of document.querySelectorAll("main.management-students .student-request-error")) {
-    if (!error.closest(".student-field")) return error;
-  }
-}
-
 document.addEventListener("click", (event) => {
   if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
   const row = event.target.closest(".student-table tr[data-student-id]");
@@ -33,7 +24,9 @@ document.body.addEventListener("htmx:beforeRequest", ({ detail }) => {
     saving: source.matches("form.student-field-editor"),
   };
   studentRequests.set(detail.xhr, request);
-  const error = studentRequestError(request);
+  const error = request.fieldID
+    ? document.getElementById(request.fieldID)?.querySelector(".student-request-error")
+    : document.querySelector("main.management-students > .student-request-error");
   if (error) {
     error.hidden = true;
     error.textContent = "";
@@ -73,7 +66,9 @@ studentDialog?.addEventListener("close", () => {
 document.body.addEventListener("htmx:afterRequest", ({ detail }) => {
   const request = studentRequests.get(detail.xhr);
   if (!request || detail.successful || detail.xhr.getResponseHeader("HX-Redirect")) return;
-  const error = studentRequestError(request);
+  const error = request.fieldID
+    ? document.getElementById(request.fieldID)?.querySelector(".student-request-error")
+    : document.querySelector("main.management-students > .student-request-error");
   if (!error) return;
   error.textContent = request.saving
     ? "Could not save this field. Please try again."

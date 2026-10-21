@@ -8,9 +8,11 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/alexedwards/argon2id"
+	"github.com/alexedwards/scs/postgresstore"
 	"github.com/alexedwards/scs/v2"
 	"golang.org/x/time/rate"
 	"gorm.io/gorm"
@@ -20,6 +22,7 @@ import (
 var templates embed.FS
 
 const (
+	cookieName         = "management_session"
 	usernameKey        = "username"
 	versionKey         = "auth_version"
 	loginInterval      = 12 * time.Second
@@ -34,6 +37,8 @@ type loginPage struct {
 type Manager struct {
 	db        *gorm.DB
 	sessions  *scs.SessionManager
+	store     *postgresstore.PostgresStore
+	closeOnce sync.Once
 	page      *template.Template
 	dummyHash string
 	// ponytail: one limit shared by every client bounds guessing and Argon2's
@@ -42,8 +47,8 @@ type Manager struct {
 	limiter *rate.Limiter
 }
 
-// New expects sessions to wrap every request through LoadAndSave.
-func New(db *gorm.DB, sessions *scs.SessionManager) (*Manager, error) {
+// New owns staff-session configuration and expired-session cleanup, not the SQL pool.
+func New(db *gorm.DB, secureCookies bool) (*Manager, error) {
 	page, err := template.ParseFS(templates, "templates/login.html")
 	if err != nil {
 		return nil, err
@@ -53,18 +58,40 @@ func New(db *gorm.DB, sessions *scs.SessionManager) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	store := postgresstore.New(sqlDB)
+	sessions := scs.New()
+	sessions.Store = store
+	sessions.Lifetime = 14 * 24 * time.Hour
+	sessions.IdleTimeout = 0
+	sessions.Cookie.Name = cookieName
+	sessions.Cookie.Path = "/management/"
+	sessions.Cookie.Domain = ""
+	sessions.Cookie.HttpOnly = true
+	sessions.Cookie.SameSite = http.SameSiteLaxMode
+	sessions.Cookie.Persist = true
+	sessions.Cookie.Secure = secureCookies
 	return &Manager{
 		db:        db,
 		sessions:  sessions,
+		store:     store,
 		page:      page,
 		dummyHash: dummyHash,
 		limiter:   rate.NewLimiter(rate.Every(loginInterval), 2),
 	}, nil
 }
 
+// Close stops expired-session cleanup once, leaving the caller's SQL pool open.
+func (m *Manager) Close() {
+	m.closeOnce.Do(m.store.StopCleanup)
+}
+
 func (m *Manager) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /management/login", m.login)
-	mux.HandleFunc("POST /management/logout", m.logout)
+	mux.Handle("POST /management/login", m.sessions.LoadAndSave(http.HandlerFunc(m.login)))
+	mux.Handle("POST /management/logout", m.sessions.LoadAndSave(http.HandlerFunc(m.logout)))
 }
 
 type staffKey struct{}
@@ -79,7 +106,7 @@ func Staff(ctx context.Context) string {
 // Require serves next only for a session whose account still exists with the
 // auth version recorded at sign-in, exposing the account through Staff.
 func (m *Manager) Require(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return m.sessions.LoadAndSave(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		username, err := m.authenticated(r.Context())
 		if err != nil {
 			log.Printf("check management session: %v", err)
@@ -99,7 +126,7 @@ func (m *Manager) Require(next http.Handler) http.Handler {
 		default:
 			http.Redirect(w, r, "/management/", http.StatusSeeOther)
 		}
-	})
+	}))
 }
 
 // authenticated returns the session's username, or "" when it is signed out.

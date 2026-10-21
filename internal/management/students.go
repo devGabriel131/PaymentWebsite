@@ -13,11 +13,8 @@ import (
 )
 
 type studentFieldView struct {
+	students.Field
 	StudentID uint64
-	Key       string
-	Label     string
-	InputType string
-	Required  bool
 	Value     string
 	Modal     bool
 	Editing   bool
@@ -26,35 +23,28 @@ type studentFieldView struct {
 }
 
 type studentView struct {
-	ID        uint64
-	Fields    []studentFieldView
-	CreatedAt time.Time
-	OOB       bool
-}
-
-type studentListData struct {
-	Staff    string
-	Fields   []students.Field
-	Students []studentView
+	students.Student
+	Fields []studentFieldView
+	OOB    bool
 }
 
 type studentPageData struct {
-	Staff   string
-	Student studentView
-	Field   *studentFieldView
-	Modal   bool
+	Staff    string
+	Fields   []students.Field
+	Students []studentView
+	Student  studentView
+	Field    *studentFieldView
+	Modal    bool
 }
 
 // studentDisplay evaluates the field registry once for each rendered student.
 // The same values feed table rows, detail fields, and saved-field responses.
 func studentDisplay(record students.Student, modal bool) studentView {
 	fields := students.Fields()
-	view := studentView{ID: record.ID, CreatedAt: record.CreatedAt, Fields: make([]studentFieldView, len(fields))}
+	view := studentView{Student: record, Fields: make([]studentFieldView, len(fields))}
 	for i, field := range fields {
 		view.Fields[i] = studentFieldView{
-			StudentID: record.ID, Key: field.Key(), Label: field.Label(),
-			InputType: field.InputType(), Required: field.Required(),
-			Value: field.Value(record), Modal: modal,
+			Field: field, StudentID: record.ID, Value: field.Value(record), Modal: modal,
 		}
 	}
 	return view
@@ -100,7 +90,7 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 			http.Error(w, "Could not load students. Please try again.", http.StatusInternalServerError)
 			return
 		}
-		data := studentListData{Staff: staff(r.Context()), Fields: students.Fields(), Students: make([]studentView, len(records))}
+		data := studentPageData{Staff: staff(r.Context()), Fields: students.Fields(), Students: make([]studentView, len(records))}
 		for i, record := range records {
 			data.Students[i] = studentDisplay(record, false)
 		}
@@ -119,7 +109,7 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 		if field := data.Student.field(r.URL.Query().Get("saved")); field != nil {
 			field.Saved = true
 		}
-		name := "student.html"
+		name := "students.html"
 		if modal {
 			name = "student-detail"
 		}
@@ -159,17 +149,14 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 			}
 			modal = r.PostForm.Get("modal") == "1"
 			attempted = r.PostForm.Get("value")
-			updated, err := roster.UpdateField(ctx, record.ID, field.Key(), attempted)
+			updated, err := roster.UpdateField(ctx, record.ID, field.Key, attempted)
 			var invalid *students.ValidationError
 			switch {
 			case errors.As(err, &invalid):
 				status, editing, validation = http.StatusUnprocessableEntity, true, invalid.Message
-			case errors.Is(err, students.ErrUnknownField):
-				notFound(w)
-				return
 			case err != nil:
 				// Database error strings may contain the rejected submitted value.
-				log.Printf("save student %d field %s: %T", record.ID, field.Key(), err)
+				log.Printf("save student %d field %s: %T", record.ID, field.Key, err)
 				http.Error(w, "Could not save this field. Please try again.", http.StatusInternalServerError)
 				return
 			case updated == nil:
@@ -177,7 +164,7 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 				return
 			default:
 				if !partial {
-					path := "/management/students/" + strconv.FormatUint(record.ID, 10) + "?saved=" + url.QueryEscape(field.Key())
+					path := "/management/students/" + strconv.FormatUint(record.ID, 10) + "?saved=" + url.QueryEscape(field.Key)
 					http.Redirect(w, r, path, http.StatusSeeOther)
 					return
 				}
@@ -187,13 +174,13 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 
 		modal = partial && modal
 		data := studentPageData{Staff: staff(r.Context()), Student: studentDisplay(*record, modal), Modal: modal}
-		data.Field = data.Student.field(field.Key())
+		data.Field = data.Student.field(field.Key)
 		data.Field.Editing, data.Field.Error, data.Field.Saved = editing, validation, saved
 		if validation != "" {
 			data.Field.Value = attempted
 		}
 		if !partial {
-			execute(w, status, "student.html", data)
+			execute(w, status, "students.html", data)
 			return
 		}
 		if saved {

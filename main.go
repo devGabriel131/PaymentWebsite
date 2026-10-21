@@ -8,11 +8,11 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
-	"github.com/alexedwards/scs/postgresstore"
-	"github.com/alexedwards/scs/v2"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -51,12 +51,16 @@ func run() error {
 		}
 	}
 
+	signalContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		return errors.New("DATABASE_URL is required")
 	}
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
-		DisableAutomaticPing: true,
+		DisableAutomaticPing:   true,
+		SkipDefaultTransaction: true,
 		Logger: logger.New(log.New(os.Stderr, "", log.LstdFlags), logger.Config{
 			SlowThreshold:        200 * time.Millisecond,
 			LogLevel:             logger.Warn,
@@ -72,22 +76,19 @@ func run() error {
 	}
 	defer sqlDB.Close()
 	sqlDB.SetMaxOpenConns(10)
-	sqlDB.SetMaxIdleConns(5)
+	sqlDB.SetMaxIdleConns(10)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(signalContext, 10*time.Second)
 	defer cancel()
 	if err := sqlDB.PingContext(ctx); err != nil {
 		return fmt.Errorf("connect to PostgreSQL: %w", err)
 	}
-	if err := db.WithContext(ctx).AutoMigrate(&auth.User{}, &auth.Session{}, &settings.Settings{}); err != nil {
+	if err := db.WithContext(ctx).AutoMigrate(&auth.User{}, &auth.Session{}, &settings.Settings{}, &links.Link{}, &students.Student{}); err != nil {
 		return fmt.Errorf("migrate database: %w", err)
-	}
-	if err := links.Migrate(db.WithContext(ctx)); err != nil {
-		return fmt.Errorf("migrate links: %w", err)
 	}
 
 	if len(args) > 0 {
-		return auth.RunCLI(context.Background(), db, args[1:])
+		return auth.RunCLI(signalContext, db, args[1:])
 	}
 
 	secureCookies := true
@@ -98,23 +99,11 @@ func run() error {
 		}
 	}
 	store := links.New(db)
-	sessionStore := postgresstore.New(sqlDB)
-	defer sessionStore.StopCleanup()
-	sessions := scs.New()
-	sessions.Store = sessionStore
-	sessions.Lifetime = 14 * 24 * time.Hour
-	sessions.IdleTimeout = 0
-	sessions.Cookie.Name = "management_session"
-	sessions.Cookie.Path = "/management/"
-	sessions.Cookie.Domain = ""
-	sessions.Cookie.HttpOnly = true
-	sessions.Cookie.SameSite = http.SameSiteLaxMode
-	sessions.Cookie.Persist = true
-	sessions.Cookie.Secure = secureCookies
-	authentication, err := auth.New(db, sessions)
+	authentication, err := auth.New(db, secureCookies)
 	if err != nil {
 		return fmt.Errorf("initialize authentication: %w", err)
 	}
+	defer authentication.Close()
 	mux := http.NewServeMux()
 	mux.Handle("GET /static/", http.FileServerFS(assets))
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
@@ -140,12 +129,37 @@ func run() error {
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           http.NewCrossOriginProtection().Handler(sessions.LoadAndSave(mux)),
+		Handler:           http.NewCrossOriginProtection().Handler(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
 	log.Printf("Listening on %s", server.Addr)
-	return server.ListenAndServe()
+	return serve(signalContext, server)
+}
+
+func serve(ctx context.Context, server *http.Server) error {
+	result := make(chan error, 1)
+	go func() { result <- server.ListenAndServe() }()
+
+	select {
+	case err := <-result:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		err := server.Shutdown(shutdownContext)
+		if err != nil {
+			err = errors.Join(err, server.Close())
+		}
+		servingErr := <-result
+		if errors.Is(servingErr, http.ErrServerClosed) {
+			servingErr = nil
+		}
+		return errors.Join(err, servingErr)
+	}
 }

@@ -17,14 +17,14 @@
   <a class="management-skip-link" href="#main-content">Skip to content</a>
   {{template "header" .Staff}}
   {{if .Trash}}{{template "navigation" "trash"}}{{else}}{{template "navigation" "links"}}{{end}}
-  <main id="main-content" class="management-links management-registry" tabindex="-1">
+  <main id="main-content" class="management-links" tabindex="-1">
     <div class="management-page-heading">
       <div>
         <h1>{{if .Trash}}Trash{{else}}Customer links{{end}}</h1>
         <p class="management-page-description">{{if .Trash}}Canceled and expired unfinished links, with their saved data and history.{{else}}Active links and forms completed in the last 24 hours. Completed information stays in Students.{{end}}</p>
       </div>
       {{if not .Trash}}
-      <form id="create-link" class="management-create" action="/management/links" method="post"
+      <form id="create-link" action="/management/links" method="post"
         hx-post="/management/links" hx-target="#generated-links" hx-swap="beforeend"
         hx-disabled-elt="button">
         <button type="submit" class="management-button-primary">
@@ -55,7 +55,7 @@
       <div class="management-panel-footer">
         <p class="management-retention-note">{{if .Trash}}Links and their history are retained, not deleted.{{else}}Finished links leave this page after 24 hours; their information remains in Students. Canceled and expired unfinished links move to Trash.{{end}}</p>
         {{if not .Trash}}
-        <form class="management-cancel-all" action="/management/links/cancel" method="post"
+        <form action="/management/links/cancel" method="post"
           hx-post="/management/links/cancel" hx-target="#generated-links" hx-disabled-elt="button"
           hx-confirm="Cancel all unfinished links? Unfinished customer forms will no longer open. Completed submissions are kept.">
           <button type="submit" class="management-button-danger">Cancel all unfinished links</button>
@@ -98,11 +98,7 @@
 {{end}}
 
 {{define "result"}}
-{{if .Link.ID}}
-  {{if .ShowLink}}{{template "link" .Link}}{{end}}
-{{else}}
-  {{range .Links}}{{template "link" .}}{{end}}
-{{end}}
+{{range .Links}}{{template "link" .}}{{end}}
 <p id="link-status" hx-swap-oob="innerHTML">{{.Notice}}</p>
 {{end}}
 

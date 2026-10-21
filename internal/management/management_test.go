@@ -19,8 +19,6 @@ import (
 	"time"
 
 	"github.com/alexedwards/argon2id"
-	"github.com/alexedwards/scs/postgresstore"
-	"github.com/alexedwards/scs/v2"
 	"gorm.io/gorm"
 
 	"paymentwebsite/internal/auth"
@@ -44,22 +42,17 @@ type app struct {
 	store *links.Store
 }
 
-// newApp wires routes like main.go: auth's login route on the root mux and the
-// whole management subtree behind Require, inside origin and session middleware.
+// newApp wires routes like main.go: auth owns session middleware and the root
+// mux retains outer origin protection.
 func newApp(t *testing.T) *app {
 	t.Helper()
 	db := testdb.Open(t, &auth.User{}, &auth.Session{}, &links.Link{}, &students.Student{}, &settings.Settings{})
 	store := links.New(db)
-	sqlDB, err := db.DB()
+	manager, err := auth.New(db, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sessions := scs.New()
-	sessions.Store = postgresstore.NewWithCleanupInterval(sqlDB, 0)
-	manager, err := auth.New(db, sessions)
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(manager.Close)
 	child := http.NewServeMux()
 	if err := RegisterRoutes(child, store, students.New(db), settings.New(db), auth.Staff); err != nil {
 		t.Fatal(err)
@@ -67,7 +60,7 @@ func newApp(t *testing.T) *app {
 	root := http.NewServeMux()
 	manager.RegisterRoutes(root)
 	root.Handle("/management/", manager.Require(child))
-	server := httptest.NewServer(http.NewCrossOriginProtection().Handler(sessions.LoadAndSave(root)))
+	server := httptest.NewServer(http.NewCrossOriginProtection().Handler(root))
 	t.Cleanup(server.Close)
 	return &app{url: server.URL, db: db, store: store}
 }
@@ -88,7 +81,7 @@ func newBrowser(t *testing.T) *http.Client {
 func (a *app) signIn(t *testing.T, username string) *http.Client {
 	t.Helper()
 	password := rand.Text()
-	hash, err := argon2id.CreateHash(password, argon2id.DefaultParams)
+	hash, err := argon2id.CreateHash(password, &argon2id.Params{Memory: 16, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +217,7 @@ func TestUnauthorizedRequestsCannotUseManagement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := a.store.Submit(t.Context(), existing.Token, "Private student"); err != nil || !saved {
+	if saved, err := a.store.Submit(t.Context(), existing.Token, "Private student"); err != nil || saved != links.Saved {
 		t.Fatalf("submit private student: saved=%v, err=%v", saved, err)
 	}
 	existing.Name, existing.Status = "Private student", links.Finished
@@ -260,14 +253,9 @@ func TestUnauthorizedRequestsCannotUseManagement(t *testing.T) {
 				t.Fatalf("sign-in page leaked link data: %s", body)
 			}
 		})
-		t.Run(b.name+"/trash", func(t *testing.T) {
-			res, body := a.send(t, b.browser, http.MethodGet, "/management/trash", nil, nil)
-			if res.StatusCode != http.StatusSeeOther || res.Header.Get("Location") != "/management/" ||
-				strings.Contains(body, existing.ID) || strings.Contains(body, existing.Token) {
-				t.Fatalf("unauthorized Trash leaked data or failed to redirect: status=%d, body=%s", res.StatusCode, body)
-			}
-		})
 		for _, path := range []string{
+			"/management/trash",
+			"/management/settings",
 			"/management/students",
 			"/management/students/1",
 			"/management/students/1/fields/name?edit=1",
@@ -280,7 +268,7 @@ func TestUnauthorizedRequestsCannotUseManagement(t *testing.T) {
 						strings.Contains(body, "<form") || strings.Contains(body, existing.ID) ||
 						strings.Contains(body, existing.Token) || strings.Contains(body, existing.Name) || strings.Contains(body, "student-details") ||
 						strings.Contains(body, "student-table") {
-						t.Fatalf("unauthorized student read: status=%d, %s=%q, body=%s",
+						t.Fatalf("unauthorized management read: status=%d, %s=%q, body=%s",
 							res.StatusCode, mode.redirectHeader, res.Header.Get(mode.redirectHeader), body)
 					}
 				})
@@ -315,7 +303,7 @@ func TestCrossOriginWritesAreRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := a.store.Submit(t.Context(), existing.Token, "Original student"); err != nil || !saved {
+	if saved, err := a.store.Submit(t.Context(), existing.Token, "Original student"); err != nil || saved != links.Saved {
 		t.Fatalf("submit student: saved=%v, err=%v", saved, err)
 	}
 	existing.Name, existing.Status = "Original student", links.Finished
@@ -423,7 +411,7 @@ func TestRegistryArchivesCompletedSubmissions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if saved, err := a.store.Submit(t.Context(), created.Token, fixture.name); err != nil || !saved {
+		if saved, err := a.store.Submit(t.Context(), created.Token, fixture.name); err != nil || saved != links.Saved {
 			t.Fatalf("submit %s: saved=%v, err=%v", fixture.name, saved, err)
 		}
 		submitted := now.Add(-fixture.submittedAge)
@@ -445,7 +433,7 @@ func TestRegistryArchivesCompletedSubmissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := a.store.SaveDraft(t.Context(), draft.Token, "Old unfinished form"); err != nil || !saved {
+	if saved, err := a.store.SaveDraft(t.Context(), draft.Token, "Old unfinished form"); err != nil || saved != links.Saved {
 		t.Fatalf("save old draft: saved=%v, err=%v", saved, err)
 	}
 	if err := a.db.WithContext(t.Context()).Model(&links.Link{}).
@@ -493,146 +481,166 @@ func TestRegistryArchivesCompletedSubmissions(t *testing.T) {
 
 func TestStaffShareLinkStatuses(t *testing.T) {
 	a := newApp(t)
-	ctx := t.Context()
 	admin := a.signIn(t, "admin")
 	worker := a.signIn(t, "worker")
-
-	res, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmx)
-	firstToken := createdToken(t, body)
-	created := a.list(t)
-	created[0].Token = firstToken
-	requireFragment(t, res, body, created) // Only the appended row, never the whole list.
-
-	res, body = a.send(t, admin, http.MethodPost, "/management/links", nil, nil)
-	secondToken := createdToken(t, body)
-	created = a.list(t)
-	if len(created) != 2 {
-		t.Fatalf("ordinary create left %d links, want 2", len(created))
-	}
-	created[1].Token = secondToken // The first row's URL is gone after its creating response.
-	requirePage(t, res, body, created)
-
-	// Customers progress through their own links.
-	if saved, err := a.store.Submit(ctx, firstToken, "Ana Pérez"); err != nil || !saved {
-		t.Fatalf("save name: saved=%v, err=%v", saved, err)
-	}
-	if link, err := a.store.Open(ctx, secondToken); err != nil || link == nil {
-		t.Fatalf("open link: link=%v, err=%v", link, err)
-	}
-	entries := a.list(t)
-	if entries[0].Status != links.Finished || entries[1].Status != links.Opened {
-		t.Fatalf("statuses = %q, %q; want Finished, Opened", entries[0].Status, entries[1].Status)
-	}
-	for name, browser := range map[string]*http.Client{"admin": admin, "worker": worker} {
-		t.Run(name+" fresh page", func(t *testing.T) {
-			res, body := a.send(t, browser, http.MethodGet, "/management/", nil, nil)
-			requirePage(t, res, body, entries)
-		})
-	}
-
-	// A completed submission remains available and cannot be canceled.
-	res, body = a.send(t, worker, http.MethodPost, "/management/links/"+entries[0].ID+"/cancel", nil, nil)
-	entries = a.list(t)
-	if entries[0].Status != links.Finished || entries[0].Name != "Ana Pérez" ||
-		entries[0].CanceledBy != "" || entries[1].Status != links.Opened {
-		t.Fatalf("cancel finished: registry = %+v", entries)
-	}
-	requirePage(t, res, body, entries)
-
-	// An HTMX cancel removes only its own row, leaving other rows as shown,
-	// including a newly created one the customer has since opened.
-	_, body = a.send(t, worker, http.MethodPost, "/management/links", nil, htmx)
-	if link, err := a.store.Open(ctx, createdToken(t, body)); err != nil || link == nil {
-		t.Fatalf("open worker's link: link=%v, err=%v", link, err)
-	}
-	res, body = a.send(t, admin, http.MethodPost, "/management/links/"+entries[1].ID+"/cancel", nil, htmx)
-	entries = a.list(t)
-	if entries[1].Status != links.Canceled || entries[2].Status != links.Opened {
-		t.Fatalf("HTMX cancel one: registry = %+v", entries)
-	}
-	requireFragment(t, res, body, nil)
-
-	res, body = a.send(t, worker, http.MethodPost, "/management/links/cancel", nil, nil)
-	entries = a.list(t)
-	if len(entries) != 3 || entries[0].Status != links.Finished || entries[0].Name != "Ana Pérez" ||
-		entries[1].Status != links.Canceled || entries[2].Status != links.Canceled {
-		t.Fatalf("cancel all must keep completed submissions and cancel unfinished links: %+v", entries)
-	}
-	requirePage(t, res, body, entries[:1])
-	res, body = a.send(t, worker, http.MethodGet, "/management/trash", nil, nil)
-	requirePage(t, res, body, entries[1:])
-
-	// Each action records the session's account, and cancel all keeps earlier cancelers.
-	for i, want := range []struct{ createdBy, canceledBy string }{
-		{"admin", ""},
-		{"admin", "admin"},
-		{"worker", "worker"},
-	} {
-		if entries[i].CreatedBy != want.createdBy || entries[i].CanceledBy != want.canceledBy {
-			t.Errorf("link %d: created by %q, canceled by %q; want %q, %q",
-				i, entries[i].CreatedBy, entries[i].CanceledBy, want.createdBy, want.canceledBy)
-		}
-	}
-}
-
-// A single HTMX cancel removes only its addressed row from the main view,
-// retaining it in Trash; unknown IDs swap nothing.
-func TestHTMXCancelMovesOnlyItsRowToTrash(t *testing.T) {
-	a := newApp(t)
-	ctx := t.Context()
-	admin := a.signIn(t, "admin")
-	worker := a.signIn(t, "worker")
-	create := func(staff string, expiresAt time.Time) links.Entry {
-		t.Helper()
-		entry, err := a.store.Create(ctx, staff, expiresAt)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return entry
-	}
-	named, expired, other := create("admin", later), create("admin", time.Now().Add(-time.Minute)), create("worker", later)
-	if saved, err := a.store.SaveDraft(ctx, named.Token, "Ana Pérez"); err != nil || !saved {
-		t.Fatalf("save name: saved=%v, err=%v", saved, err)
-	}
-	// The other customer opens their link after the page rendered it.
-	if link, err := a.store.Open(ctx, other.Token); err != nil || link == nil {
-		t.Fatalf("open other link: link=%v, err=%v", link, err)
-	}
 	cancel := func(t *testing.T, browser *http.Client, id string, header http.Header) (*http.Response, string) {
 		t.Helper()
 		return a.send(t, browser, http.MethodPost, "/management/links/"+id+"/cancel", nil, header)
 	}
+	var firstToken, secondToken, thirdToken string
+	var entries []links.Entry
 
-	canceled := links.Entry{ID: named.ID, Name: "Ana Pérez", Status: links.Canceled, CreatedBy: "admin", CanceledBy: "worker"}
-	res, body := cancel(t, worker, named.ID, htmx)
-	requireFragment(t, res, body, nil)
-	// Repeating it, even from another account, keeps the first canceler.
-	res, body = cancel(t, admin, named.ID, htmx)
-	requireFragment(t, res, body, nil)
-	// A page rendered before the link lapsed still offers to cancel it.
-	stillExpired := links.Entry{ID: expired.ID, Status: links.Expired, CreatedBy: "admin"}
-	res, body = cancel(t, worker, expired.ID, htmx)
-	requireFragment(t, res, body, nil)
+	if !t.Run("creation full page and one-time tokens", func(t *testing.T) {
+		res, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmx)
+		firstToken = createdToken(t, body)
+		created := a.list(t)
+		if len(created) != 1 {
+			t.Fatalf("HTMX create left %d links, want 1", len(created))
+		}
+		created[0].Token = firstToken
+		requireFragment(t, res, body, created)
 
-	registry := []links.Entry{canceled, stillExpired, {ID: other.ID, Status: links.Opened, CreatedBy: "worker", ExpiresAt: later}}
-	for name, id := range map[string]string{"unknown": unknownID, "malformed": "not-issued", "customer token": other.Token} {
-		t.Run(name, func(t *testing.T) {
-			if res, body := cancel(t, admin, id, htmx); res.StatusCode != http.StatusNoContent || body != "" {
+		res, body = a.send(t, admin, http.MethodPost, "/management/links", nil, nil)
+		secondToken = createdToken(t, body)
+		created = a.list(t)
+		if len(created) != 2 {
+			t.Fatalf("ordinary create left %d links, want 2", len(created))
+		}
+		created[1].Token = secondToken
+		requirePage(t, res, body, created)
+	}) {
+		return
+	}
+
+	if !t.Run("shared customer statuses", func(t *testing.T) {
+		if saved, err := a.store.Submit(t.Context(), firstToken, "Ana Pérez"); err != nil || saved != links.Saved {
+			t.Fatalf("submit name: saved=%v, err=%v", saved, err)
+		}
+		if link, err := a.store.Open(t.Context(), secondToken); err != nil || link == nil {
+			t.Fatalf("open link: link=%v, err=%v", link, err)
+		}
+		entries = a.list(t)
+		if entries[0].Status != links.Finished || entries[0].Name != "Ana Pérez" || entries[1].Status != links.Opened {
+			t.Fatalf("submitted and opened customer statuses: %+v", entries)
+		}
+		for name, browser := range map[string]*http.Client{"admin": admin, "worker": worker} {
+			t.Run(name+" fresh page", func(t *testing.T) {
+				res, body := a.send(t, browser, http.MethodGet, "/management/", nil, nil)
+				requirePage(t, res, body, entries)
+			})
+		}
+		res, body := cancel(t, worker, entries[0].ID, nil)
+		a.requireRegistry(t, entries...)
+		requirePage(t, res, body, entries)
+	}) {
+		return
+	}
+
+	if !t.Run("canceled draft retained without replacing other rows", func(t *testing.T) {
+		res, body := a.send(t, worker, http.MethodPost, "/management/links", nil, htmx)
+		thirdToken = createdToken(t, body)
+		created := a.list(t)
+		if len(created) != 3 {
+			t.Fatalf("worker create left %d links, want 3", len(created))
+		}
+		created[2].Token = thirdToken
+		requireFragment(t, res, body, created[2:])
+		if link, err := a.store.Open(t.Context(), thirdToken); err != nil || link == nil {
+			t.Fatalf("open worker's link: link=%v, err=%v", link, err)
+		}
+		if saved, err := a.store.SaveDraft(t.Context(), secondToken, "Retained draft"); err != nil || saved != links.Saved {
+			t.Fatalf("save draft: saved=%v, err=%v", saved, err)
+		}
+		entries = a.list(t)
+		if entries[1].Status != links.InProgress || entries[1].Name != "Retained draft" || entries[2].Status != links.Opened {
+			t.Fatalf("draft and unrelated customer statuses: %+v", entries)
+		}
+		entries[1].Status, entries[1].CanceledBy = links.Canceled, "worker"
+		res, body = cancel(t, worker, entries[1].ID, htmx)
+		requireFragment(t, res, body, nil)
+		a.requireRegistry(t, entries...)
+		res, body = a.send(t, admin, http.MethodGet, "/management/trash", nil, nil)
+		requirePage(t, res, body, entries[1:2])
+	}) {
+		return
+	}
+
+	if !t.Run("first canceler audit preserved", func(t *testing.T) {
+		res, body := cancel(t, admin, entries[1].ID, htmx)
+		requireFragment(t, res, body, nil)
+		a.requireRegistry(t, entries...)
+	}) {
+		return
+	}
+
+	if !t.Run("expired HTMX row removed without cancellation", func(t *testing.T) {
+		expired, err := a.store.Create(t.Context(), "admin", time.Now().Add(-time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		expired.Token, expired.Status = "", links.Expired
+		entries = append(entries, expired)
+		res, body := cancel(t, worker, expired.ID, htmx)
+		requireFragment(t, res, body, nil)
+		a.requireRegistry(t, entries...)
+	}) {
+		return
+	}
+
+	for _, tc := range []struct{ name, id string }{
+		{"unknown", unknownID},
+		{"malformed", "not-issued"},
+		{"raw customer token", thirdToken},
+	} {
+		t.Run(tc.name+" cancel ID", func(t *testing.T) {
+			if res, body := cancel(t, admin, tc.id, htmx); res.StatusCode != http.StatusNoContent || body != "" {
 				t.Fatalf("HTMX: status = %d, want 204 so nothing is swapped: %s", res.StatusCode, body)
 			}
-			res, body := cancel(t, admin, id, nil)
-			requirePage(t, res, body, registry[2:])
+			res, body := cancel(t, admin, tc.id, nil)
+			requirePage(t, res, body, []links.Entry{entries[0], entries[2]})
+			a.requireRegistry(t, entries...)
 		})
 	}
-	a.requireRegistry(t, registry...)
 
-	// Cancel all empties the main view; Trash keeps earlier cancelers and expiry.
-	res, body = a.send(t, admin, http.MethodPost, "/management/links/cancel", nil, htmx)
-	registry[2].Status, registry[2].CanceledBy = links.Canceled, "admin"
-	requireFragment(t, res, body, nil)
-	res, body = a.send(t, admin, http.MethodGet, "/management/trash", nil, nil)
-	requirePage(t, res, body, registry)
-	a.requireRegistry(t, registry...)
+	if !t.Run("ordinary cancel all retains completed and earlier audit", func(t *testing.T) {
+		entries[2].Status, entries[2].CanceledBy = links.Canceled, "admin"
+		res, body := a.send(t, admin, http.MethodPost, "/management/links/cancel", nil, nil)
+		requirePage(t, res, body, entries[:1])
+		a.requireRegistry(t, entries...)
+		res, body = a.send(t, worker, http.MethodGet, "/management/trash", nil, nil)
+		requirePage(t, res, body, entries[1:])
+	}) {
+		return
+	}
+
+	t.Run("HTMX cancel all retains completed and earlier audit", func(t *testing.T) {
+		_, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmx)
+		createdToken(t, body)
+		created := a.list(t)
+		if len(created) != len(entries)+1 {
+			t.Fatalf("create before cancel all left %d links, want %d", len(created), len(entries)+1)
+		}
+		newest := created[len(created)-1]
+		newest.Status, newest.CanceledBy = links.Canceled, "worker"
+		entries = append(entries, newest)
+		res, body := a.send(t, worker, http.MethodPost, "/management/links/cancel", nil, htmx)
+		requireFragment(t, res, body, entries[:1])
+		a.requireRegistry(t, entries...)
+		res, body = a.send(t, worker, http.MethodGet, "/management/trash", nil, nil)
+		requirePage(t, res, body, entries[1:])
+		for i, want := range []struct{ createdBy, canceledBy string }{
+			{"admin", ""},
+			{"admin", "worker"},
+			{"worker", "admin"},
+			{"admin", ""},
+			{"admin", "worker"},
+		} {
+			if entries[i].CreatedBy != want.createdBy || entries[i].CanceledBy != want.canceledBy {
+				t.Errorf("link %d: created by %q, canceled by %q; want %q, %q",
+					i, entries[i].CreatedBy, entries[i].CanceledBy, want.createdBy, want.canceledBy)
+			}
+		}
+	})
 }
 
 // Database failures answer 500 with no list, row, or notice that htmx could

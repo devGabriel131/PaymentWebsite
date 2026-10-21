@@ -218,7 +218,7 @@ func enroll(t *testing.T, db *gorm.DB, sources *links.Store, ctx context.Context
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := sources.Submit(ctx, entry.Token, name); err != nil || !saved {
+	if saved, err := sources.Submit(ctx, entry.Token, name); err != nil || saved != links.Saved {
 		t.Fatalf("enrollment saved=%v, err=%v", saved, err)
 	}
 	digest, err := hex.DecodeString(entry.ID)

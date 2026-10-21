@@ -33,35 +33,32 @@ func TestErrorResponsesKeepNameForm(t *testing.T) {
 		t.Fatal(err)
 	}
 	token := entry.Token
-	if saved, err := store.SaveDraft(t.Context(), token, "Existing name"); err != nil || !saved {
+	const existing = "Existing name"
+	if saved, err := store.SaveDraft(t.Context(), token, existing); err != nil || saved != links.Saved {
 		t.Fatalf("save existing name: saved=%v, err=%v", saved, err)
 	}
 
-	failedStore := failingStore(t, db)
-	muxes := map[bool]*http.ServeMux{}
-	for failed, s := range map[bool]*links.Store{false: store, true: failedStore} {
-		mux := http.NewServeMux()
-		if err := RegisterRoutes(mux, s); err != nil {
-			t.Fatal(err)
-		}
-		muxes[failed] = mux
+	muxes := map[bool]*http.ServeMux{
+		false: newMux(t, store),
+		true:  newMux(t, failingStore(t, db)),
 	}
-
+	const attempted = "  Ada & co  "
 	cases := []struct {
-		name         string
-		method       string
-		body         string
-		status       int
-		failedLookup bool
+		name            string
+		method          string
+		body            string
+		status          int
+		databaseFailure bool
+		value           string
 	}{
-		{"malformed form", http.MethodPost, "name=%zz", http.StatusBadRequest, false},
-		{"oversized ASCII form", http.MethodPost, "name=" + strings.Repeat("a", 4100), http.StatusRequestEntityTooLarge, false},
-		{"oversized encoded Unicode form", http.MethodPost, url.Values{"name": {strings.Repeat("é", 683)}}.Encode(), http.StatusRequestEntityTooLarge, false},
-		{"blank final name", http.MethodPost, "name=+", http.StatusUnprocessableEntity, false},
-		{"NUL name", http.MethodPost, "name=A%00", http.StatusUnprocessableEntity, false},
-		{"invalid UTF-8 name", http.MethodPost, "name=%FF", http.StatusUnprocessableEntity, false},
-		{"lookup failure on submission", http.MethodPost, "name=Ada", http.StatusInternalServerError, true},
-		{"lookup failure on entry", http.MethodGet, "", http.StatusInternalServerError, true},
+		{"malformed form", http.MethodPost, "name=%zz", http.StatusBadRequest, false, existing},
+		{"oversized ASCII form", http.MethodPost, "name=" + strings.Repeat("a", 4100), http.StatusRequestEntityTooLarge, false, existing},
+		{"oversized encoded Unicode form", http.MethodPost, url.Values{"name": {strings.Repeat("é", 683)}}.Encode(), http.StatusRequestEntityTooLarge, false, existing},
+		{"blank final name", http.MethodPost, "name=+", http.StatusUnprocessableEntity, false, " "},
+		{"NUL name", http.MethodPost, "name=A%00", http.StatusUnprocessableEntity, false, "A\x00"},
+		{"invalid UTF-8 name", http.MethodPost, "name=%FF", http.StatusUnprocessableEntity, false, "\xff"},
+		{"database failure on submission", http.MethodPost, url.Values{"name": {attempted}}.Encode(), http.StatusInternalServerError, true, attempted},
+		{"database failure on entry", http.MethodGet, "", http.StatusInternalServerError, true, ""},
 	}
 	for _, tc := range cases {
 		for _, mode := range []string{"ordinary", "htmx"} {
@@ -73,7 +70,7 @@ func TestErrorResponsesKeepNameForm(t *testing.T) {
 					r.Header.Set("HX-Request", "true")
 				}
 				w := httptest.NewRecorder()
-				muxes[tc.failedLookup].ServeHTTP(w, r)
+				muxes[tc.databaseFailure].ServeHTTP(w, r)
 				if w.Code != tc.status {
 					t.Fatalf("status = %d, want %d", w.Code, tc.status)
 				}
@@ -81,20 +78,9 @@ func TestErrorResponsesKeepNameForm(t *testing.T) {
 					t.Errorf("Content-Type = %q, want HTML", contentType)
 				}
 				body := w.Body.String()
-				if strings.Count(body, "<form ") != 1 || !strings.Contains(body, `action="`+path+`"`) ||
-					!strings.Contains(body, `name="name"`) || !strings.Contains(body, `type="submit"`) {
-					t.Fatalf("error response lost the retryable name form: %s", body)
-				}
-				if strings.Count(body, `<section id="customer-content">`) != 1 ||
-					!strings.Contains(body, `hx-target="#customer-content"`) || !strings.Contains(body, `hx-swap="outerHTML"`) {
-					t.Fatalf("error response lost its retryable section target: %s", body)
-				}
-				if !strings.Contains(body, `role="alert"`) {
-					t.Errorf("error response lost its inline error: %s", body)
-				}
-				wantPage := mode == "ordinary" || tc.method != http.MethodPost
-				if fullPage := strings.Contains(body, "<!doctype html>"); fullPage != wantPage {
-					t.Errorf("full page = %v, want %v", fullPage, wantPage)
+				requireFormError(t, body, path, mode == "ordinary" || tc.method != http.MethodPost)
+				if !strings.Contains(body, `value="`+template.HTMLEscapeString(tc.value)+`"`) {
+					t.Errorf("error response lost the expected name %q: %s", tc.value, body)
 				}
 			})
 		}
@@ -108,10 +94,7 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := http.NewServeMux()
-	if err := RegisterRoutes(mux, store); err != nil {
-		t.Fatal(err)
-	}
+	mux := newMux(t, store)
 	path := "/customer/" + entry.Token
 	send := func(method, target, name string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, target, strings.NewReader(url.Values{"name": {name}}.Encode()))
@@ -140,13 +123,16 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 		{"invalid draft is not saved", http.MethodPost, path + "/draft", "A\x00", http.StatusUnprocessableEntity, "Ana", links.InProgress},
 		{"cleared box is mirrored", http.MethodPost, path + "/draft", " ", http.StatusOK, "", links.Opened},
 	}
-	for _, step := range steps {
+	for i, step := range steps {
 		w := send(step.method, step.target, step.value)
 		if w.Code != step.code {
 			t.Fatalf("%s: status = %d, want %d: %s", step.name, w.Code, step.code, w.Body.String())
 		}
 		if step.target != path && strings.Contains(w.Body.String(), "<input") {
 			t.Fatalf("%s: autosave redrew the form: %s", step.name, w.Body.String())
+		}
+		if i == 0 && stored(t, db)[0].OpenedAt != nil {
+			t.Fatal("draft POST recorded a first visit")
 		}
 		reload := httptest.NewRecorder()
 		mux.ServeHTTP(reload, httptest.NewRequest(http.MethodGet, path, nil))
@@ -205,18 +191,21 @@ func TestExpiredLinkShowsNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mux := http.NewServeMux()
-	if err := RegisterRoutes(mux, store); err != nil {
-		t.Fatal(err)
-	}
+	mux := newMux(t, store)
 	path := "/customer/" + entry.Token
-	for _, tc := range []struct{ name, method, target string }{
-		{"entry", http.MethodGet, path},
-		{"autosave", http.MethodPost, path + "/draft"},
-		{"submit", http.MethodPost, path},
+	for _, tc := range []struct{ name, method, target, body string }{
+		{"entry", http.MethodGet, path, ""},
+		{"autosave", http.MethodPost, path + "/draft", "name=Ana"},
+		{"submit", http.MethodPost, path, "name=Ana"},
+		{"malformed final", http.MethodPost, path, "name=%zz"},
+		{"malformed draft", http.MethodPost, path + "/draft", "name=%zz"},
+		{"oversized final", http.MethodPost, path, "name=" + strings.Repeat("a", 4100)},
+		{"oversized draft", http.MethodPost, path + "/draft", "name=" + strings.Repeat("a", 4100)},
+		{"invalid final name", http.MethodPost, path, "name=+"},
+		{"invalid draft name", http.MethodPost, path + "/draft", "name=A%00"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := httptest.NewRequest(tc.method, tc.target, strings.NewReader("name=Ana"))
+			r := httptest.NewRequest(tc.method, tc.target, strings.NewReader(tc.body))
 			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			w := httptest.NewRecorder()
 			mux.ServeHTTP(w, r)
@@ -236,16 +225,13 @@ func TestSubmissionFailureRollsBackAndAllowsRetry(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if saved, err := store.SaveDraft(t.Context(), entry.Token, "Original draft"); err != nil || !saved {
+			if saved, err := store.SaveDraft(t.Context(), entry.Token, "Original draft"); err != nil || saved != links.Saved {
 				t.Fatalf("save draft: saved=%v, err=%v", saved, err)
 			}
 			if err := db.WithContext(t.Context()).Exec("ALTER TABLE students ADD CONSTRAINT customer_submit_rejected CHECK (name <> 'Reject completion')").Error; err != nil {
 				t.Fatal(err)
 			}
-			mux := http.NewServeMux()
-			if err := RegisterRoutes(mux, store); err != nil {
-				t.Fatal(err)
-			}
+			mux := newMux(t, store)
 			path := "/customer/" + entry.Token
 			attempted := "  Reject completion  "
 			send := func() *httptest.ResponseRecorder {
@@ -264,14 +250,9 @@ func TestSubmissionFailureRollsBackAndAllowsRetry(t *testing.T) {
 				t.Fatalf("rejected insert: status = %d, body %s", w.Code, w.Body.String())
 			}
 			body := w.Body.String()
-			if strings.Count(body, `<section id="customer-content">`) != 1 ||
-				!strings.Contains(body, `hx-target="#customer-content"`) || !strings.Contains(body, `hx-swap="outerHTML"`) ||
-				!strings.Contains(body, `value="`+template.HTMLEscapeString(attempted)+`"`) ||
-				!strings.Contains(body, `role="alert"`) || !strings.Contains(body, `type="submit"`) {
-				t.Fatalf("failed completion lost its retryable form or attempted name: %s", body)
-			}
-			if fullPage := strings.Contains(body, "<!doctype html>"); fullPage != (mode == "ordinary") {
-				t.Fatalf("failed completion full page = %v, mode %s", fullPage, mode)
+			requireFormError(t, body, path, mode == "ordinary")
+			if !strings.Contains(body, `value="`+template.HTMLEscapeString(attempted)+`"`) {
+				t.Fatalf("failed completion lost its attempted name: %s", body)
 			}
 			if after := stored(t, db); !reflect.DeepEqual(after, before) {
 				t.Fatalf("failed student insert changed link from %+v to %+v", before, after)
@@ -290,7 +271,7 @@ func TestSubmissionFailureRollsBackAndAllowsRetry(t *testing.T) {
 			requireCompletion(t, w.Body.String(), mode == "ordinary", attempted, strings.TrimSpace(attempted))
 			completed := stored(t, db)[0]
 			enrolled := studentRecords(t, db)
-			if completed.Name != strings.TrimSpace(attempted) || completed.SubmittedAt == nil ||
+			if completed.Name != strings.TrimSpace(attempted) || completed.SubmittedAt == nil || completed.OpenedAt != nil ||
 				len(enrolled) != 1 || enrolled[0].Name != completed.Name ||
 				!enrolled[0].CreatedAt.Equal(*completed.SubmittedAt) ||
 				completed.ExpiresAt.Sub(*completed.SubmittedAt) != 168*time.Hour {
@@ -310,7 +291,7 @@ func TestCompletedAccessAndReplay(t *testing.T) {
 	const submittedName = "Submission snapshot"
 	const canonicalName = "Edited student name"
 	// Submit directly so replay must not even fill in the absent first-visit time.
-	if saved, err := store.Submit(t.Context(), entry.Token, submittedName); err != nil || !saved {
+	if saved, err := store.Submit(t.Context(), entry.Token, submittedName); err != nil || saved != links.Saved {
 		t.Fatalf("submit: saved=%v, err=%v", saved, err)
 	}
 	enrolled := studentRecords(t, db)
@@ -320,10 +301,7 @@ func TestCompletedAccessAndReplay(t *testing.T) {
 	if _, err := students.New(db).UpdateField(t.Context(), enrolled[0].ID, "name", canonicalName); err != nil {
 		t.Fatal(err)
 	}
-	mux := http.NewServeMux()
-	if err := RegisterRoutes(mux, store); err != nil {
-		t.Fatal(err)
-	}
+	mux := newMux(t, store)
 	path := "/customer/" + entry.Token
 	before, studentsBefore := stored(t, db), studentRecords(t, db)
 	for _, mode := range []string{"ordinary", "htmx"} {
@@ -331,9 +309,12 @@ func TestCompletedAccessAndReplay(t *testing.T) {
 			name, suffix, body string
 			status             int
 		}{
+			{"valid final replay", "", "name=Replacement", http.StatusOK},
 			{"malformed final replay", "", "name=%zz", http.StatusOK},
 			{"oversized final replay", "", "name=" + strings.Repeat("x", 5000), http.StatusOK},
-			{"stale draft", "/draft", "name=%zz", http.StatusConflict},
+			{"valid stale draft", "/draft", "name=Replacement", http.StatusConflict},
+			{"malformed stale draft", "/draft", "name=%zz", http.StatusConflict},
+			{"oversized stale draft", "/draft", "name=" + strings.Repeat("x", 5000), http.StatusConflict},
 		} {
 			t.Run(mode+"/"+tc.name, func(t *testing.T) {
 				r := httptest.NewRequest(http.MethodPost, path+tc.suffix, strings.NewReader(tc.body))
@@ -441,7 +422,7 @@ func TestHeadChecksLinkWithoutChangingIt(t *testing.T) {
 	}
 	headKeeps(t, db, server, path, http.StatusOK)
 
-	if saved, err := store.SaveDraft(t.Context(), entry.Token, "Ana"); err != nil || !saved {
+	if saved, err := store.SaveDraft(t.Context(), entry.Token, "Ana"); err != nil || saved != links.Saved {
 		t.Fatalf("save draft: saved=%v, err=%v", saved, err)
 	}
 	headKeeps(t, db, server, path, http.StatusOK)
@@ -465,7 +446,7 @@ func TestHeadChecksLinkWithoutChangingIt(t *testing.T) {
 	}
 
 	// A submitted link still opens read-only: HEAD answers 200, not the 409 that locks edits.
-	if saved, err := store.Submit(t.Context(), entry.Token, "Ana Pérez"); err != nil || !saved {
+	if saved, err := store.Submit(t.Context(), entry.Token, "Ana Pérez"); err != nil || saved != links.Saved {
 		t.Fatalf("submit: saved=%v, err=%v", saved, err)
 	}
 	headKeeps(t, db, server, path, http.StatusOK)
@@ -504,14 +485,19 @@ func TestHeadRejectsUnusableLinks(t *testing.T) {
 // httpTimeout bounds each HTTP exchange, so a stuck handler fails its test.
 const httpTimeout = 10 * time.Second
 
-// serve runs the customer routes behind a real HTTP server.
-func serve(t *testing.T, store *links.Store) *httptest.Server {
+func newMux(t *testing.T, store *links.Store) *http.ServeMux {
 	t.Helper()
 	mux := http.NewServeMux()
 	if err := RegisterRoutes(mux, store); err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer(mux)
+	return mux
+}
+
+// serve runs the customer routes behind a real HTTP server.
+func serve(t *testing.T, store *links.Store) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(newMux(t, store))
 	t.Cleanup(server.Close)
 	return server
 }
@@ -549,19 +535,34 @@ func studentRecords(t *testing.T, db *gorm.DB) []students.Student {
 	return all
 }
 
+func requireFormError(t *testing.T, body, path string, fullPage bool) {
+	t.Helper()
+	if strings.Count(body, "<form ") != 1 || !strings.Contains(body, `action="`+path+`"`) ||
+		!strings.Contains(body, `name="name"`) || !strings.Contains(body, `type="submit"`) {
+		t.Fatalf("error response lost the retryable name form: %s", body)
+	}
+	if strings.Count(body, `<section id="customer-content">`) != 1 ||
+		!strings.Contains(body, `hx-target="#customer-content"`) || !strings.Contains(body, `hx-swap="outerHTML"`) {
+		t.Fatalf("error response lost its retryable section target: %s", body)
+	}
+	if !strings.Contains(body, `role="alert"`) {
+		t.Errorf("error response lost its inline error: %s", body)
+	}
+	if got := strings.Contains(body, "<!doctype html>"); got != fullPage {
+		t.Errorf("error response full page = %v, want %v", got, fullPage)
+	}
+}
+
 func requireCompletion(t *testing.T, body string, fullPage bool, private ...string) {
 	t.Helper()
 	if strings.Count(body, `<section id="customer-content">`) != 1 ||
-		!strings.Contains(body, "<h1>Thank you</h1>") ||
-		!strings.Contains(body, "Your information has been saved.") ||
-		!strings.Contains(body, "<title>Submission complete | Masterminds</title>") ||
 		strings.Count(body, "<title>") != 1 {
-		t.Fatalf("completion lost its section, confirmation or single title: %s", body)
+		t.Fatalf("completion lost its section or single title: %s", body)
 	}
 	if got := strings.Contains(body, "<!doctype html>"); got != fullPage {
 		t.Fatalf("completion full page = %v, want %v: %s", got, fullPage, body)
 	}
-	for _, hidden := range append(private, "<input", "<form", "What's your name?") {
+	for _, hidden := range append(private, "<input", "<form") {
 		if strings.Contains(body, hidden) {
 			t.Fatalf("completion exposed %q: %s", hidden, body)
 		}

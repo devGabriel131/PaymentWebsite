@@ -15,8 +15,6 @@ a {
 
 :root {
   --brand-ink: #25484e;
-  --brand-tint: #eef4f4;
-  --brand-border: #d5e2e3;
 }
 
 /* Management: dark workspace. Tokens and color-scheme stay scoped so customer pages are untouched. */

@@ -10,19 +10,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alexedwards/scs/postgresstore"
-	"github.com/alexedwards/scs/v2"
 	"golang.org/x/time/rate"
 	"gorm.io/gorm"
 
+	"paymentwebsite/internal/customer"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/management"
 	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
 )
-
-const cookieName = "management_session"
 
 // later keeps the seeded link usable for any test's duration.
 var later = time.Now().Add(time.Hour)
@@ -68,6 +65,8 @@ func TestSignIn(t *testing.T) {
 		t.Fatalf("sign in over an existing session: status %d, cookie %v; want a new token", rec.Code, second)
 	}
 	requireSignedOut(t, app, first)
+	manager.Close()
+	manager.Close()
 
 	restarted, _ := newApp(t, db)
 	requireSignedIn(t, restarted, second)
@@ -160,6 +159,27 @@ func TestSignOutEndsOnlyThisBrowser(t *testing.T) {
 	requireSignedIn(t, app, desktop)
 }
 
+func TestPublicCustomerIgnoresStaffSessions(t *testing.T) {
+	t.Parallel()
+	db := newAuthDatabase(t)
+	app, _ := newApp(t, db)
+	if err := db.WithContext(t.Context()).Exec("ALTER TABLE sessions RENAME TO unavailable_sessions").Error; err != nil {
+		t.Fatal(err)
+	}
+	cookie := &http.Cookie{Name: cookieName, Value: "forged-staff-session"}
+	request := newRequest(t, http.MethodHead, "/customer/"+strings.Repeat("A", 43))
+	rec := serve(app, request, cookie)
+	if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 ||
+		rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Referrer-Policy") != "no-referrer" ||
+		strings.Contains(rec.Header().Get("Vary"), "Cookie") || len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("public customer with unavailable staff sessions: status %d, headers %v, body %q",
+			rec.Code, rec.Header(), rec.Body.String())
+	}
+	if rec := serve(app, newRequest(t, http.MethodGet, "/management/"), cookie); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("protected management with unavailable staff sessions: status %d, body %q", rec.Code, rec.Body.String())
+	}
+}
+
 func newAuthDatabase(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := testdb.Open(t, &User{}, &Session{}, &links.Link{}, &students.Student{}, &settings.Settings{})
@@ -169,31 +189,26 @@ func newAuthDatabase(t *testing.T) *gorm.DB {
 	return db
 }
 
-// newApp wires auth like main: SCS over the test pool, login on the root mux,
-// and the rest of /management/ behind Require.
+// newApp wires auth like main: staff-only sessions, origin protection, and public customer routes.
 func newApp(t *testing.T, db *gorm.DB) (http.Handler, *Manager) {
 	t.Helper()
-	sqlDB, err := db.DB()
+	manager, err := New(db, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sessions := scs.New()
-	sessions.Store = postgresstore.NewWithCleanupInterval(sqlDB, 0)
-	sessions.Lifetime = 14 * 24 * time.Hour
-	sessions.Cookie.Name = cookieName
-	sessions.Cookie.Path = "/management/"
-	manager, err := New(db, sessions)
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(manager.Close)
 	mux := http.NewServeMux()
 	manager.RegisterRoutes(mux)
+	store := links.New(db)
 	managementMux := http.NewServeMux()
-	if err := management.RegisterRoutes(managementMux, links.New(db), students.New(db), settings.New(db), Staff); err != nil {
+	if err := management.RegisterRoutes(managementMux, store, students.New(db), settings.New(db), Staff); err != nil {
 		t.Fatal(err)
 	}
 	mux.Handle("/management/", manager.Require(managementMux))
-	return sessions.LoadAndSave(mux), manager
+	if err := customer.RegisterRoutes(mux, store); err != nil {
+		t.Fatal(err)
+	}
+	return http.NewCrossOriginProtection().Handler(mux), manager
 }
 
 func newRequest(t *testing.T, method, path string) *http.Request {

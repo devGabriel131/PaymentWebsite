@@ -5,16 +5,18 @@ import (
 	"unicode/utf8"
 )
 
-type Field interface {
-	Key() string
-	Label() string
-	InputType() string
-	Required() bool
-	Value(Student) string
-	Parse(string) (any, error)
+type Field struct {
+	Key, Label, InputType string
+	Required              bool
+	Value                 func(Student) string
+	Parse                 func(string) (any, error)
 }
 
-var fields = []Field{nameField{}}
+var fields = []Field{{
+	Key: "name", Label: "Name", InputType: "text", Required: true,
+	Value: func(s Student) string { return s.Name },
+	Parse: func(raw string) (any, error) { return ParseName(raw, true) },
+}}
 
 // Fields returns the ordered registry. Callers must not modify the slice.
 func Fields() []Field {
@@ -23,11 +25,11 @@ func Fields() []Field {
 
 func FindField(key string) (Field, bool) {
 	for _, field := range fields {
-		if field.Key() == key {
+		if field.Key == key {
 			return field, true
 		}
 	}
-	return nil, false
+	return Field{}, false
 }
 
 // ParseName validates both final names and optional autosaved drafts.
@@ -48,15 +50,4 @@ type ValidationError struct {
 
 func (e *ValidationError) Error() string {
 	return e.Message
-}
-
-type nameField struct{}
-
-func (nameField) Key() string            { return "name" }
-func (nameField) Label() string          { return "Name" }
-func (nameField) InputType() string      { return "text" }
-func (nameField) Required() bool         { return true }
-func (nameField) Value(s Student) string { return s.Name }
-func (nameField) Parse(raw string) (any, error) {
-	return ParseName(raw, true)
 }

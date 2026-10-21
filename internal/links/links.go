@@ -53,6 +53,15 @@ const (
 	Canceled Status = "Canceled"
 )
 
+// SaveResult reports the authoritative outcome of a customer write.
+type SaveResult uint8
+
+const (
+	Unavailable SaveResult = iota
+	Saved
+	AlreadySubmitted
+)
+
 // Entry is a link as shown to staff. ID is the lowercase hex token digest.
 // Token is set only by Create: it is never stored, so it can't be shown again.
 type Entry struct {
@@ -69,7 +78,7 @@ type Entry struct {
 
 // Cancelable reports whether staff can still revoke an unfinished link.
 func (e Entry) Cancelable() bool {
-	return e.Status != Canceled && e.Status != Finished && !e.AccessExpired()
+	return e.Status == NotOpened || e.Status == Opened || e.Status == InProgress
 }
 
 // AccessExpired reports whether the token's access deadline has passed.
@@ -87,7 +96,7 @@ func (e Entry) Trashed() bool {
 	return e.Status == Canceled || e.Status == Expired
 }
 
-func (l Link) entry() Entry {
+func (l Link) entry(now time.Time) Entry {
 	e := Entry{
 		ID: hex.EncodeToString(l.TokenHash), Name: l.Name, Status: NotOpened,
 		CreatedAt: l.CreatedAt, ExpiresAt: l.ExpiresAt, CreatedBy: l.CreatedBy, CanceledBy: l.CanceledBy,
@@ -98,7 +107,7 @@ func (l Link) entry() Entry {
 		e.Status = Canceled
 	case l.SubmittedAt != nil:
 		e.Status = Finished
-	case !time.Now().Before(l.ExpiresAt):
+	case !now.Before(l.ExpiresAt):
 		e.Status = Expired
 	case l.Name != "":
 		e.Status = InProgress
@@ -119,20 +128,6 @@ func New(db *gorm.DB) *Store {
 	return &Store{db: db}
 }
 
-// Migrate atomically replaces pre-enrollment mock links on first cutover.
-// Once students exists, later migrations preserve every retained record.
-func Migrate(db *gorm.DB) error {
-	return db.Transaction(func(tx *gorm.DB) error {
-		m := tx.Migrator()
-		if !m.HasTable(&students.Student{}) && m.HasTable(&Link{}) {
-			if err := m.DropTable(&Link{}); err != nil {
-				return err
-			}
-		}
-		return tx.AutoMigrate(&Link{}, &students.Student{})
-	})
-}
-
 // Create issues a link that stops working at expiresAt, on behalf of the
 // signed-in staff username.
 func (s *Store) Create(ctx context.Context, staff string, expiresAt time.Time) (Entry, error) {
@@ -148,7 +143,7 @@ func (s *Store) Create(ctx context.Context, staff string, expiresAt time.Time) (
 	if err := s.db.WithContext(ctx).Create(&link).Error; err != nil {
 		return Entry{}, err
 	}
-	entry := link.entry()
+	entry := link.entry(time.Now())
 	entry.Token = token
 	return entry, nil
 }
@@ -161,9 +156,10 @@ func (s *Store) List(ctx context.Context) ([]Entry, error) {
 	if err := s.db.WithContext(ctx).Order("created_at, token_hash").Find(&records).Error; err != nil {
 		return nil, err
 	}
+	now := time.Now()
 	entries := make([]Entry, len(records))
 	for i, link := range records {
-		entries[i] = link.entry()
+		entries[i] = link.entry(now)
 	}
 	return entries, nil
 }
@@ -189,53 +185,71 @@ func (s *Store) Open(ctx context.Context, token string) (*Link, error) {
 	if err != nil || link == nil {
 		return nil, err
 	}
-	if link.OpenedAt == nil {
-		if err := s.active(ctx, link.TokenHash).Where("opened_at IS NULL").Update("opened_at", gorm.Expr("now()")).Error; err != nil {
-			return nil, err
-		}
+	if link.OpenedAt != nil {
+		return link, nil
+	}
+	result := s.active(ctx, link.TokenHash).Model(link).Where("opened_at IS NULL").
+		Clauses(clause.Returning{}).Update("opened_at", gorm.Expr("now()"))
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return s.Lookup(ctx, token)
 	}
 	return link, nil
 }
 
 // SaveDraft stores an autosaved name without finishing the form.
-// Submitted forms never match: the customer's final answers are locked.
-func (s *Store) SaveDraft(ctx context.Context, token, name string) (bool, error) {
+// Submitted forms never change: the customer's final answers are locked.
+func (s *Store) SaveDraft(ctx context.Context, token, name string) (SaveResult, error) {
 	digest, ok := tokenDigest(token)
 	if !ok {
-		return false, nil
+		return Unavailable, nil
 	}
 	result := s.active(ctx, digest).Where("submitted_at IS NULL").Update("name", name)
-	return result.RowsAffected == 1 && result.Error == nil, result.Error
+	return s.saveResult(ctx, digest, result)
 }
 
 // Submit commits final answers and a retained student together, locking the form.
-func (s *Store) Submit(ctx context.Context, token, name string) (bool, error) {
+func (s *Store) Submit(ctx context.Context, token, name string) (SaveResult, error) {
 	digest, ok := tokenDigest(token)
 	if !ok {
-		return false, nil
+		return Unavailable, nil
 	}
-	saved := false
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var completed Link
-		scoped := Store{db: tx}
-		result := scoped.active(ctx, digest).Model(&completed).Where("submitted_at IS NULL").
-			Clauses(clause.Returning{}).Updates(map[string]any{
-			"name": name, "submitted_at": gorm.Expr("now()"),
-			"expires_at": gorm.Expr("now() + interval '168 hours'"),
-		})
-		if result.Error != nil || result.RowsAffected == 0 {
-			return result.Error
-		}
-		student := students.Student{
-			SourceLinkHash: completed.TokenHash, Name: completed.Name, CreatedAt: *completed.SubmittedAt,
-		}
-		if err := tx.Create(&student).Error; err != nil {
-			return err
-		}
-		saved = true
-		return nil
-	})
-	return saved && err == nil, err
+	result := s.db.WithContext(ctx).Exec(`
+WITH completed AS (
+    UPDATE links
+       SET name = ?,
+           submitted_at = now(),
+           expires_at = now() + interval '168 hours'
+     WHERE token_hash = ?
+       AND canceled_at IS NULL
+       AND expires_at > now()
+       AND submitted_at IS NULL
+    RETURNING token_hash, name, submitted_at
+)
+INSERT INTO students (source_link_hash, name, created_at)
+SELECT token_hash, name, submitted_at FROM completed
+`, name, digest)
+	return s.saveResult(ctx, digest, result)
+}
+
+func (s *Store) saveResult(ctx context.Context, digest []byte, result *gorm.DB) (SaveResult, error) {
+	if result.Error != nil {
+		return Unavailable, result.Error
+	}
+	if result.RowsAffected == 1 {
+		return Saved, nil
+	}
+	var link Link
+	result = s.active(ctx, digest).Select("submitted_at").Limit(1).Find(&link)
+	if result.Error != nil {
+		return Unavailable, result.Error
+	}
+	if result.RowsAffected == 1 && link.SubmittedAt != nil {
+		return AlreadySubmitted, nil
+	}
+	return Unavailable, nil
 }
 
 // Cancel revokes an unfinished link whose Entry.ID is id and returns its
@@ -250,15 +264,20 @@ func (s *Store) Cancel(ctx context.Context, id, staff string) (*Entry, error) {
 	if err != nil || len(digest) != sha256.Size {
 		return nil, nil
 	}
-	if err := s.active(ctx, digest).Where("submitted_at IS NULL").Updates(canceledBy(staff)).Error; err != nil {
-		return nil, err
-	}
 	var link Link
-	result := s.db.WithContext(ctx).Where(&Link{TokenHash: digest}).Limit(1).Find(&link)
-	if result.Error != nil || result.RowsAffected == 0 {
+	result := s.active(ctx, digest).Model(&link).Where("submitted_at IS NULL").
+		Clauses(clause.Returning{}).Updates(canceledBy(staff))
+	if result.Error != nil {
 		return nil, result.Error
 	}
-	entry := link.entry()
+	if result.RowsAffected == 0 {
+		link = Link{}
+		result = s.db.WithContext(ctx).Where(&Link{TokenHash: digest}).Limit(1).Find(&link)
+		if result.Error != nil || result.RowsAffected == 0 {
+			return nil, result.Error
+		}
+	}
+	entry := link.entry(time.Now())
 	return &entry, nil
 }
 

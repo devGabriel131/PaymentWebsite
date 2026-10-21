@@ -23,8 +23,8 @@ func enrollStudent(t *testing.T, a *app, name string) (students.Student, links.L
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := a.store.Submit(t.Context(), entry.Token, name); err != nil || !ok {
-		t.Fatalf("enroll student: submitted = %v, error = %v", ok, err)
+	if saved, err := a.store.Submit(t.Context(), entry.Token, name); err != nil || saved != links.Saved {
+		t.Fatalf("enroll student: submitted = %v, error = %v", saved, err)
 	}
 	hash, err := hex.DecodeString(entry.ID)
 	if err != nil {

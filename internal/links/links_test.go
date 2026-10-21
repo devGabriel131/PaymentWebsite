@@ -17,8 +17,6 @@ import (
 
 	"gorm.io/gorm"
 
-	"paymentwebsite/internal/auth"
-	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
 )
@@ -88,6 +86,13 @@ func TestIssuedTokenBoundary(t *testing.T) {
 			if valid := link != nil; valid != tc.valid {
 				t.Fatalf("valid = %v, want %v", valid, tc.valid)
 			}
+			if !tc.valid {
+				for _, save := range []func(context.Context, string, string) (SaveResult, error){store.SaveDraft, store.Submit} {
+					if result, err := save(ctx, tc.token, "Must not save"); err != nil || result != Unavailable {
+						t.Fatalf("invalid token write: result=%v, err=%v", result, err)
+					}
+				}
+			}
 		})
 	}
 
@@ -97,6 +102,11 @@ func TestIssuedTokenBoundary(t *testing.T) {
 		entry, err := store.Create(cancelled, staff, later)
 		if err == nil || entry != (Entry{}) {
 			t.Fatal("cancelled database write must return an error and no usable link")
+		}
+		for _, save := range []func(context.Context, string, string) (SaveResult, error){store.SaveDraft, store.Submit} {
+			if result, err := save(cancelled, first.Token, "Must not save"); err == nil || result != Unavailable {
+				t.Fatalf("failed database write: result=%v, err=%v", result, err)
+			}
 		}
 	})
 }
@@ -112,10 +122,10 @@ func TestStatusFollowsCustomerProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	const name = "Ana Pérez"
-	refused := func(save func(context.Context, string, string) (bool, error)) func() error {
+	refused := func(save func(context.Context, string, string) (SaveResult, error)) func() error {
 		return func() error {
-			if saved, err := save(ctx, link.Token, "Changed after submit"); err != nil || saved {
-				return fmt.Errorf("submitted form accepted a change: saved=%v, err=%v", saved, err)
+			if saved, err := save(ctx, link.Token, "Changed after submit"); err != nil || saved != AlreadySubmitted {
+				return fmt.Errorf("submitted form replay: saved=%v, err=%v", saved, err)
 			}
 			return nil
 		}
@@ -127,6 +137,28 @@ func TestStatusFollowsCustomerProgress(t *testing.T) {
 		}
 		return nil
 	}
+	// Open returns the first visit immediately and preserves it on later reads.
+	var firstVisit *time.Time
+	opened := func() error {
+		found, err := store.Open(ctx, link.Token)
+		if err != nil || found == nil || found.OpenedAt == nil {
+			return fmt.Errorf("open did not return its first visit: link=%+v, err=%v", found, err)
+		}
+		if firstVisit == nil {
+			firstVisit = found.OpenedAt
+		} else if !found.OpenedAt.Equal(*firstVisit) {
+			return fmt.Errorf("open moved first visit from %v to %v", *firstVisit, found.OpenedAt)
+		}
+		return nil
+	}
+	saved := func(save func(context.Context, string, string) (SaveResult, error), name string) func() error {
+		return func() error {
+			if result, err := save(ctx, link.Token, name); err != nil || result != Saved {
+				return fmt.Errorf("save: result=%v, err=%v", result, err)
+			}
+			return nil
+		}
+	}
 
 	steps := []struct {
 		name   string
@@ -136,11 +168,12 @@ func TestStatusFollowsCustomerProgress(t *testing.T) {
 	}{
 		{"issued", func() error { return nil }, NotOpened, ""},
 		{"looked up before opening", lookedUp, NotOpened, ""},
-		{"opened", func() error { _, err := store.Open(ctx, link.Token); return err }, Opened, ""},
-		{"reopened", func() error { _, err := store.Open(ctx, link.Token); return err }, Opened, ""},
-		{"autosaved", func() error { _, err := store.SaveDraft(ctx, link.Token, "Ana"); return err }, InProgress, "Ana"},
-		{"reopened draft", func() error { _, err := store.Open(ctx, link.Token); return err }, InProgress, "Ana"},
-		{"submitted", func() error { _, err := store.Submit(ctx, link.Token, name); return err }, Finished, name},
+		{"opened", opened, Opened, ""},
+		{"reopened", opened, Opened, ""},
+		{"empty autosave", saved(store.SaveDraft, ""), Opened, ""},
+		{"autosaved", saved(store.SaveDraft, "Ana"), InProgress, "Ana"},
+		{"reopened draft", opened, InProgress, "Ana"},
+		{"submitted", saved(store.Submit, name), Finished, name},
 		{"looked up after submit", lookedUp, Finished, name},
 		{"autosave after submit is refused", refused(store.SaveDraft), Finished, name},
 		{"second submit is refused", refused(store.Submit), Finished, name},
@@ -148,7 +181,6 @@ func TestStatusFollowsCustomerProgress(t *testing.T) {
 		{"finished link still opens success", lookedUp, Finished, name},
 	}
 	// The first visit is recorded once; no later step may move it.
-	var firstVisit *time.Time
 	for _, step := range steps {
 		if !t.Run(step.name, func(t *testing.T) {
 			if err := step.act(); err != nil {
@@ -184,116 +216,114 @@ func TestStatusFollowsCustomerProgress(t *testing.T) {
 			return
 		}
 	}
+
+	// Enrollment retains its source even when staff independently edit students.
+	digest := digestOf(link.Token)
+	if err := db.WithContext(ctx).Where("token_hash = ?", digest).Delete(&Link{}).Error; err == nil {
+		t.Fatal("student enrollment did not restrict deletion of its source link")
+	}
+	replacementDigest := digestOf("unused replacement source link hash")
+	if err := db.WithContext(ctx).Model(&Link{}).Where("token_hash = ?", digest).
+		Update("token_hash", replacementDigest).Error; err == nil {
+		t.Fatal("student enrollment did not restrict changing its source link hash")
+	}
+	var before []Link
+	if err := db.WithContext(ctx).Order("token_hash").Find(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	enrolled := studentsFor(t, db, ctx, link.Token)
+	for range 2 {
+		if err := db.WithContext(ctx).AutoMigrate(&Link{}, &students.Student{}); err != nil {
+			t.Fatal(err)
+		}
+		var after []Link
+		if err := db.WithContext(ctx).Order("token_hash").Find(&after).Error; err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(after, before) {
+			t.Fatalf("repeat migration changed links: before=%+v, after=%+v", before, after)
+		}
+		if after := studentsFor(t, db, ctx, link.Token); !reflect.DeepEqual(after, enrolled) {
+			t.Fatalf("repeat migration changed enrollment: before=%+v, after=%+v", enrolled, after)
+		}
+	}
 }
 
-func TestMigrateCutsOverOnce(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		old  bool
-	}{
-		{"fresh schema", false},
-		{"old mock schema", true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			db := testdb.Open(t, &auth.User{}, &auth.Session{}, &settings.Settings{})
-			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-			defer cancel()
-			at := time.Date(2026, time.October, 1, 12, 0, 0, 0, time.UTC)
-			user := auth.User{Username: "retained", PasswordHash: "password sentinel", AuthVersion: "version sentinel"}
-			session := auth.Session{Token: "session sentinel", Data: []byte("session data"), Expiry: at.Add(time.Hour)}
-			config := settings.Settings{ID: 1, LinkLifetimeDays: 12, UpdatedAt: at, UpdatedBy: user.Username}
-			for _, sentinel := range []any{&user, &session, &config} {
-				if err := db.WithContext(ctx).Create(sentinel).Error; err != nil {
-					t.Fatal(err)
-				}
+func TestOpenObservesConcurrentCancellation(t *testing.T) {
+	db, store, ctx := testStore(t)
+	issued, err := store.Create(ctx, staff, later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker := db.WithContext(ctx).Begin()
+	if blocker.Error != nil {
+		t.Fatal(blocker.Error)
+	}
+	openCtx, cancelOpen := context.WithCancel(ctx)
+	type result struct {
+		link *Link
+		err  error
+	}
+	var results chan result
+	defer func() {
+		blocker.Rollback()
+		cancelOpen()
+		if results != nil {
+			for range results {
 			}
-			oldToken := base64.RawURLEncoding.EncodeToString(make([]byte, tokenBytes))
-			if tc.old {
-				// Pre-enrollment mock data, including the removed recoverable token.
-				if err := db.WithContext(ctx).Exec(`CREATE TABLE links (
-					token_hash bytea PRIMARY KEY, name text NOT NULL,
-					token_ciphertext bytea, created_at timestamptz NOT NULL
-				)`).Error; err != nil {
-					t.Fatal(err)
-				}
-				if err := db.WithContext(ctx).Exec(
-					"INSERT INTO links (token_hash, name, token_ciphertext, created_at) VALUES (decode(?, 'hex'), ?, decode(?, 'hex'), ?)",
-					hex.EncodeToString(digestOf(oldToken)), "Old mock submission", hex.EncodeToString([]byte("sealed token")), at,
-				).Error; err != nil {
-					t.Fatal(err)
-				}
-			}
-			if err := Migrate(db.WithContext(ctx)); err != nil {
-				t.Fatal(err)
-			}
-			if !db.Migrator().HasTable(&Link{}) || !db.Migrator().HasTable(&students.Student{}) ||
-				db.Migrator().HasColumn(&Link{}, "token_ciphertext") {
-				t.Fatal("cutover did not replace the mock schema with links and students")
-			}
-			store := New(db)
-			if old, err := store.Lookup(ctx, oldToken); err != nil || old != nil {
-				t.Fatalf("old mock URL survived cutover: link=%+v, err=%v", old, err)
-			}
-			if records := listByID(t, store, ctx); len(records) != 0 {
-				t.Fatalf("cutover kept mock links: %+v", records)
-			}
-			var initialStudents int64
-			if err := db.WithContext(ctx).Model(&students.Student{}).Count(&initialStudents).Error; err != nil || initialStudents != 0 {
-				t.Fatalf("cutover enrolled mock submissions: count=%d, err=%v", initialStudents, err)
-			}
-			draft, err := store.Create(ctx, staff, later)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if saved, err := store.SaveDraft(ctx, draft.Token, "Retained draft"); err != nil || !saved {
-				t.Fatalf("save draft: saved=%v, err=%v", saved, err)
-			}
-			finished, err := store.Create(ctx, staff, later)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if saved, err := store.Submit(ctx, finished.Token, "Retained student"); err != nil || !saved {
-				t.Fatalf("submit: saved=%v, err=%v", saved, err)
-			}
-			before := listByID(t, store, ctx)
-			enrolled := studentsFor(t, db, ctx, finished.Token)
-			if len(enrolled) != 1 {
-				t.Fatalf("completion created %d students, want one", len(enrolled))
-			}
-			if err := db.WithContext(ctx).Where("token_hash = ?", digestOf(finished.Token)).Delete(&Link{}).Error; err == nil {
-				t.Fatal("student enrollment did not restrict deletion of its source link")
-			}
-			if err := db.WithContext(ctx).Model(&Link{}).Where("token_hash = ?", digestOf(finished.Token)).
-				Update("token_hash", digestOf(oldToken)).Error; err == nil {
-				t.Fatal("student enrollment did not restrict changing its source link hash")
-			}
-			for range 2 {
-				if err := Migrate(db.WithContext(ctx)); err != nil {
-					t.Fatal(err)
-				}
-				if after := listByID(t, store, ctx); !reflect.DeepEqual(after, before) {
-					t.Fatalf("repeat migration changed links: before=%+v, after=%+v", before, after)
-				}
-				if after := studentsFor(t, db, ctx, finished.Token); !reflect.DeepEqual(after, enrolled) {
-					t.Fatalf("repeat migration changed enrollment: before=%+v, after=%+v", enrolled, after)
-				}
-				var gotUser auth.User
-				var gotSession auth.Session
-				var gotConfig settings.Settings
-				for _, sentinel := range []any{&gotUser, &gotSession, &gotConfig} {
-					if err := db.WithContext(ctx).Take(sentinel).Error; err != nil {
-						t.Fatal(err)
-					}
-				}
-				if gotUser != user || gotSession.Token != session.Token || !bytes.Equal(gotSession.Data, session.Data) ||
-					!gotSession.Expiry.Equal(session.Expiry) || gotConfig.ID != config.ID ||
-					gotConfig.LinkLifetimeDays != config.LinkLifetimeDays || gotConfig.UpdatedBy != config.UpdatedBy ||
-					!gotConfig.UpdatedAt.Equal(config.UpdatedAt) {
-					t.Fatalf("migration changed auth/session/settings sentinels: user=%+v, session=%+v, settings=%+v",
-						gotUser, gotSession, gotConfig)
-				}
-			}
-		})
+		}
+	}()
+	var blockerPID int
+	if err := blocker.Raw("SELECT pg_backend_pid()").Scan(&blockerPID).Error; err != nil {
+		t.Fatal(err)
+	}
+	canceled, err := New(blocker).Cancel(ctx, issued.ID, "canceler")
+	if err != nil || canceled == nil || canceled.Status != Canceled {
+		t.Fatalf("hold cancellation: entry=%+v, err=%v", canceled, err)
+	}
+
+	results = make(chan result, 1)
+	go func() {
+		defer close(results)
+		opened, err := store.Open(openCtx, issued.Token)
+		results <- result{link: opened, err: err}
+	}()
+	// Observe the database lock, not elapsed time, before releasing cancellation.
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		var waiting bool
+		if err := db.WithContext(ctx).Raw(
+			"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE ? = ANY(pg_blocking_pids(pid)))",
+			blockerPID,
+		).Scan(&waiting).Error; err != nil {
+			t.Fatalf("observe Open lock wait: %v", err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case got := <-results:
+			t.Fatalf("Open returned before waiting on cancellation: link=%+v, err=%v", got.link, got.err)
+		case <-ctx.Done():
+			t.Fatalf("Open did not wait on cancellation: %v", ctx.Err())
+		case <-poll.C:
+		}
+	}
+	if err := blocker.Commit().Error; err != nil {
+		t.Fatal(err)
+	}
+	got := <-results
+	if got.err != nil {
+		t.Fatalf("Open after cancellation: %v", got.err)
+	}
+	var row Link
+	if err := db.WithContext(ctx).Where("token_hash = ?", digestOf(issued.Token)).Take(&row).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.link != nil || row.CanceledAt == nil || row.CanceledBy != "canceler" ||
+		row.OpenedAt != nil || row.SubmittedAt != nil {
+		t.Fatalf("Open ignored committed cancellation: link=%+v, row=%+v", got.link, row)
 	}
 }
 
@@ -303,7 +333,7 @@ func TestConcurrentSubmissionEnrollsOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := store.SaveDraft(ctx, issued.Token, "Draft only"); err != nil || !saved {
+	if saved, err := store.SaveDraft(ctx, issued.Token, "Draft only"); err != nil || saved != Saved {
 		t.Fatalf("draft: saved=%v, err=%v", saved, err)
 	}
 	if enrolled := studentsFor(t, db, ctx, issued.Token); len(enrolled) != 0 {
@@ -311,7 +341,7 @@ func TestConcurrentSubmissionEnrollsOnce(t *testing.T) {
 	}
 	type result struct {
 		name  string
-		saved bool
+		saved SaveResult
 		err   error
 	}
 	start := make(chan struct{})
@@ -325,17 +355,26 @@ func TestConcurrentSubmissionEnrollsOnce(t *testing.T) {
 	}
 	close(start)
 	var winner string
+	replays := 0
 	for range 2 {
 		got := <-results
 		if got.err != nil {
 			t.Fatal(got.err)
 		}
-		if got.saved {
+		switch got.saved {
+		case Saved:
 			if winner != "" {
 				t.Fatal("competing submissions both succeeded")
 			}
 			winner = got.name
+		case AlreadySubmitted:
+			replays++
+		default:
+			t.Fatalf("competing submission returned %v, want Saved or AlreadySubmitted", got.saved)
 		}
+	}
+	if replays != 1 {
+		t.Fatalf("competing submissions returned %d replays, want one", replays)
 	}
 	completed, err := store.Lookup(ctx, issued.Token)
 	enrolled := studentsFor(t, db, ctx, issued.Token)
@@ -345,8 +384,8 @@ func TestConcurrentSubmissionEnrollsOnce(t *testing.T) {
 		t.Fatalf("completion not atomic: winner=%q, link=%+v, students=%+v, err=%v", winner, completed, enrolled, err)
 	}
 	before := listByID(t, store, ctx)[issued.ID]
-	for _, save := range []func(context.Context, string, string) (bool, error){store.SaveDraft, store.Submit} {
-		if saved, err := save(ctx, issued.Token, "Replacement"); err != nil || saved {
+	for _, save := range []func(context.Context, string, string) (SaveResult, error){store.SaveDraft, store.Submit} {
+		if saved, err := save(ctx, issued.Token, "Replacement"); err != nil || saved != AlreadySubmitted {
 			t.Fatalf("finished form accepted replacement: saved=%v, err=%v", saved, err)
 		}
 	}
@@ -380,7 +419,7 @@ func TestSubmissionFailureRollsBack(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if saved, err := store.Submit(ctx, existing.Token, name); err != nil || !saved {
+				if saved, err := store.Submit(ctx, existing.Token, name); err != nil || saved != Saved {
 					t.Fatalf("seed existing student: saved=%v, err=%v", saved, err)
 				}
 			}
@@ -388,7 +427,7 @@ func TestSubmissionFailureRollsBack(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if saved, err := store.SaveDraft(ctx, issued.Token, "Original draft"); err != nil || !saved {
+			if saved, err := store.SaveDraft(ctx, issued.Token, "Original draft"); err != nil || saved != Saved {
 				t.Fatalf("save draft: saved=%v, err=%v", saved, err)
 			}
 			before, err := store.Lookup(ctx, issued.Token)
@@ -399,7 +438,7 @@ func TestSubmissionFailureRollsBack(t *testing.T) {
 			if err := db.WithContext(ctx).Exec("ALTER TABLE students ADD CONSTRAINT test_student_rejection " + tc.constraint).Error; err != nil {
 				t.Fatal(err)
 			}
-			if saved, err := store.Submit(ctx, issued.Token, name); err == nil || saved {
+			if saved, err := store.Submit(ctx, issued.Token, name); err == nil || saved != Unavailable {
 				t.Fatalf("failed transaction reported success: saved=%v, err=%v", saved, err)
 			}
 			after, err := store.Lookup(ctx, issued.Token)
@@ -409,7 +448,7 @@ func TestSubmissionFailureRollsBack(t *testing.T) {
 			if err := db.WithContext(ctx).Exec("ALTER TABLE students DROP CONSTRAINT test_student_rejection").Error; err != nil {
 				t.Fatal(err)
 			}
-			if saved, err := store.Submit(ctx, issued.Token, name); err != nil || !saved {
+			if saved, err := store.Submit(ctx, issued.Token, name); err != nil || saved != Saved {
 				t.Fatalf("retry failed: saved=%v, err=%v", saved, err)
 			}
 			completed, err := store.Lookup(ctx, issued.Token)
@@ -429,11 +468,11 @@ func TestSubmissionCancellationRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := store.SaveDraft(ctx, issued.Token, "Original draft"); err != nil || !saved {
+	if saved, err := store.SaveDraft(ctx, issued.Token, "Original draft"); err != nil || saved != Saved {
 		t.Fatalf("draft: saved=%v, err=%v", saved, err)
 	}
 	type result struct {
-		saved bool
+		saved SaveResult
 		entry *Entry
 		err   error
 	}
@@ -450,16 +489,17 @@ func TestSubmissionCancellationRace(t *testing.T) {
 		results <- result{entry: entry, err: err}
 	}()
 	close(start)
-	var submitted bool
+	var submitted SaveResult
 	var canceled *Entry
 	for range 2 {
 		got := <-results
 		if got.err != nil {
 			t.Fatal(got.err)
 		}
-		submitted = submitted || got.saved
 		if got.entry != nil {
 			canceled = got.entry
+		} else {
+			submitted = got.saved
 		}
 	}
 	var row Link
@@ -472,18 +512,41 @@ func TestSubmissionCancellationRace(t *testing.T) {
 	}
 	switch {
 	case row.SubmittedAt != nil:
-		if !submitted || row.CanceledAt != nil || row.CanceledBy != "" || row.Name != "Final answer" ||
+		if submitted != Saved || row.CanceledAt != nil || row.CanceledBy != "" || row.Name != "Final answer" ||
 			len(enrolled) != 1 || enrolled[0].Name != row.Name || !enrolled[0].CreatedAt.Equal(*row.SubmittedAt) ||
 			canceled.Status != Finished || row.ExpiresAt.Sub(*row.SubmittedAt) != 168*time.Hour {
 			t.Fatalf("invalid submission-wins outcome: submitted=%v, row=%+v, students=%+v, cancel=%+v", submitted, row, enrolled, canceled)
 		}
 	case row.CanceledAt != nil:
-		if submitted || row.CanceledBy != "canceler" || row.Name != "Original draft" ||
+		if submitted != Unavailable || row.CanceledBy != "canceler" || row.Name != "Original draft" ||
 			len(enrolled) != 0 || canceled.Status != Canceled || row.ExpiresAt.Sub(later).Abs() > time.Microsecond {
 			t.Fatalf("invalid cancellation-wins outcome: submitted=%v, row=%+v, students=%+v, cancel=%+v", submitted, row, enrolled, canceled)
 		}
 	default:
 		t.Fatalf("race left neither completion nor cancellation: %+v", row)
+	}
+	want := Unavailable
+	if submitted == Saved {
+		want = AlreadySubmitted
+	}
+	for _, save := range []func(context.Context, string, string) (SaveResult, error){store.SaveDraft, store.Submit} {
+		if saved, err := save(ctx, issued.Token, "Replacement after race"); err != nil || saved != want {
+			t.Fatalf("write after race: saved=%v, want=%v, err=%v", saved, want, err)
+		}
+	}
+	again, err := store.Cancel(ctx, issued.ID, "later canceler")
+	if err != nil || again == nil || !reflect.DeepEqual(again, canceled) {
+		t.Fatalf("repeat cancel changed race outcome: before=%+v, after=%+v, err=%v", canceled, again, err)
+	}
+	if err := store.CancelAll(ctx, "later canceler"); err != nil {
+		t.Fatal(err)
+	}
+	var after Link
+	if err := db.WithContext(ctx).Where("token_hash = ?", digestOf(issued.Token)).Take(&after).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, row) || !reflect.DeepEqual(studentsFor(t, db, ctx, issued.Token), enrolled) {
+		t.Fatalf("replay or cancellation changed race outcome: before=%+v, after=%+v", row, after)
 	}
 }
 
@@ -500,7 +563,7 @@ func TestCustomerNameIsolationAndRevocation(t *testing.T) {
 
 	const name = "María O'Connor 李"
 	saved, err := store.Submit(ctx, first.Token, name)
-	if err != nil || !saved {
+	if err != nil || saved != Saved {
 		t.Fatalf("save issued link's name: saved=%v, err=%v", saved, err)
 	}
 	for _, tc := range []struct {
@@ -526,7 +589,7 @@ func TestCustomerNameIsolationAndRevocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved, err = store.Submit(ctx, first.Token, "Should not be saved")
-	if err != nil || saved {
+	if err != nil || saved != AlreadySubmitted {
 		t.Fatalf("finished link accepted another name: saved=%v, err=%v", saved, err)
 	}
 	link, err := store.Open(ctx, first.Token)
@@ -556,7 +619,7 @@ func TestCancel(t *testing.T) {
 	}
 	const canceledName, name = "Canceled customer", "Still active"
 	for i, saved := range []string{canceledName, name} {
-		if ok, err := store.SaveDraft(ctx, entries[i].Token, saved); err != nil || !ok {
+		if ok, err := store.SaveDraft(ctx, entries[i].Token, saved); err != nil || ok != Saved {
 			t.Fatalf("save link %d name: saved=%v, err=%v", i, ok, err)
 		}
 	}
@@ -624,7 +687,7 @@ func TestCancel(t *testing.T) {
 	if active.Name != name {
 		t.Fatalf("other link's name = %q, want %q", active.Name, name)
 	}
-	if saved, err := store.SaveDraft(ctx, entries[0].Token, "Must not revive"); err != nil || saved {
+	if saved, err := store.SaveDraft(ctx, entries[0].Token, "Must not revive"); err != nil || saved != Unavailable {
 		t.Fatalf("canceled link accepted a draft: saved=%v, err=%v", saved, err)
 	}
 }
@@ -733,10 +796,10 @@ func TestExpiredLinksStopWorking(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := store.SaveDraft(ctx, midForm.Token, "Half done"); err != nil || !saved {
+	if saved, err := store.SaveDraft(ctx, midForm.Token, "Half done"); err != nil || saved != Saved {
 		t.Fatalf("draft before expiry: saved=%v, err=%v", saved, err)
 	}
-	if saved, err := store.Submit(ctx, finished.Token, "Done"); err != nil || !saved {
+	if saved, err := store.Submit(ctx, finished.Token, "Done"); err != nil || saved != Saved {
 		t.Fatalf("submit before expiry: saved=%v, err=%v", saved, err)
 	}
 	enrolled := studentsFor(t, db, ctx, finished.Token)
@@ -754,10 +817,10 @@ func TestExpiredLinksStopWorking(t *testing.T) {
 			if link, err := store.Open(ctx, token); err != nil || link != nil {
 				t.Errorf("open: link=%v, err=%v; want none", link, err)
 			}
-			if saved, err := store.SaveDraft(ctx, token, "After expiry"); err != nil || saved {
+			if saved, err := store.SaveDraft(ctx, token, "After expiry"); err != nil || saved != Unavailable {
 				t.Errorf("draft: saved=%v, err=%v; want refused", saved, err)
 			}
-			if saved, err := store.Submit(ctx, token, "After expiry"); err != nil || saved {
+			if saved, err := store.Submit(ctx, token, "After expiry"); err != nil || saved != Unavailable {
 				t.Errorf("submit: saved=%v, err=%v; want refused", saved, err)
 			}
 		})
@@ -830,6 +893,10 @@ func TestEntryAccessExpiryIsNotCancelability(t *testing.T) {
 		trashed    bool
 	}{
 		{"usable unfinished", Entry{Status: NotOpened, ExpiresAt: now.Add(time.Hour)}, false, true, false},
+		{"opened unfinished", Entry{Status: Opened, ExpiresAt: now.Add(time.Hour)}, false, true, false},
+		{"draft unfinished", Entry{Status: InProgress, ExpiresAt: now.Add(time.Hour)}, false, true, false},
+		{"status projection predates expiry", Entry{Status: NotOpened, ExpiresAt: now.Add(-time.Hour)}, true, true, false},
+		{"unknown status", Entry{ExpiresAt: now.Add(time.Hour)}, false, false, false},
 		{"finished success access", Entry{Status: Finished, ExpiresAt: now.Add(time.Hour)}, false, false, false},
 		{"finished expired access", Entry{Status: Finished, ExpiresAt: now.Add(-time.Hour)}, true, false, false},
 		{"deadline reached", Entry{Status: Expired, ExpiresAt: now}, true, false, true},

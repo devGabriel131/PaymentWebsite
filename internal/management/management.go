@@ -21,14 +21,10 @@ import (
 var templates embed.FS
 
 type pageData struct {
-	Links []links.Entry
-	// Link is the row addressed by a create or cancel; a full page uses it
-	// only to retain a newly created token. Fragments omit hidden rows.
-	Link     links.Entry
-	ShowLink bool
-	Notice   string
-	Staff    string
-	Trash    bool
+	Links  []links.Entry
+	Notice string
+	Staff  string
+	Trash  bool
 }
 
 type settingsData struct {
@@ -65,43 +61,51 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 
 	// Full pages and cancel-all fragments filter the registry by tab. Single-row
 	// fragments leave other rows alone so they keep their one-time URLs.
-	render := func(ctx context.Context, w http.ResponseWriter, r *http.Request, data pageData) {
+	render := func(ctx context.Context, w http.ResponseWriter, r *http.Request, data pageData, single *links.Entry) {
 		now := time.Now()
-		data.ShowLink = !data.Link.Trashed() && !data.Link.Archived(now)
-		partial := fragment(r)
-		name := "index.html"
-		if partial {
-			name = "result"
+		visible := func(e links.Entry) bool {
+			return e.Trashed() == data.Trash && (data.Trash || !e.Archived(now))
 		}
-		if !partial || data.Link.ID == "" {
+		partial := fragment(r)
+		if partial && single != nil {
+			if visible(*single) {
+				data.Links = []links.Entry{*single}
+			}
+		} else {
 			var err error
 			if data.Links, err = store.List(ctx); err != nil {
 				log.Printf("list customer links: %v", err)
 				http.Error(w, "Could not load links. Please try again.", http.StatusInternalServerError)
 				return
 			}
-			data.Links = slices.DeleteFunc(data.Links, func(link links.Entry) bool {
-				return link.Trashed() != data.Trash || (!data.Trash && link.Archived(now))
+			data.Links = slices.DeleteFunc(data.Links, func(e links.Entry) bool {
+				return !visible(e)
 			})
-			for i := range data.Links {
-				if data.Link.Token != "" && data.Links[i].ID == data.Link.ID {
-					data.Links[i] = data.Link
+			if single != nil && single.Token != "" {
+				for i := range data.Links {
+					if data.Links[i].ID == single.ID {
+						data.Links[i].Token = single.Token
+					}
 				}
 			}
 		}
-		data.Staff = staff(r.Context())
+		name := "result"
+		if !partial {
+			name = "index.html"
+			data.Staff = staff(r.Context())
+		}
 		execute(w, http.StatusOK, name, data)
 	}
 
 	mux.HandleFunc("GET /management/{$}", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		render(ctx, w, r, pageData{})
+		render(ctx, w, r, pageData{}, nil)
 	})
 	mux.HandleFunc("GET /management/trash", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		render(ctx, w, r, pageData{Trash: true})
+		render(ctx, w, r, pageData{Trash: true}, nil)
 	})
 	mux.HandleFunc("POST /management/links", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -117,7 +121,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			return
 		}
 
-		render(ctx, w, r, pageData{Link: created, Notice: "Link created."})
+		render(ctx, w, r, pageData{Notice: "Link created."}, &created)
 	})
 	mux.HandleFunc("POST /management/links/{id}/cancel", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -131,7 +135,6 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 
 		data := pageData{Notice: "Link canceled."}
 		if canceled != nil {
-			data.Link = *canceled
 			if canceled.Status != links.Canceled {
 				data.Notice = "Link can no longer be canceled."
 			}
@@ -140,7 +143,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		render(ctx, w, r, data)
+		render(ctx, w, r, data, canceled)
 	})
 	mux.HandleFunc("POST /management/links/cancel", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -151,13 +154,11 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			return
 		}
 
-		render(ctx, w, r, pageData{Notice: "All unfinished links canceled."})
+		render(ctx, w, r, pageData{Notice: "All unfinished links canceled."}, nil)
 	})
 
 	// showSettings renders the settings page with the saved values.
-	showSettings := func(w http.ResponseWriter, r *http.Request, status int, data settingsData) {
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
+	showSettings := func(ctx context.Context, w http.ResponseWriter, r *http.Request, status int, data settingsData) {
 		var err error
 		if data.Current, err = config.Current(ctx); err != nil {
 			log.Printf("load settings: %v", err)
@@ -169,11 +170,13 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 		execute(w, status, "settings.html", data)
 	}
 	mux.HandleFunc("GET /management/settings", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
 		var data settingsData
 		if r.URL.Query().Has("saved") {
 			data.Notice = "Saved."
 		}
-		showSettings(w, r, http.StatusOK, data)
+		showSettings(ctx, w, r, http.StatusOK, data)
 	})
 	mux.HandleFunc("POST /management/settings", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -189,7 +192,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			// Redirect so a reload doesn't resubmit the form.
 			http.Redirect(w, r, "/management/settings?saved", http.StatusSeeOther)
 		case errors.Is(err, settings.ErrLinkLifetimeRange):
-			showSettings(w, r, http.StatusUnprocessableEntity, settingsData{
+			showSettings(ctx, w, r, http.StatusUnprocessableEntity, settingsData{
 				Error: fmt.Sprintf("Choose between %d and %d days.", settings.MinLinkLifetimeDays, settings.MaxLinkLifetimeDays),
 			})
 		default:

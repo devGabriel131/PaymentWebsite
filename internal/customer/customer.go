@@ -33,7 +33,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 	// handle serves the page, its final submit, and (when draft) blur autosave,
 	// which responds only with save status so it never redraws fields in use.
 	// Completion replaces the form with confirmation. GET records a visit;
-	// HEAD and POST lookup without mutating the link before any save.
+	// HEAD only checks usability; POST writes without recording a visit.
 	handle := func(draft bool) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Cache-Control", "no-store")
@@ -78,6 +78,50 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 
 			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
+			status := http.StatusOK
+			if r.Method == http.MethodPost {
+				r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+				if err := r.ParseForm(); err != nil {
+					status = http.StatusBadRequest
+					var tooLarge *http.MaxBytesError
+					if errors.As(err, &tooLarge) {
+						status = http.StatusRequestEntityTooLarge
+					}
+					data.Error = "Could not read your name. Please try again."
+				} else {
+					data.Name = r.PostForm.Get("name")
+					name, err := students.ParseName(data.Name, !draft)
+					if err != nil {
+						status = http.StatusUnprocessableEntity
+						data.Error = err.Error()
+					} else {
+						save := store.Submit
+						if draft {
+							save = store.SaveDraft
+						}
+						result, err := save(ctx, token, name)
+						switch {
+						case err != nil:
+							log.Printf("save customer name: %v", err)
+							data.Error = "Could not save your name. Please try again."
+							show(http.StatusInternalServerError)
+						case result == links.AlreadySubmitted:
+							showCompletion()
+						case result == links.Saved:
+							if draft {
+								show(http.StatusOK)
+							} else {
+								showCompletion()
+							}
+						default:
+							show(http.StatusNotFound)
+						}
+						return
+					}
+				}
+			}
+
+			// Invalid input still observes link usability and completion first.
 			lookup := store.Lookup
 			if r.Method == http.MethodGet {
 				lookup = store.Open
@@ -93,69 +137,14 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 				show(http.StatusNotFound)
 				return
 			}
-			data.Submitted = link.SubmittedAt != nil
-			if !data.Submitted {
+			if link.SubmittedAt != nil {
+				showCompletion()
+				return
+			}
+			if status != http.StatusUnprocessableEntity {
 				data.Name = link.Name
 			}
-			if r.Method == http.MethodGet || r.Method == http.MethodHead {
-				show(http.StatusOK)
-				return
-			}
-			if data.Submitted {
-				showCompletion()
-				return
-			}
-
-			r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
-			if err := r.ParseForm(); err != nil {
-				status := http.StatusBadRequest
-				var tooLarge *http.MaxBytesError
-				if errors.As(err, &tooLarge) {
-					status = http.StatusRequestEntityTooLarge
-				}
-				data.Error = "Could not read your name. Please try again."
-				show(status)
-				return
-			}
-			data.Name = r.PostForm.Get("name")
-			name, err := students.ParseName(data.Name, !draft)
-			if err != nil {
-				data.Error = err.Error()
-				show(http.StatusUnprocessableEntity)
-				return
-			}
-
-			save := store.Submit
-			if draft {
-				save = store.SaveDraft
-			}
-			saved, err := save(ctx, token, name)
-			if err != nil {
-				log.Printf("save customer name: %v", err)
-				data.Error = "Could not save your name. Please try again."
-				show(http.StatusInternalServerError)
-				return
-			}
-			if !saved {
-				// Since lookup, another tab submitted, staff canceled, or the link expired.
-				link, err = store.Lookup(ctx, token)
-				switch {
-				case err != nil:
-					log.Printf("look up customer link: %v", err)
-					data.Error = "Could not save your name. Please try again."
-					show(http.StatusInternalServerError)
-				case link != nil && link.SubmittedAt != nil:
-					showCompletion()
-				default:
-					show(http.StatusNotFound)
-				}
-				return
-			}
-			if draft {
-				show(http.StatusOK)
-			} else {
-				showCompletion()
-			}
+			show(status)
 		}
 	}
 
