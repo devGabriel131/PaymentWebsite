@@ -94,7 +94,11 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, staff fun
 		for i, record := range records {
 			data.Students[i] = studentDisplay(record, false)
 		}
-		execute(w, r, http.StatusOK, "students.html", data)
+		name := "students.html"
+		if r.Header.Get("HX-Request") == "true" {
+			name = "student-records" // A live refresh of just the records.
+		}
+		execute(w, r, http.StatusOK, name, data)
 	})))
 
 	mux.Handle("GET /management/students/{id}", logging.Operation("student_get", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

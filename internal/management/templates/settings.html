@@ -31,7 +31,7 @@
             {{if .Error}}aria-invalid="true"{{end}}>
           <span><output name="lifetime_days" for="lifetime">{{.Current.LinkLifetimeDays}}</output> days</span>
         </div>
-        <p id="lifetime-scope">Applies to initial access for links created from now on. Existing unfinished links keep their expiry date. Completing a form replaces that deadline with seven days of success-page access from completion.</p>
+        <p id="lifetime-scope">Applies to initial access for links created from now on. Existing unfinished links keep their expiry date. Completing a form replaces that deadline with seven days of continued enrollment access from completion.</p>
         {{if .Error}}<p id="lifetime-error" role="alert">{{.Error}}</p>{{end}}
         <button type="submit" class="management-button-primary">Save</button>
       </form>

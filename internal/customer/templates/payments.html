@@ -1,0 +1,53 @@
+{{define "payments"}}
+<div class="payment-selection">
+  <header class="payment-page-heading">
+    <h1>Selección del plan de pago</h1>
+    <p id="payment-schedule-note">Las fechas muestran el calendario si el primer pago se realiza hoy, en la zona horaria de Puerto Rico. Si pagas en otra fecha, el calendario cambiará.</p>
+    <p id="payment-choice-note">Guardar tu elección no realiza ningún pago ni activa cobros automáticos.</p>
+  </header>
+  {{with .SelectedPlan}}
+  {{if or $.Error (index $.FieldErrors "payment_plan")}}
+  <p class="payment-saved" role="status">Plan guardado anteriormente: <strong>{{.}}</strong>. Tu intento de cambio no se guardó. No se ha realizado ningún cargo.</p>
+  {{else}}
+  <p class="payment-saved" role="status">Plan guardado: <strong>{{.}}</strong>. No se ha realizado ningún cargo. Puedes cambiar tu elección y volver a guardarla.</p>
+  {{end}}
+  {{end}}
+  {{with .Error}}<p id="payment-error" role="alert">{{.}}</p>{{end}}
+  {{if .Plans}}
+  <form class="payment-plan-form" action="{{.Path}}/payments" method="post">
+    <fieldset aria-describedby="payment-schedule-note payment-choice-note{{if .Error}} payment-error{{end}}{{if index .FieldErrors "payment_plan"}} payment-plan-error{{end}}"{{if index .FieldErrors "payment_plan"}} aria-invalid="true"{{end}}>
+      <legend>Elige tu plan de pago</legend>
+      {{with index .FieldErrors "payment_plan"}}<p id="payment-plan-error" role="alert">{{.}}</p>{{end}}
+      <div class="payment-options">
+        {{range .Plans}}
+        <section class="payment-option" aria-labelledby="plan-title-{{.ID}}">
+          <h2 class="payment-option-heading">
+            <label class="customer-choice" for="payment-plan-{{.ID}}">
+              <input id="payment-plan-{{.ID}}" name="payment_plan" type="radio" value="{{.ID}}" required{{if eq $.PaymentPlan .ID}} checked{{end}}
+                aria-describedby="plan-summary-{{.ID}}{{if index $.FieldErrors "payment_plan"}} payment-plan-error{{end}}"{{if index $.FieldErrors "payment_plan"}} aria-invalid="true"{{end}}>
+              <span id="plan-title-{{.ID}}">{{.Name}}</span>
+            </label>
+          </h2>
+          <div class="payment-plan-summary" id="plan-summary-{{.ID}}">
+            <p>Total a pagar: <strong>{{money .TotalCents}}</strong></p>
+            <p>{{len .Schedule}} {{if eq (len .Schedule) 1}}pago{{else}}pagos mensuales{{end}}</p>
+          </div>
+          <h3 class="payment-schedule-heading">Fechas y montos</h3>
+          <ol class="payment-schedule" role="list">
+            {{range $index, $installment := .Schedule}}
+            <li>
+              <span>{{if eq $index 0}}<strong>Hoy</strong> — {{end}}{{spanishDate .Date}}</span>
+              <strong class="payment-installment-amount">{{money .AmountCents}}</strong>
+            </li>
+            {{end}}
+          </ol>
+        </section>
+        {{end}}
+      </div>
+    </fieldset>
+    <button class="customer-primary" type="submit">Guardar plan de pago</button>
+  </form>
+  {{end}}
+  <p class="payment-review"><a href="{{.Path}}/agreement">Revisar el Acuerdo de Pago y los Términos y Condiciones</a></p>
+</div>
+{{end}}

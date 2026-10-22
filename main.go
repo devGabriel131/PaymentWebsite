@@ -20,6 +20,7 @@ import (
 	"paymentwebsite/internal/auth"
 	"paymentwebsite/internal/customer"
 	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/live"
 	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/management"
 	"paymentwebsite/internal/settings"
@@ -147,7 +148,9 @@ func run(log *slog.Logger) (err error) {
 			return errors.New("SESSION_COOKIE_SECURE must be true or false")
 		}
 	}
-	store := links.New(db)
+	// Committed writes tell open management pages to refresh themselves.
+	feed := live.New()
+	store := links.New(db, feed.Changed)
 	stage = "auth_initialize"
 	authentication, err := auth.New(db, secureCookies, log)
 	if err != nil {
@@ -164,13 +167,14 @@ func run(log *slog.Logger) (err error) {
 	})
 	authentication.RegisterRoutes(mux)
 	managementMux := http.NewServeMux()
+	managementMux.Handle("GET /management/events", logging.Operation("live_updates", feed))
 	stage = "management_routes"
-	if err := management.RegisterRoutes(managementMux, store, students.New(db), settings.New(db), auth.Staff); err != nil {
+	if err := management.RegisterRoutes(managementMux, store, students.New(db, feed.Changed), settings.New(db), auth.Staff); err != nil {
 		return fmt.Errorf("register management routes: %w", err)
 	}
 	mux.Handle("/management/", authentication.Require(managementMux))
 	stage = "customer_routes"
-	if err := customer.RegisterRoutes(mux, store); err != nil {
+	if err := customer.RegisterRoutes(mux, store, settings.New(db)); err != nil {
 		return fmt.Errorf("register customer routes: %w", err)
 	}
 
@@ -187,6 +191,8 @@ func run(log *slog.Logger) (err error) {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
+	// Event streams never finish on their own; end them once shutdown starts.
+	server.RegisterOnShutdown(feed.Close)
 
 	stage = "listen"
 	listener, err := net.Listen("tcp", server.Addr)

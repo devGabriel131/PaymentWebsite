@@ -183,8 +183,9 @@ func TestDBLoggerFlushBoundsAndResets(t *testing.T) {
 	}
 	db.Flush()
 	events := decodeEvents(t, out.Bytes())
-	if len(events) != 21 {
-		t.Fatalf("summary events = %d, want exactly 21 bounded buckets", len(events))
+	buckets := len(operationNames)
+	if len(events) != buckets {
+		t.Fatalf("summary events = %d, want exactly %d bounded buckets", len(events), buckets)
 	}
 	seen := make(map[string]bool)
 	for _, event := range events {
@@ -213,10 +214,10 @@ func TestDBLoggerFlushBoundsAndResets(t *testing.T) {
 	db.observe(WithOperation(context.Background(), "link_read"), 201*time.Millisecond+750*time.Microsecond, nil)
 	db.Flush()
 	events = decodeEvents(t, out.Bytes())
-	if len(events) != 22 {
-		t.Fatalf("events after final partial flush = %d, want 22", len(events))
+	if len(events) != buckets+1 {
+		t.Fatalf("events after final partial flush = %d, want %d", len(events), buckets+1)
 	}
-	assertDatabaseSummary(t, events[21], "link_read", 1, 201*time.Millisecond+750*time.Microsecond)
+	assertDatabaseSummary(t, events[buckets], "link_read", 1, 201*time.Millisecond+750*time.Microsecond)
 	before = out.Len()
 	db.Flush()
 	if out.Len() != before {

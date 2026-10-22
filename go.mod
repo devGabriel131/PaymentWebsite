@@ -8,6 +8,7 @@ require (
 	github.com/alexedwards/argon2id v1.0.0
 	github.com/alexedwards/scs/postgresstore v0.0.0-20251002162104-209de6e426de
 	github.com/alexedwards/scs/v2 v2.9.0
+	github.com/nyaruka/phonenumbers/v2 v2.0.15
 	golang.org/x/term v0.47.0
 	golang.org/x/time v0.16.0
 	gorm.io/driver/postgres v1.6.3

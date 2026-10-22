@@ -3,14 +3,16 @@ package customer
 import (
 	"context"
 	"embed"
-	"errors"
 	"html/template"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
+	"paymentwebsite/internal/payments"
+	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
 )
 
@@ -18,29 +20,43 @@ import (
 var templates embed.FS
 
 type pageData struct {
-	Path      string
-	Name      string
-	Error     string
-	Submitted bool
+	students.Details
+	Path              string
+	View              string
+	Error             string
+	EmailConfirm      string
+	EmailMismatch     bool
+	FieldErrors       map[string]string
+	DraftField        string
+	ProgramStartDate  string
+	ProgramStartLabel string
+	TermsAcceptedAt   *time.Time
+	PaymentPlan       string
+	SelectedPlan      string
+	Plans             []planView
 }
 
-func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
-	page, err := template.ParseFS(templates, "templates/*.html")
+func RegisterRoutes(mux *http.ServeMux, store *links.Store, configuration *settings.Store) error {
+	page, err := template.New("index.html").Funcs(template.FuncMap{
+		"municipalities": students.MunicipalityOptions,
+		"trim":           strings.TrimSpace,
+		"money":          payments.Money,
+		"spanishDate":    payments.SpanishDate,
+	}).ParseFS(templates, "templates/*.html")
 	if err != nil {
 		return err
 	}
 
-	// handle serves the page, its final submit, and (when draft) blur autosave,
-	// which responds only with save status so it never redraws fields in use.
-	// Completion replaces the form with confirmation. GET records a visit;
+	// handle serves the welcome, form, final submit, and blur autosave.
+	// Autosave responds only with status so it never redraws fields in use.
+	// Submission advances to the agreement. GET records a visit;
 	// HEAD only checks usability; POST writes without recording a visit.
-	handle := func(draft bool) http.HandlerFunc {
+	handle := func(view string) http.HandlerFunc {
+		draft := view == "save-status"
 		return func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Cache-Control", "no-store")
-			w.Header().Set("Referrer-Policy", "no-referrer")
-			w.Header().Set("Vary", "HX-Request")
+			customerHeaders(w)
 			token := r.PathValue("token")
-			data := pageData{Path: "/customer/" + url.PathEscape(token)}
+			data := pageData{Path: "/customer/" + url.PathEscape(token), View: view}
 			show := func(status int) {
 				name := "index.html"
 				switch {
@@ -49,69 +65,111 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 					if r.Header.Get("HX-Request") == "true" {
 						w.Header().Set("HX-Refresh", "true")
 					}
-				case status == http.StatusConflict: // Stale draft: reload into confirmation.
-					if r.Header.Get("HX-Request") == "true" {
-						w.Header().Set("HX-Refresh", "true")
-					}
 				case draft:
 					name = "save-status"
 				case r.Method == http.MethodPost && r.Header.Get("HX-Request") == "true":
 					name = "customer-response"
 				}
-				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				w.WriteHeader(status)
-				if r.Method == http.MethodHead {
+				renderPage(w, r, page, name, data, status)
+			}
+			advance := func() {
+				if draft {
+					if r.Header.Get("HX-Request") == "true" {
+						w.Header().Set("HX-Refresh", "true")
+					}
+					w.WriteHeader(http.StatusConflict)
 					return
 				}
-				if err := page.ExecuteTemplate(w, name, data); err != nil {
-					logging.RecordError(r, "render", err)
+				if r.Method == http.MethodHead {
+					w.WriteHeader(http.StatusOK)
+					return
 				}
+				redirectCustomer(w, r, data.Path+"/agreement", true)
 			}
-			showCompletion := func() {
-				data.Name, data.Submitted = "", true
-				status := http.StatusOK
-				if draft {
-					status = http.StatusConflict
+
+			var draftField students.Field
+			if draft {
+				var known bool
+				data.DraftField = r.PathValue("field")
+				draftField, known = students.FindField(data.DraftField)
+				if !known {
+					show(http.StatusNotFound)
+					return
 				}
-				show(status)
 			}
 
 			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
 			status := http.StatusOK
 			if r.Method == http.MethodPost {
-				r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
-				if err := r.ParseForm(); err != nil {
+				status = parseCustomerForm(w, r)
+				if status != http.StatusOK {
+					data.Error = "No pudimos leer tu información. Intenta de nuevo."
+				} else if draft && len(r.PostForm[draftField.Key]) != 1 {
 					status = http.StatusBadRequest
-					var tooLarge *http.MaxBytesError
-					if errors.As(err, &tooLarge) {
-						status = http.StatusRequestEntityTooLarge
-					}
-					data.Error = "Could not read your name. Please try again."
+					data.Error = "No pudimos leer tu información. Intenta de nuevo."
 				} else {
-					data.Name = r.PostForm.Get("name")
-					name, err := students.ParseName(data.Name, !draft)
-					if err != nil {
-						status = http.StatusUnprocessableEntity
-						data.Error = err.Error()
-					} else {
-						save := store.Submit
-						if draft {
-							save = store.SaveDraft
+					data.Details = students.Details{
+						Name: r.PostForm.Get("name"), Email: r.PostForm.Get("email"),
+						Phone: r.PostForm.Get("phone"), Municipality: r.PostForm.Get("municipality"),
+					}
+					data.EmailConfirm = r.PostForm.Get("email_confirm")
+					data.FieldErrors = make(map[string]string)
+					var parsed students.Details
+					var draftValue string
+					if draft {
+						value, err := draftField.Parse(r.PostForm.Get(draftField.Key), false)
+						if err != nil {
+							data.FieldErrors[draftField.Key] = fieldError(draftField.Key)
 						}
-						result, err := save(ctx, token, name)
+						draftValue = value
+					} else {
+						for _, field := range students.Fields() {
+							value, err := field.Parse(r.PostForm.Get(field.Key), true)
+							if err != nil {
+								data.FieldErrors[field.Key] = fieldError(field.Key)
+							}
+							switch field.Key {
+							case "name":
+								parsed.Name = value
+							case "email":
+								parsed.Email = value
+							case "phone":
+								parsed.Phone = value
+							case "municipality":
+								parsed.Municipality = value
+							}
+						}
+						confirmation, err := students.ParseEmail(data.EmailConfirm, true)
+						if err != nil {
+							data.FieldErrors["email_confirm"] = fieldError("email")
+						} else if data.FieldErrors["email"] == "" && confirmation != parsed.Email {
+							data.EmailMismatch = true
+							data.FieldErrors["email_confirm"] = "Los correos electrónicos no coinciden."
+						}
+					}
+					if len(data.FieldErrors) != 0 {
+						status = http.StatusUnprocessableEntity
+					} else {
+						var result links.SaveResult
+						var err error
+						if draft {
+							result, err = store.SaveDraft(ctx, token, draftField.Key, draftValue)
+						} else {
+							result, err = store.Submit(ctx, token, parsed)
+						}
 						switch {
 						case err != nil:
 							logging.RecordError(r, "save", err)
-							data.Error = "Could not save your name. Please try again."
+							data.Error = "No pudimos guardar tu información. Intenta de nuevo."
 							show(http.StatusInternalServerError)
 						case result == links.AlreadySubmitted:
-							showCompletion()
+							advance()
 						case result == links.Saved:
 							if draft {
 								show(http.StatusOK)
 							} else {
-								showCompletion()
+								advance()
 							}
 						default:
 							show(http.StatusNotFound)
@@ -129,7 +187,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 			link, err := lookup(ctx, token)
 			if err != nil {
 				logging.RecordError(r, "lookup", err)
-				data.Error = "Could not open this link. Please try again."
+				data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
 				show(http.StatusInternalServerError)
 				return
 			}
@@ -138,18 +196,34 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store) error {
 				return
 			}
 			if link.SubmittedAt != nil {
-				showCompletion()
+				advance()
 				return
 			}
 			if status != http.StatusUnprocessableEntity {
-				data.Name = link.Name
+				data.Details = link.Details
 			}
 			show(status)
 		}
 	}
 
-	mux.Handle("GET /customer/{token}", logging.Operation("link_read", handle(false)))
-	mux.Handle("POST /customer/{token}", logging.Operation("final_submit", handle(false)))
-	mux.Handle("POST /customer/{token}/draft", logging.Operation("draft_save", handle(true)))
+	mux.Handle("GET /customer/{token}", logging.Operation("link_read", handle("welcome")))
+	mux.Handle("GET /customer/{token}/forms", logging.Operation("link_read", handle("form")))
+	mux.Handle("POST /customer/{token}", logging.Operation("final_submit", handle("form")))
+	mux.Handle("POST /customer/{token}/draft/{field}", logging.Operation("draft_save", handle("save-status")))
+	registerAgreementRoutes(mux, store, configuration, page)
 	return nil
+}
+
+func fieldError(key string) string {
+	switch key {
+	case "name":
+		return "Escribe tu nombre y apellidos usando solo letras y espacios."
+	case "email":
+		return "Escribe un correo electrónico válido."
+	case "phone":
+		return "Escribe un número válido de Puerto Rico o Estados Unidos, con código de área."
+	case "municipality":
+		return "Selecciona un municipio o “Fuera de Puerto Rico”."
+	}
+	return ""
 }

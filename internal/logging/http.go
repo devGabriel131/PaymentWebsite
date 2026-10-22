@@ -24,6 +24,7 @@ var operationNames = [...]string{
 	"student_get",
 	"student_field_get",
 	"student_update",
+	"live_updates",
 	"sign_in",
 	"sign_out",
 	"session_check",

@@ -12,6 +12,8 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"paymentwebsite/internal/payments"
+	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
 )
 
@@ -19,13 +21,18 @@ const tokenBytes = 32
 
 // Link stores only the token's digest, so a database leak yields no usable URL.
 type Link struct {
-	TokenHash []byte    `gorm:"primaryKey;not null;check:token_hash_size,octet_length(token_hash) = 32"`
-	Name      string    `gorm:"not null;default:''"`
+	TokenHash []byte `gorm:"primaryKey;not null;check:token_hash_size,octet_length(token_hash) = 32"`
+	students.Details
 	CreatedAt time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
 	// OpenedAt is the customer's first visit.
 	OpenedAt *time.Time
 	// SubmittedAt is the customer's final submit; autosave never sets it.
 	SubmittedAt *time.Time
+	// TermsAcceptedAt and ProgramStartDate retain the agreement first accepted.
+	TermsAcceptedAt  *time.Time `gorm:"type:timestamptz"`
+	ProgramStartDate string     `gorm:"type:text;not null;default:''"`
+	// PaymentPlan records a local choice, never payment completion.
+	PaymentPlan string `gorm:"type:text;not null;default:''"`
 	// CanceledAt revokes an unfinished token but keeps its draft for staff.
 	CanceledAt *time.Time
 	// ExpiresAt starts with the configured lifetime; completion replaces it
@@ -68,6 +75,7 @@ type Entry struct {
 	ID          string
 	Token       string
 	Name        string
+	Phone       string
 	CreatedAt   time.Time
 	ExpiresAt   time.Time
 	SubmittedAt *time.Time
@@ -98,7 +106,7 @@ func (e Entry) Trashed() bool {
 
 func (l Link) entry(now time.Time) Entry {
 	e := Entry{
-		ID: hex.EncodeToString(l.TokenHash), Name: l.Name, Status: NotOpened,
+		ID: hex.EncodeToString(l.TokenHash), Name: l.Name, Phone: l.Phone, Status: NotOpened,
 		CreatedAt: l.CreatedAt, ExpiresAt: l.ExpiresAt, CreatedBy: l.CreatedBy, CanceledBy: l.CanceledBy,
 		SubmittedAt: l.SubmittedAt,
 	}
@@ -109,7 +117,7 @@ func (l Link) entry(now time.Time) Entry {
 		e.Status = Finished
 	case !now.Before(l.ExpiresAt):
 		e.Status = Expired
-	case l.Name != "":
+	case l.Name != "" || l.Email != "" || l.Phone != "" || l.Municipality != "":
 		e.Status = InProgress
 	case l.OpenedAt != nil:
 		e.Status = Opened
@@ -120,12 +128,21 @@ func (l Link) entry(now time.Time) Entry {
 // errNoStaff rejects staff actions that would leave an anonymous audit entry.
 var errNoStaff = errors.New("links: staff username required")
 
+// ErrProgramStartChanged requires the customer to review the current start date.
+var ErrProgramStartChanged = errors.New("links: program start date changed or unavailable")
+
 type Store struct {
 	db *gorm.DB
+	// changed runs after every committed write, so open management pages refresh.
+	changed func()
 }
 
-func New(db *gorm.DB) *Store {
-	return &Store{db: db}
+// New returns a store whose committed writes call changed, when it is non-nil.
+func New(db *gorm.DB, changed func()) *Store {
+	if changed == nil {
+		changed = func() {}
+	}
+	return &Store{db: db, changed: changed}
 }
 
 // Create issues a link that stops working at expiresAt, on behalf of the
@@ -143,6 +160,7 @@ func (s *Store) Create(ctx context.Context, staff string, expiresAt time.Time) (
 	if err := s.db.WithContext(ctx).Create(&link).Error; err != nil {
 		return Entry{}, err
 	}
+	s.changed()
 	entry := link.entry(time.Now())
 	entry.Token = token
 	return entry, nil
@@ -196,22 +214,28 @@ func (s *Store) Open(ctx context.Context, token string) (*Link, error) {
 	if result.RowsAffected == 0 {
 		return s.Lookup(ctx, token)
 	}
+	s.changed()
 	return link, nil
 }
 
-// SaveDraft stores an autosaved name without finishing the form.
+// SaveDraft stores one validated field without finishing the form.
 // Submitted forms never change: the customer's final answers are locked.
-func (s *Store) SaveDraft(ctx context.Context, token, name string) (SaveResult, error) {
+func (s *Store) SaveDraft(ctx context.Context, token, key, value string) (SaveResult, error) {
+	field, ok := students.FindField(key)
+	if !ok {
+		return Unavailable, students.ErrUnknownField
+	}
 	digest, ok := tokenDigest(token)
 	if !ok {
 		return Unavailable, nil
 	}
-	result := s.active(ctx, digest).Where("submitted_at IS NULL").Update("name", name)
-	return s.saveResult(ctx, digest, result)
+	result := s.active(ctx, digest).Where("submitted_at IS NULL").
+		Where(clause.Neq{Column: clause.Column{Name: field.Key}, Value: value}).Update(field.Key, value)
+	return s.saveResult(ctx, digest, result, Saved)
 }
 
 // Submit commits final answers and a retained student together, locking the form.
-func (s *Store) Submit(ctx context.Context, token, name string) (SaveResult, error) {
+func (s *Store) Submit(ctx context.Context, token string, details students.Details) (SaveResult, error) {
 	digest, ok := tokenDigest(token)
 	if !ok {
 		return Unavailable, nil
@@ -220,25 +244,98 @@ func (s *Store) Submit(ctx context.Context, token, name string) (SaveResult, err
 WITH completed AS (
     UPDATE links
        SET name = ?,
+           email = ?,
+           phone = ?,
+           municipality = ?,
            submitted_at = now(),
            expires_at = now() + interval '168 hours'
      WHERE token_hash = ?
        AND canceled_at IS NULL
        AND expires_at > now()
        AND submitted_at IS NULL
-    RETURNING token_hash, name, submitted_at
+    RETURNING token_hash, name, email, phone, municipality, submitted_at
 )
-INSERT INTO students (source_link_hash, name, created_at)
-SELECT token_hash, name, submitted_at FROM completed
-`, name, digest)
-	return s.saveResult(ctx, digest, result)
+INSERT INTO students (source_link_hash, name, email, phone, municipality, created_at)
+SELECT token_hash, name, email, phone, municipality, submitted_at FROM completed
+`, details.Name, details.Email, details.Phone, details.Municipality, digest)
+	return s.saveResult(ctx, digest, result, Unavailable)
 }
 
-func (s *Store) saveResult(ctx context.Context, digest []byte, result *gorm.DB) (SaveResult, error) {
+// AcceptTerms snapshots the displayed start date once, after contact submission.
+// Accepted replays preserve the original agreement even when settings change.
+func (s *Store) AcceptTerms(ctx context.Context, token, shownStartDate string) (*Link, error) {
+	link, err := s.Lookup(ctx, token)
+	if err != nil || link == nil || link.SubmittedAt == nil {
+		return nil, err
+	}
+	if link.TermsAcceptedAt != nil {
+		return link, nil
+	}
+	startDate, err := settings.ParseProgramStartDate(shownStartDate)
+	if err != nil {
+		return nil, ErrProgramStartChanged
+	}
+	var accepted Link
+	// The settings row lock serializes acceptance with staff date changes.
+	result := s.active(ctx, link.TokenHash).Model(&accepted).
+		Where("submitted_at IS NOT NULL AND terms_accepted_at IS NULL").
+		Where("? = (SELECT program_start_date FROM settings WHERE id = 1 FOR SHARE)", startDate).
+		Clauses(clause.Returning{}).Updates(map[string]any{
+		"terms_accepted_at": gorm.Expr("now()"), "program_start_date": startDate,
+	})
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected > 0 {
+		s.changed()
+		return &accepted, nil
+	}
+	link, err = s.Lookup(ctx, token)
+	if err != nil || link == nil || link.SubmittedAt == nil {
+		return nil, err
+	}
+	if link.TermsAcceptedAt != nil {
+		return link, nil
+	}
+	return nil, ErrProgramStartChanged
+}
+
+// ChoosePlan saves an allowed local choice for a submitted, accepted link.
+// Changing the choice never enrolls another student or moves money.
+func (s *Store) ChoosePlan(ctx context.Context, token, planID string) (*Link, error) {
+	plan, ok := payments.Find(planID)
+	if !ok {
+		return nil, payments.ErrUnknownPlan
+	}
+	digest, ok := tokenDigest(token)
+	if !ok {
+		return nil, nil
+	}
+	var link Link
+	result := s.active(ctx, digest).Model(&link).
+		Where("submitted_at IS NOT NULL AND terms_accepted_at IS NOT NULL").
+		Where("payment_plan <> ?", plan.ID).
+		Clauses(clause.Returning{}).Update("payment_plan", plan.ID)
+	if result.Error != nil {
+		return nil, result.Error
+	}
+	if result.RowsAffected > 0 {
+		s.changed()
+		return &link, nil
+	}
+	current, err := s.Lookup(ctx, token)
+	if err != nil || current == nil || current.SubmittedAt == nil || current.TermsAcceptedAt == nil {
+		return nil, err
+	}
+	return current, nil
+}
+
+func (s *Store) saveResult(ctx context.Context, digest []byte, result *gorm.DB, unfinishedResult SaveResult) (SaveResult, error) {
 	if result.Error != nil {
 		return Unavailable, result.Error
 	}
 	if result.RowsAffected == 1 {
+		s.changed()
 		return Saved, nil
 	}
 	var link Link
@@ -246,10 +343,13 @@ func (s *Store) saveResult(ctx context.Context, digest []byte, result *gorm.DB) 
 	if result.Error != nil {
 		return Unavailable, result.Error
 	}
-	if result.RowsAffected == 1 && link.SubmittedAt != nil {
+	if result.RowsAffected == 0 {
+		return Unavailable, nil
+	}
+	if link.SubmittedAt != nil {
 		return AlreadySubmitted, nil
 	}
-	return Unavailable, nil
+	return unfinishedResult, nil
 }
 
 // Cancel revokes an unfinished link whose Entry.ID is id and returns its
@@ -276,6 +376,8 @@ func (s *Store) Cancel(ctx context.Context, id, staff string) (*Entry, error) {
 		if result.Error != nil || result.RowsAffected == 0 {
 			return nil, result.Error
 		}
+	} else {
+		s.changed()
 	}
 	entry := link.entry(time.Now())
 	return &entry, nil
@@ -287,7 +389,11 @@ func (s *Store) CancelAll(ctx context.Context, staff string) error {
 	if staff == "" {
 		return errNoStaff
 	}
-	return s.usable(ctx).Where("submitted_at IS NULL").Updates(canceledBy(staff)).Error
+	result := s.usable(ctx).Where("submitted_at IS NULL").Updates(canceledBy(staff))
+	if result.RowsAffected > 0 {
+		s.changed()
+	}
+	return result.Error
 }
 
 func canceledBy(staff string) map[string]any {
@@ -299,7 +405,7 @@ func (s *Store) active(ctx context.Context, digest []byte) *gorm.DB {
 	return s.usable(ctx).Where(&Link{TokenHash: digest})
 }
 
-// usable scopes a query to tokens that still open the form or success page:
+// usable scopes a query to tokens that still open the enrollment flow:
 // neither canceled nor past their access deadline.
 func (s *Store) usable(ctx context.Context) *gorm.DB {
 	return s.db.WithContext(ctx).Model(&Link{}).Where("canceled_at IS NULL AND expires_at > now()")

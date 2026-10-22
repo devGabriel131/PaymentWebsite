@@ -264,7 +264,7 @@ func TestSessionCleanupDeletesOnlyExpired(t *testing.T) {
 func newAuthDatabase(t *testing.T) *gorm.DB {
 	t.Helper()
 	db := testdb.Open(t, &User{}, &Session{}, &links.Link{}, &students.Student{}, &settings.Settings{})
-	if _, err := links.New(db).Create(t.Context(), "seed", later); err != nil {
+	if _, err := links.New(db, nil).Create(t.Context(), "seed", later); err != nil {
 		t.Fatal(err)
 	}
 	return db
@@ -281,13 +281,13 @@ func newApp(t *testing.T, db *gorm.DB) (http.Handler, *Manager) {
 	t.Cleanup(manager.Close)
 	mux := http.NewServeMux()
 	manager.RegisterRoutes(mux)
-	store := links.New(db)
+	store := links.New(db, nil)
 	managementMux := http.NewServeMux()
-	if err := management.RegisterRoutes(managementMux, store, students.New(db), settings.New(db), Staff); err != nil {
+	if err := management.RegisterRoutes(managementMux, store, students.New(db, nil), settings.New(db), Staff); err != nil {
 		t.Fatal(err)
 	}
 	mux.Handle("/management/", manager.Require(managementMux))
-	if err := customer.RegisterRoutes(mux, store); err != nil {
+	if err := customer.RegisterRoutes(mux, store, settings.New(db)); err != nil {
 		t.Fatal(err)
 	}
 	return logging.Requests(log, http.NewCrossOriginProtection().Handler(mux)), manager

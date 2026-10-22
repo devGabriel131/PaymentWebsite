@@ -49,22 +49,26 @@ func TestCustomerRolledBackRequestsLogOnce(t *testing.T) {
 	if err := tx.Rollback().Error; err != nil {
 		t.Fatal(err)
 	}
-	handler := fixture.routes(t, links.New(tx))
+	handler := fixture.routes(t, links.New(tx, nil))
 	for _, tc := range []struct {
-		name, suffix, operation string
+		name, suffix, route, operation string
 	}{
-		{"final", "", "final_submit"},
-		{"draft", "/draft", "draft_save"},
+		{"final", "", "POST /customer/{token}", "final_submit"},
+		{"name draft", "/draft/name", "POST /customer/{token}/draft/{field}", "draft_save"},
+		{"email draft", "/draft/email", "POST /customer/{token}/draft/{field}", "draft_save"},
+		{"phone draft", "/draft/phone", "POST /customer/{token}/draft/{field}", "draft_save"},
+		{"municipality draft", "/draft/municipality", "POST /customer/{token}/draft/{field}", "draft_save"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			const attempted = "PRIVATE_ROLLED_BACK_NAME"
-			rec := serveHTTPLogging(t, handler, http.MethodPost, "/customer/"+entry.Token+tc.suffix, url.Values{"name": {attempted}}, nil)
+			form := httpContactForm("Private rolled back name")
+			rec := serveHTTPLogging(t, handler, http.MethodPost, "/customer/"+entry.Token+tc.suffix, form, nil)
+			private := append(httpContactValues(form), entry.Token, entry.ID, httpUsername)
 			fixture.requireFailure(t, rec, httpFailure{
-				method: http.MethodPost, route: "POST /customer/{token}" + tc.suffix,
+				method: http.MethodPost, route: tc.route,
 				operation: tc.operation, stage: "save", kind: "transaction_done",
-			}, attempted, entry.Token, entry.ID, httpUsername)
-			if !strings.Contains(rec.Body.String(), "Could not save your name. Please try again.") {
-				t.Fatal("rolled-back write lost the existing customer error response")
+			}, private...)
+			if !strings.Contains(rec.Body.String(), `role="alert"`) || strings.Contains(rec.Body.String(), "data-validation=") {
+				t.Fatal("rolled-back write lost its save-error response")
 			}
 			fixture.out.Reset()
 		})
@@ -79,9 +83,12 @@ func TestCustomerRolledBackRequestsLogOnce(t *testing.T) {
 func TestCustomerCompletionFailureLogsOnceAndRetryIsSilent(t *testing.T) {
 	fixture := newHTTPLoggingFixture(t)
 	entry := fixture.createLink(t)
-	const draft = "PRIVATE_ORIGINAL_DRAFT"
-	if saved, err := fixture.store.SaveDraft(t.Context(), entry.Token, draft); err != nil || saved != links.Saved {
-		t.Fatalf("save draft: result = %v, error = %v", saved, err)
+	draft := httpContactDetails("Private original draft")
+	for _, field := range students.Fields() {
+		value := field.Value(students.Student{Details: draft})
+		if saved, err := fixture.store.SaveDraft(t.Context(), entry.Token, field.Key, value); err != nil || saved != links.Saved {
+			t.Fatalf("save %s draft: result = %v, error = %v", field.Key, saved, err)
+		}
 	}
 	before := fixture.link(t, entry.Token)
 	if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE students ADD CONSTRAINT customer_submit_rejected CHECK (name <> 'Reject completion')").Error; err != nil {
@@ -89,12 +96,14 @@ func TestCustomerCompletionFailureLogsOnceAndRetryIsSilent(t *testing.T) {
 	}
 	handler := fixture.routes(t, fixture.store)
 	const attempted = "  Reject completion  "
-	form := url.Values{"name": {attempted}}
+	form := httpContactForm(attempted)
+	private := append(httpContactValues(form), draft.Name, draft.Email, draft.Phone, draft.Municipality,
+		entry.Token, entry.ID, httpUsername, "customer_submit_rejected")
 	rec := serveHTTPLogging(t, handler, http.MethodPost, "/customer/"+entry.Token, form, nil)
 	fixture.requireFailure(t, rec, httpFailure{
 		method: http.MethodPost, route: "POST /customer/{token}",
 		operation: "final_submit", stage: "save", kind: "database", sqlstate: "23514",
-	}, strings.TrimSpace(attempted), draft, entry.Token, entry.ID, httpUsername, "customer_submit_rejected")
+	}, private...)
 	if after := fixture.link(t, entry.Token); !reflect.DeepEqual(after, before) {
 		t.Fatal("failed completion changed draft, completion, or expiry")
 	}
@@ -104,18 +113,24 @@ func TestCustomerCompletionFailureLogsOnceAndRetryIsSilent(t *testing.T) {
 	}
 	fixture.out.Reset()
 	rec = serveHTTPLogging(t, handler, http.MethodPost, "/customer/"+entry.Token, form, nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("retry status = %d, want 200", rec.Code)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/customer/"+entry.Token+"/agreement" {
+		t.Fatalf("retry status = %d, want 303 to agreement", rec.Code)
 	}
 	completed := fixture.link(t, entry.Token)
 	var enrolled []students.Student
 	if err := fixture.db.WithContext(t.Context()).Find(&enrolled).Error; err != nil {
 		t.Fatal(err)
 	}
-	if completed.Name != strings.TrimSpace(attempted) || completed.SubmittedAt == nil || completed.OpenedAt != nil ||
-		len(enrolled) != 1 || enrolled[0].Name != completed.Name || !bytes.Equal(enrolled[0].SourceLinkHash, completed.TokenHash) ||
+	want := students.Details{Name: "Reject completion", Email: "Private+logging@example.com", Phone: "+12025550123", Municipality: "Bayamón"}
+	if completed.Details != want || completed.SubmittedAt == nil || completed.OpenedAt != nil ||
+		len(enrolled) != 1 || enrolled[0].Details != completed.Details || !bytes.Equal(enrolled[0].SourceLinkHash, completed.TokenHash) ||
 		!enrolled[0].CreatedAt.Equal(*completed.SubmittedAt) || completed.ExpiresAt.Sub(*completed.SubmittedAt) != 168*time.Hour {
 		t.Fatal("retry did not atomically commit matching completion and student")
+	}
+	for _, value := range httpContactValues(form) {
+		if strings.Contains(rec.Body.String(), value) {
+			t.Fatalf("completion exposed contact value %q", value)
+		}
 	}
 	fixture.requireQuiet(t)
 }
@@ -123,8 +138,8 @@ func TestCustomerCompletionFailureLogsOnceAndRetryIsSilent(t *testing.T) {
 func TestStudentSaveAndPreliminaryLoadKeepSafeLeafLogging(t *testing.T) {
 	fixture := newHTTPLoggingFixture(t)
 	entry := fixture.createLink(t)
-	const originalName = "PRIVATE_ORIGINAL_STUDENT"
-	if saved, err := fixture.store.Submit(t.Context(), entry.Token, originalName); err != nil || saved != links.Saved {
+	originalDetails := httpContactDetails("Private original student")
+	if saved, err := fixture.store.Submit(t.Context(), entry.Token, originalDetails); err != nil || saved != links.Saved {
 		t.Fatalf("enroll student: result = %v, error = %v", saved, err)
 	}
 	source := fixture.link(t, entry.Token)
@@ -150,7 +165,8 @@ func TestStudentSaveAndPreliminaryLoadKeepSafeLeafLogging(t *testing.T) {
 	fixture.requireQuiet(t)
 	cookieDigest := sha256.Sum256([]byte(cookie.Value))
 	private := []string{httpUsername, httpPassword, user.PasswordHash, user.AuthVersion, cookie.Value, hex.EncodeToString(cookieDigest[:]),
-		entry.Token, entry.ID, originalName, "Rejected by database", "reject_test_student_name", "unavailable_students"}
+		entry.Token, entry.ID, originalDetails.Name, originalDetails.Email, originalDetails.Phone, originalDetails.Municipality,
+		"Rejected by database", "reject_test_student_name", "unavailable_students"}
 	path := fmt.Sprintf("/management/students/%d/fields/name", original.ID)
 	if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE students ADD CONSTRAINT reject_test_student_name CHECK (name <> 'Rejected by database')").Error; err != nil {
 		t.Fatal(err)
@@ -238,6 +254,107 @@ func TestSignInCommitFailureLogsActualStatusWithoutCredentials(t *testing.T) {
 	}
 }
 
+func TestAgreementAndChoiceFailuresLogOnceWithoutContactData(t *testing.T) {
+	fixture := newHTTPLoggingFixture(t)
+	entry := fixture.createLink(t)
+	details := httpContactDetails("Private agreement student")
+	if result, err := fixture.store.Submit(t.Context(), entry.Token, details); err != nil || result != links.Saved {
+		t.Fatalf("submit: %v, %v", result, err)
+	}
+	const date = "2027-02-28"
+	if err := settings.New(fixture.db).SetProgramStartDate(t.Context(), date, httpUsername); err != nil {
+		t.Fatal(err)
+	}
+	handler := fixture.routes(t, fixture.store)
+	path := "/customer/" + entry.Token
+	private := []string{details.Name, details.Email, details.Phone, details.Municipality, entry.Token, entry.ID,
+		httpUsername, "reject_agreement", "reject_payment_choice", "unavailable_settings"}
+	before := fixture.link(t, entry.Token)
+	if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE settings RENAME TO unavailable_settings").Error; err != nil {
+		t.Fatal(err)
+	}
+	rec := serveHTTPLogging(t, handler, http.MethodGet, path+"/agreement", nil, nil)
+	fixture.requireFailure(t, rec, httpFailure{
+		method: http.MethodGet, route: "GET /customer/{token}/agreement",
+		operation: "link_read", stage: "load", kind: "database", sqlstate: "42P01",
+	}, private...)
+	if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE unavailable_settings RENAME TO settings").Error; err != nil {
+		t.Fatal(err)
+	}
+	fixture.out.Reset()
+	if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE links ADD CONSTRAINT reject_agreement CHECK (terms_accepted_at IS NULL)").Error; err != nil {
+		t.Fatal(err)
+	}
+	consent := url.Values{"accept_terms": {"yes"}, "program_start_date": {date}}
+	rec = serveHTTPLogging(t, handler, http.MethodPost, path+"/agreement", consent, nil)
+	fixture.requireFailure(t, rec, httpFailure{
+		method: http.MethodPost, route: "POST /customer/{token}/agreement",
+		operation: "final_submit", stage: "save", kind: "database", sqlstate: "23514",
+	}, private...)
+	if after := fixture.link(t, entry.Token); !reflect.DeepEqual(after, before) {
+		t.Fatal("failed agreement changed contact or consent")
+	}
+	if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE links DROP CONSTRAINT reject_agreement").Error; err != nil {
+		t.Fatal(err)
+	}
+	fixture.out.Reset()
+	rec = serveHTTPLogging(t, handler, http.MethodPost, path+"/agreement", consent, nil)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != path+"/payments" || rec.Body.Len() != 0 {
+		t.Fatal("agreement retry did not advance quietly")
+	}
+	fixture.requireQuiet(t)
+	before = fixture.link(t, entry.Token)
+	if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE links ADD CONSTRAINT reject_payment_choice CHECK (payment_plan = '')").Error; err != nil {
+		t.Fatal(err)
+	}
+	rec = serveHTTPLogging(t, handler, http.MethodPost, path+"/payments", url.Values{"payment_plan": {"six"}}, nil)
+	fixture.requireFailure(t, rec, httpFailure{
+		method: http.MethodPost, route: "POST /customer/{token}/payments",
+		operation: "final_submit", stage: "save", kind: "database", sqlstate: "23514",
+	}, private...)
+	if after := fixture.link(t, entry.Token); !reflect.DeepEqual(after, before) {
+		t.Fatal("failed choice changed contact, consent, or saved choice")
+	}
+	if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE links DROP CONSTRAINT reject_payment_choice").Error; err != nil {
+		t.Fatal(err)
+	}
+	fixture.out.Reset()
+	for range 2 {
+		rec = serveHTTPLogging(t, handler, http.MethodPost, path+"/payments", url.Values{"payment_plan": {"six"}}, nil)
+		if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != path+"/payments" || rec.Body.Len() != 0 {
+			t.Fatal("choice retry or replay did not advance quietly")
+		}
+		fixture.requireQuiet(t)
+	}
+}
+
+func httpContactDetails(name string) students.Details {
+	return students.Details{Name: name, Email: "Private+retained@example.com", Phone: "+17872345678", Municipality: "Río Grande"}
+}
+
+func httpContactForm(name string) url.Values {
+	return url.Values{"name": {name}, "email": {" Private+logging@EXAMPLE.COM "},
+		"email_confirm": {" Private+logging@example.com "}, "phone": {"(202) 555-0123"}, "municipality": {"Bayamón"}}
+}
+
+func httpContactValues(form url.Values) []string {
+	var private []string
+	for key, values := range form {
+		for _, value := range values {
+			if value == "" {
+				continue
+			}
+			private = append(private, value, strings.TrimSpace(value))
+			if field, ok := students.FindField(key); ok {
+				if normalized, err := field.Parse(value, true); err == nil {
+					private = append(private, normalized)
+				}
+			}
+		}
+	}
+	return private
+}
+
 type httpLoggingFixture struct {
 	db    *gorm.DB
 	store *links.Store
@@ -251,7 +368,7 @@ func newHTTPLoggingFixture(t *testing.T) *httpLoggingFixture {
 	fixture.log = logging.New(&fixture.out)
 	db := testdb.Open(t, &auth.User{}, &auth.Session{}, &links.Link{}, &students.Student{}, &settings.Settings{})
 	fixture.db = db.Session(&gorm.Session{Logger: logging.NewDBLogger(fixture.log)})
-	fixture.store = links.New(fixture.db)
+	fixture.store = links.New(fixture.db, nil)
 	return fixture
 }
 
@@ -263,13 +380,13 @@ func (fixture *httpLoggingFixture) routes(t *testing.T, store *links.Store) http
 	}
 	t.Cleanup(manager.Close)
 	child := http.NewServeMux()
-	if err := management.RegisterRoutes(child, store, students.New(fixture.db), settings.New(fixture.db), auth.Staff); err != nil {
+	if err := management.RegisterRoutes(child, store, students.New(fixture.db, nil), settings.New(fixture.db), auth.Staff); err != nil {
 		t.Fatal(err)
 	}
 	root := http.NewServeMux()
 	manager.RegisterRoutes(root)
 	root.Handle("/management/", manager.Require(child))
-	if err := customer.RegisterRoutes(root, store); err != nil {
+	if err := customer.RegisterRoutes(root, store, settings.New(fixture.db)); err != nil {
 		t.Fatal(err)
 	}
 	return logging.Requests(fixture.log, http.NewCrossOriginProtection().Handler(root))
@@ -308,7 +425,7 @@ func (fixture *httpLoggingFixture) createUser(t *testing.T) auth.User {
 
 func (fixture *httpLoggingFixture) requireStudents(t *testing.T, want []students.Student) {
 	t.Helper()
-	got, err := students.New(fixture.db).List(t.Context())
+	got, err := students.New(fixture.db, nil).List(t.Context())
 	if err != nil || len(got) != len(want) || len(want) > 0 && !reflect.DeepEqual(got, want) {
 		t.Fatalf("student rows changed: count = %d, want %d, error = %v", len(got), len(want), err)
 	}

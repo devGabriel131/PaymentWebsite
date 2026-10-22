@@ -9,19 +9,33 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+type Details struct {
+	Name         string `gorm:"not null;default:''"`
+	Email        string `gorm:"not null;default:''"`
+	Phone        string `gorm:"not null;default:''"`
+	Municipality string `gorm:"not null;default:''"`
+}
+
 type Student struct {
-	ID             uint64    `gorm:"primaryKey"`
-	SourceLinkHash []byte    `gorm:"not null;uniqueIndex;check:student_source_hash_size,octet_length(source_link_hash) = 32"`
-	Name           string    `gorm:"not null"`
-	CreatedAt      time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
+	ID             uint64 `gorm:"primaryKey"`
+	SourceLinkHash []byte `gorm:"not null;uniqueIndex;check:student_source_hash_size,octet_length(source_link_hash) = 32"`
+	Details
+	CreatedAt time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
+	IsActive  bool      `gorm:"not null;default:true"`
 }
 
 type Store struct {
 	db *gorm.DB
+	// changed runs after every committed write, so open management pages refresh.
+	changed func()
 }
 
-func New(db *gorm.DB) *Store {
-	return &Store{db: db}
+// New returns a store whose committed writes call changed, when it is non-nil.
+func New(db *gorm.DB, changed func()) *Store {
+	if changed == nil {
+		changed = func() {}
+	}
+	return &Store{db: db, changed: changed}
 }
 
 // List returns all retained students, newest first, regardless of source access.
@@ -55,7 +69,7 @@ func (s *Store) UpdateField(ctx context.Context, id uint64, key, raw string) (*S
 	if !ok {
 		return nil, ErrUnknownField
 	}
-	value, err := field.Parse(raw)
+	value, err := field.Parse(raw, field.Required)
 	if err != nil {
 		return nil, err
 	}
@@ -68,5 +82,6 @@ func (s *Store) UpdateField(ctx context.Context, id uint64, key, raw string) (*S
 	if result.Error != nil || result.RowsAffected == 0 {
 		return nil, result.Error
 	}
+	s.changed()
 	return &record, nil
 }

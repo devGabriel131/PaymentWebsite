@@ -2,45 +2,358 @@ package students_test
 
 import (
 	"errors"
+	"reflect"
+	"strings"
 	"testing"
 
 	"paymentwebsite/internal/students"
 )
 
-func TestParseNamePreservesUnicodeAndDraftBoundary(t *testing.T) {
-	cases := []struct {
+func TestFieldsExposeOrderedRequiredDetails(t *testing.T) {
+	t.Parallel()
+	student := students.Student{Details: students.Details{
+		Name: "María Rivera", Email: "Maria@example.com", Phone: "+17872345678", Municipality: "Añasco",
+	}}
+	want := []struct {
+		key, label, inputType, value string
+	}{
+		{"name", "Name", "text", student.Name},
+		{"email", "Email", "email", student.Email},
+		{"phone", "Phone", "tel", student.Phone},
+		{"municipality", "Municipality", "", student.Municipality},
+	}
+	fields := students.Fields()
+	if len(fields) != len(want) {
+		t.Fatalf("registry has %d fields, want %d", len(fields), len(want))
+	}
+	for i, expected := range want {
+		t.Run(expected.key, func(t *testing.T) {
+			field := fields[i]
+			if field.Key != expected.key || field.Label != expected.label || field.InputType != expected.inputType || !field.Required || field.Value(student) != expected.value {
+				t.Fatalf("field = %+v, value = %q, want %+v and required", field, field.Value(student), expected)
+			}
+			found, ok := students.FindField(expected.key)
+			if !ok || found.Key != field.Key || found.Value(student) != expected.value {
+				t.Fatalf("FindField(%q) = %+v, %v", expected.key, found, ok)
+			}
+			if value, err := field.Parse("", field.Required); value != "" || err == nil {
+				t.Fatalf("required registry parser = %q, %v", value, err)
+			}
+			if value, err := field.Parse("", false); value != "" || err != nil {
+				t.Fatalf("draft registry parser = %q, %v", value, err)
+			}
+			if expected.key == "municipality" {
+				if !reflect.DeepEqual(field.Options, students.MunicipalityOptions()) {
+					t.Fatalf("municipality registry options differ from shared choices: %v", field.Options)
+				}
+			} else if len(field.Options) != 0 {
+				t.Fatalf("nonselect field has options: %v", field.Options)
+			}
+		})
+	}
+	for _, key := range []string{"", "Name", "email_confirm", "id", "source_link_hash", "created_at", "name; DROP TABLE students"} {
+		t.Run("unknown "+key, func(t *testing.T) {
+			if field, ok := students.FindField(key); ok {
+				t.Fatalf("unknown field %q resolved to %+v", key, field)
+			}
+		})
+	}
+}
+
+func TestFieldParsersRespectNormalizationAndDraftBoundaries(t *testing.T) {
+	t.Parallel()
+	type parserCase struct {
 		name     string
 		raw      string
 		required bool
 		want     string
-		message  string
-	}{
-		{"Unicode whitespace trimmed", "\u2003 María O'Connor 李 \t\n", true, "María O'Connor 李", ""},
-		{"markup remains plain data", `<b>Ana & 李</b>`, true, `<b>Ana & 李</b>`, ""},
-		{"empty draft allowed", "", false, "", ""},
-		{"blank draft allowed", " \t\u2003\n", false, "", ""},
-		{"empty final refused", "", true, "", "Enter a name."},
-		{"blank final refused", " \t\u2003\n", true, "", "Enter a name."},
-		{"invalid UTF8 final refused", "Ana\xff", true, "", "Enter a valid name."},
-		{"invalid UTF8 draft refused", "\xff", false, "", "Enter a valid name."},
-		{"NUL final refused", "Ana\x00", true, "", "Enter a valid name."},
-		{"NUL draft refused", "\x00", false, "", "Enter a valid name."},
+		invalid  bool
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, err := students.ParseName(tc.raw, tc.required)
-			if got != tc.want {
-				t.Fatalf("parsed %q, want %q", got, tc.want)
+	local64 := strings.Repeat("a", 64)
+	domain189 := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 61)
+	for _, parser := range []struct {
+		name  string
+		parse func(string, bool) (string, error)
+		cases []parserCase
+	}{
+		{"name", students.ParseName, []parserCase{
+			{"accented full name", "María José Pérez Rivera", true, "María José Pérez Rivera", false},
+			{"decomposed accents preserved", " Mari\u0301a Jose\u0301 Pe\u0301rez Rivera ", true, "Mari\u0301a Jose\u0301 Pe\u0301rez Rivera", false},
+			{"multiple attached combining marks", "A\u0301\u0327na Rivera", true, "A\u0301\u0327na Rivera", false},
+			{"Unicode separator normalization", "\t\n María\u00a0\u2003José   Pérez\u202fRivera \r\n", true, "María José Pérez Rivera", false},
+			{"Unicode letters preserved", "李 小龍", true, "李 小龍", false},
+			{"one word draft", " María ", false, "María", false},
+			{"one word final", "María", true, "", true},
+			{"empty draft", "", false, "", false},
+			{"blank draft", " \t\u2003\n", false, "", false},
+			{"empty final", "", true, "", true},
+			{"blank final", " \t\u2003\n", true, "", true},
+			{"no independent name size ceiling", strings.Repeat("Ana", 1500) + " Rivera", true, strings.Repeat("Ana", 1500) + " Rivera", false},
+			{"ASCII digits", "Ana Rivera2", true, "", true},
+			{"Unicode digits", "Ana Rivera٢", false, "", true},
+			{"hyphen", "Ana María-Rivera", true, "", true},
+			{"apostrophe", "Ana O'Connor", true, "", true},
+			{"curly apostrophe", "Ana O’Connor", false, "", true},
+			{"markup", "<b>Ana Rivera</b>", true, "", true},
+			{"ampersand", "Ana & Rivera", true, "", true},
+			{"emoji", "Ana Rivera😀", false, "", true},
+			{"leading detached combining mark", "\u0301Ana Rivera", true, "", true},
+			{"word starts with combining mark", "Ana \u0301Rivera", false, "", true},
+			{"only combining marks", "\u0301\u0327", false, "", true},
+			{"internal newline", "Ana\nRivera", true, "", true},
+			{"internal carriage return", "Ana\rRivera", true, "", true},
+			{"internal tab", "Ana\tRivera", false, "", true},
+			{"internal vertical tab", "Ana\vRivera", true, "", true},
+			{"internal form feed", "Ana\fRivera", true, "", true},
+			{"Unicode line separator", "Ana\u2028Rivera", true, "", true},
+			{"Unicode paragraph separator", "Ana\u2029Rivera", true, "", true},
+			{"zero width separator", "Ana\u200bRivera", true, "", true},
+			{"bidi control", "Ana \u202eRivera", false, "", true},
+			{"NUL", "Ana\x00 Rivera", true, "", true},
+			{"NUL draft", "\x00", false, "", true},
+			{"invalid UTF8", "Ana\xff Rivera", true, "", true},
+			{"invalid UTF8 draft before trim", " \xff ", false, "", true},
+		}},
+		{"email", students.ParseEmail, []parserCase{
+			{"plus dots and local case", " \tAda.Lovelace+Class@EXAMPLE.COM\n", true, "Ada.Lovelace+Class@example.com", false},
+			{"bare draft mailbox", "Ada@Example.COM", false, "Ada@example.com", false},
+			{"ASCII punycode domain", "Ada@XN--BCHER-KVA.EXAMPLE", true, "Ada@xn--bcher-kva.example", false},
+			{"hyphen and digits in labels", "Ada@mail-2.example", true, "Ada@mail-2.example", false},
+			{"unquoted apostrophe is valid local text", "O'Connor@example.com", true, "O'Connor@example.com", false},
+			{"64 byte local part", local64 + "@example.com", true, local64 + "@example.com", false},
+			{"254 byte mailbox and 63 byte labels", local64 + "@" + domain189, true, local64 + "@" + domain189, false},
+			{"65 byte local part", local64 + "a@example.com", true, "", true},
+			{"255 byte mailbox", local64 + "@" + domain189 + "c", true, "", true},
+			{"64 byte domain label", "Ada@" + strings.Repeat("a", 64) + ".com", false, "", true},
+			{"empty draft", "", false, "", false},
+			{"blank draft", " \t\u2003\n", false, "", false},
+			{"empty final", "", true, "", true},
+			{"blank final", " \t\u2003\n", true, "", true},
+			{"display name", "Ada <Ada@example.com>", true, "", true},
+			{"bare angle brackets", "<Ada@example.com>", true, "", true},
+			{"address list", "Ada@example.com, Other@example.com", false, "", true},
+			{"group", "Class: Ada@example.com;", true, "", true},
+			{"trailing comment", "Ada@example.com (Student)", true, "", true},
+			{"local comment", "Ada(Student)@example.com", true, "", true},
+			{"quoted local part", "\"Ada\"@example.com", true, "", true},
+			{"quoted local part requiring quotes", "\"Ada Rivera\"@example.com", true, "", true},
+			{"address literal", "Ada@[127.0.0.1]", true, "", true},
+			{"IPv6 address literal", "Ada@[IPv6:2001:db8::1]", true, "", true},
+			{"dotless domain", "Ada@localhost", true, "", true},
+			{"empty domain label", "Ada@example..com", false, "", true},
+			{"leading empty label", "Ada@.example.com", true, "", true},
+			{"trailing empty label", "Ada@example.com.", true, "", true},
+			{"leading label hyphen", "Ada@-example.com", true, "", true},
+			{"trailing label hyphen", "Ada@example-.com", true, "", true},
+			{"domain underscore", "Ada@my_example.com", true, "", true},
+			{"domain punctuation", "Ada@example!.com", false, "", true},
+			{"Unicode local part", "María@example.com", true, "", true},
+			{"Unicode domain", "Ada@ejémplo.com", true, "", true},
+			{"internal space", "Ada @example.com", true, "", true},
+			{"internal tab", "Ada@exam\tple.com", false, "", true},
+			{"header injection", "Ada@example.com\r\nBcc: private@example.com", true, "", true},
+			{"NUL", "Ada\x00@example.com", true, "", true},
+			{"DEL", "Ada\x7f@example.com", true, "", true},
+			{"invalid UTF8", "Ada\xff@example.com", false, "", true},
+			{"multiple at signs", "Ada@@example.com", true, "", true},
+			{"empty local part", "@example.com", true, "", true},
+			{"leading local dot", ".Ada@example.com", true, "", true},
+			{"trailing local dot", "Ada.@example.com", true, "", true},
+			{"repeated local dot", "Ada..Rivera@example.com", true, "", true},
+		}},
+		{"phone", students.ParsePhone, []parserCase{
+			{"PR 787 metadata example", "7872345678", true, "+17872345678", false},
+			{"PR 939 valid metadata prefix", "(939) 234-5678", true, "+19392345678", false},
+			{"PR leading one", "1 787 234 5678", true, "+17872345678", false},
+			{"PR international", " +1 (787) 234-5678 ", false, "+17872345678", false},
+			{"US metadata example", "2015550123", true, "+12015550123", false},
+			{"US formatted", "(202) 555-0123", true, "+12025550123", false},
+			{"US dot separators", "1.650.253.0000", true, "+16502530000", false},
+			{"surrounding whitespace", "\t\u2003+1 201 555 0123\n", true, "+12015550123", false},
+			{"empty draft", "", false, "", false},
+			{"blank draft", " \t\u2003\n", false, "", false},
+			{"empty final", "", true, "", true},
+			{"blank final", " \t\u2003\n", true, "", true},
+			{"short emergency", "911", true, "", true},
+			{"local without area code", "2345678", false, "", true},
+			{"incomplete", "787234567", true, "", true},
+			{"metadata invalid PR exchange", "7871234567", true, "", true},
+			{"metadata invalid US area", "2002345678", true, "", true},
+			{"Canada metadata example", "+15062345678", true, "", true},
+			{"Canada Toronto", "+1 416 555 0123", false, "", true},
+			{"other NANP Bahamas", "+1 242 365 1234", true, "", true},
+			{"foreign country", "+44 20 7946 0018", true, "", true},
+			{"vanity letters", "1-800-FLOWERS", true, "", true},
+			{"extension x", "7872345678 x123", true, "", true},
+			{"extension text", "7872345678 ext. 123", false, "", true},
+			{"extension hash", "7872345678#123", true, "", true},
+			{"misplaced plus", "1+7872345678", true, "", true},
+			{"duplicate plus", "++17872345678", true, "", true},
+			{"Unicode digits", "７８７２３４５６７８", true, "", true},
+			{"internal Unicode space", "787\u00a0234 5678", true, "", true},
+			{"internal tab", "787\t2345678", false, "", true},
+			{"internal newline", "787\n2345678", true, "", true},
+			{"NUL", "7872345678\x00", true, "", true},
+			{"invalid UTF8", "787\xff2345678", true, "", true},
+		}},
+		{"municipality", students.ParseMunicipality, []parserCase{
+			{"accented choice", "Añasco", true, "Añasco", false},
+			{"trimmed accented choice", "\t Bayamón \u2003", false, "Bayamón", false},
+			{"outside", "Fuera de Puerto Rico", true, "Fuera de Puerto Rico", false},
+			{"empty draft", "", false, "", false},
+			{"blank draft", " \t\u2003\n", false, "", false},
+			{"empty final", "", true, "", true},
+			{"blank final", " \t\u2003\n", true, "", true},
+			{"forged choice", "PRIVATE_FORGED_MUNICIPALITY", true, "", true},
+			{"forged draft choice", "Not a municipality", false, "", true},
+			{"alternate case", "san juan", true, "", true},
+			{"missing accent", "Anasco", true, "", true},
+			{"decomposed spelling is not exact", "An\u0303asco", true, "", true},
+			{"alternate outside spelling", "Outside Puerto Rico", true, "", true},
+			{"markup", "<option>San Juan</option>", true, "", true},
+			{"internal whitespace", "San  Juan", true, "", true},
+			{"NUL", "San Juan\x00", true, "", true},
+			{"invalid UTF8", "San Juan\xff", true, "", true},
+		}},
+	} {
+		t.Run(parser.name, func(t *testing.T) {
+			for _, tc := range parser.cases {
+				t.Run(tc.name, func(t *testing.T) {
+					got, err := parser.parse(tc.raw, tc.required)
+					if got != tc.want {
+						t.Fatalf("parsed %q, want %q", got, tc.want)
+					}
+					if !tc.invalid {
+						if err != nil {
+							t.Fatal(err)
+						}
+						return
+					}
+					var invalid *students.ValidationError
+					if !errors.As(err, &invalid) || invalid.Message == "" || err.Error() != invalid.Message {
+						t.Fatalf("error = %v, want nonempty ValidationError", err)
+					}
+				})
 			}
-			if tc.message == "" {
-				if err != nil {
-					t.Fatal(err)
-				}
-				return
+		})
+	}
+}
+
+func TestParserErrorsNeverEchoSubmittedValues(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		key, private string
+	}{
+		{"name", "PRIVATE_NAME_123"},
+		{"email", "PRIVATE_EMAIL_AT_PRIVATE_DOMAIN"},
+		{"phone", "PRIVATE_PHONE_VALUE"},
+		{"municipality", "PRIVATE_MUNICIPALITY_VALUE"},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			field, ok := students.FindField(tc.key)
+			if !ok {
+				t.Fatal("missing field")
 			}
+			_, err := field.Parse(tc.private, true)
 			var invalid *students.ValidationError
-			if !errors.As(err, &invalid) || invalid.Message != tc.message || err.Error() != tc.message {
-				t.Fatalf("error = %v, want ValidationError %q", err, tc.message)
+			if !errors.As(err, &invalid) || strings.Contains(err.Error(), tc.private) {
+				t.Fatalf("validation error leaked submitted value or lost type: %v", err)
+			}
+		})
+	}
+}
+
+func TestMunicipalityOptionsAreExactAndAllAccepted(t *testing.T) {
+	t.Parallel()
+	want := strings.Split(`Adjuntas
+Aguada
+Aguadilla
+Aguas Buenas
+Aibonito
+Añasco
+Arecibo
+Arroyo
+Barceloneta
+Barranquitas
+Bayamón
+Cabo Rojo
+Caguas
+Camuy
+Canóvanas
+Carolina
+Cataño
+Cayey
+Ceiba
+Ciales
+Cidra
+Coamo
+Comerío
+Corozal
+Culebra
+Dorado
+Fajardo
+Florida
+Guánica
+Guayama
+Guayanilla
+Guaynabo
+Gurabo
+Hatillo
+Hormigueros
+Humacao
+Isabela
+Jayuya
+Juana Díaz
+Juncos
+Lajas
+Lares
+Las Marías
+Las Piedras
+Loíza
+Luquillo
+Manatí
+Maricao
+Maunabo
+Mayagüez
+Moca
+Morovis
+Naguabo
+Naranjito
+Orocovis
+Patillas
+Peñuelas
+Ponce
+Quebradillas
+Rincón
+Río Grande
+Sabana Grande
+Salinas
+San Germán
+San Juan
+San Lorenzo
+San Sebastián
+Santa Isabel
+Toa Alta
+Toa Baja
+Trujillo Alto
+Utuado
+Vega Alta
+Vega Baja
+Vieques
+Villalba
+Yabucoa
+Yauco
+Fuera de Puerto Rico`, "\n")
+	options := students.MunicipalityOptions()
+	if len(options) != 79 || !reflect.DeepEqual(options, want) {
+		t.Fatalf("municipality choices = %q, want exact ordered 79 choices", options)
+	}
+	for _, option := range options {
+		t.Run(option, func(t *testing.T) {
+			for _, required := range []bool{false, true} {
+				if got, err := students.ParseMunicipality(option, required); err != nil || got != option {
+					t.Fatalf("ParseMunicipality(%q, %v) = %q, %v", option, required, got, err)
+				}
 			}
 		})
 	}

@@ -288,6 +288,62 @@ button.management-button-danger:enabled:hover {
   background: var(--raised);
 }
 
+/* Copy confirmation. Like #link-status, the live region stays rendered and only
+   shows while it has a message; management.js empties it when the animation ends.
+   Clicks pass through to whatever it covers. */
+#copy-toast {
+  position: fixed;
+  right: var(--gutter);
+  bottom: var(--gutter);
+  margin: 0;
+  pointer-events: none;
+}
+
+#copy-toast:not(:empty) {
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--raised);
+  box-shadow: inset 3px 0 0 var(--accent), 0 0.5rem 1.5rem rgb(0 0 0 / 0.35);
+  animation: copy-toast 3.5s ease-out forwards;
+}
+
+/* Rises in from below the viewport, holds, then fades out. */
+@keyframes copy-toast {
+  from {
+    translate: 0 calc(100% + var(--gutter));
+  }
+
+  8% {
+    translate: 0;
+  }
+
+  88% {
+    opacity: 1;
+  }
+
+  to {
+    opacity: 0;
+  }
+}
+
+/* Reduced motion skips the rise; the fade still ends the toast. */
+@media (prefers-reduced-motion: reduce) {
+  #copy-toast:not(:empty) {
+    animation-name: copy-toast-fade;
+  }
+}
+
+@keyframes copy-toast-fade {
+  88% {
+    opacity: 1;
+  }
+
+  to {
+    opacity: 0;
+  }
+}
+
 #generated-links {
   margin: 0;
   padding: 0;
@@ -398,7 +454,8 @@ button.management-button-danger:enabled:hover {
   gap: 0.5rem;
 }
 
-.management-link-actions:empty {
+/* Rows without actions still hold a hidden copy-button placeholder. */
+.management-link-actions:not(:has(> :not([hidden]))) {
   display: none;
 }
 
@@ -410,7 +467,7 @@ button.management-button-danger:enabled:hover {
   color: var(--muted);
 }
 
-/* Disappears as soon as HTMX appends the first row; no JS involved. */
+/* Disappears as soon as the list shows its first row; no JS involved. */
 #generated-links:has(> li) ~ .management-empty {
   display: none;
 }
@@ -482,6 +539,26 @@ button.management-button-danger:enabled:hover {
 .management-settings-form button {
   justify-self: start;
   margin-top: 0.25rem;
+}
+
+.management-program-settings {
+  margin-bottom: 1.5rem;
+}
+
+.management-program-settings input[type="date"] {
+  box-sizing: border-box;
+  width: min(100%, 20rem);
+  min-width: 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--control);
+  border-radius: 0.5rem;
+  background: var(--canvas);
+  color: var(--text);
+  font-size: 1rem;
+}
+
+.management-program-settings input[aria-invalid="true"] {
+  border-color: var(--danger);
 }
 
 .management-slider {
@@ -571,6 +648,12 @@ button.management-button-danger:enabled:hover {
 
 .management-students {
   min-width: 0;
+}
+
+/* Live refreshes swap the records inside this wrapper; pass the panel's
+   corners through so the scrolling table still clips to them. */
+.management .student-records {
+  border-radius: inherit;
 }
 
 .management .student-table-scroll {
@@ -791,31 +874,415 @@ button.management-button-danger:enabled:hover {
   }
 }
 
+/* Customer: a quiet, centered welcome built around the original brand mark. */
+.customer {
+  color-scheme: light;
+  box-sizing: border-box;
+  display: grid;
+  place-items: center;
+  min-height: 100svh;
+  margin: 0;
+  padding: 1.5rem;
+  padding-block: max(1.5rem, env(safe-area-inset-top)) max(1.5rem, env(safe-area-inset-bottom));
+  background: #f4f8f8;
+  color: var(--brand-ink);
+  line-height: 1.65;
+}
+
 .customer main {
-  max-width: 28rem;
+  display: grid;
+  justify-items: center;
+  gap: clamp(1.25rem, 3svh, 2rem);
+  width: 100%;
+  max-width: 38rem;
+}
+
+.customer-logo {
+  display: block;
+  width: clamp(6rem, 18svh, 10rem);
+  height: auto;
+}
+
+.customer #customer-content {
+  width: 100%;
+  text-align: center;
+}
+
+.customer h1 {
+  margin: 0;
+  font-size: clamp(1.5rem, 4vw, 2rem);
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  line-height: 1.3;
+  text-wrap: balance;
+}
+
+.customer p {
+  margin: 1rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.customer-lead {
+  font-size: 1rem;
+  text-wrap: pretty;
+}
+
+.customer-description {
+  color: #526b70;
+  font-size: 0.9375rem;
+  text-wrap: pretty;
+}
+
+.customer-primary {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  max-width: 22rem;
+  min-height: 3.5rem;
+  margin: 1.75rem auto 0;
+  padding: 0.75rem 1.5rem;
+  border: 1px solid var(--brand-ink);
+  border-radius: 0.75rem;
+  background: var(--brand-ink);
+  color: #ffffff;
+  font: inherit;
+  font-weight: 600;
+  text-decoration: none;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.customer-primary:hover {
+  background: #38636b;
+}
+
+.customer :focus-visible {
+  outline: 3px solid var(--brand-ink);
+  outline-offset: 4px;
+}
+
+.customer:has(#customer-content form) {
+  align-items: start;
+  padding: max(1.5rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right))
+    max(2rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
+}
+
+.customer:has(#customer-content form) .customer-logo {
+  width: 4.5rem;
 }
 
 .customer form {
   display: grid;
-  gap: 1rem;
+  gap: 1.5rem;
+  width: 100%;
+  max-width: 28rem;
+  margin: 1.5rem auto 0;
+  text-align: left;
 }
+
+.customer-field {
+  display: grid;
+  gap: 0.375rem;
+  min-width: 0;
+}
+
+.customer-field label {
+  font-weight: 600;
+}
+
 
 .customer input,
-.customer button {
+.customer select {
   box-sizing: border-box;
-}
-
-.customer input {
   width: 100%;
+  min-width: 0;
+  min-height: 3rem;
+  padding: 0.625rem 0.75rem;
+  border: 1px solid #526b70;
+  border-radius: 0.5rem;
+  background: #ffffff;
+  color: var(--brand-ink);
+  font: inherit;
+  font-size: 1rem;
 }
 
-.customer p {
+.customer form .customer-primary,
+.customer form p {
   margin: 0;
-  overflow-wrap: anywhere;
+}
+
+.customer form .customer-primary {
+  margin-inline: auto;
+}
+
+.customer .customer-primary:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+
+.customer-hint,
+.customer-status {
+  color: #526b70;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.customer-status:not(:has(*)),
+.customer #form-error:not(:has(*)) {
+  display: none;
+}
+
+.customer input[aria-invalid="true"],
+.customer select[aria-invalid="true"] {
+  border-color: #b91c1c;
 }
 
 .customer [role="alert"] {
   color: #b91c1c;
+}
+
+/* Agreement and plan selection stay left-aligned, with every term and date in normal page flow. */
+.customer-agreement,
+.customer-payments {
+  align-items: start;
+  padding: max(1.5rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right))
+    max(2rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
+}
+
+.customer-agreement main {
+  max-width: 44rem;
+}
+
+.customer-payments main {
+  max-width: 78rem;
+}
+
+.customer:is(.customer-agreement, .customer-payments) .customer-logo {
+  justify-self: start;
+  width: 4.5rem;
+}
+
+.payment-agreement,
+.payment-selection {
+  min-width: 0;
+  font-size: 1rem;
+  text-align: left;
+}
+
+.payment-agreement h1 {
+  font-size: clamp(1.375rem, 3vw, 1.75rem);
+}
+
+.agreement-terms {
+  margin-top: 2rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid #bdd0d2;
+}
+
+.agreement-terms h2 {
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.agreement-clauses {
+  margin: 1.25rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agreement-clauses li + li {
+  margin-top: 1.25rem;
+}
+
+.customer .agreement-acceptance {
+  display: grid;
+  gap: 1rem;
+  max-width: none;
+  margin: 2rem 0 0;
+  padding-top: 1.5rem;
+  border-top: 1px solid #bdd0d2;
+}
+
+.customer .customer-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  min-height: 44px;
+  line-height: 1.5;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.customer .customer-choice input {
+  flex: 0 0 1.25rem;
+  width: 1.25rem;
+  height: 1.25rem;
+  min-height: 1.25rem;
+  margin: 0.125rem 0 0;
+  padding: 0;
+  accent-color: var(--brand-ink);
+}
+
+.customer-choice span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.customer .agreement-acceptance .customer-primary,
+.customer .payment-plan-form .customer-primary {
+  max-width: 26rem;
+  margin: 0;
+}
+
+.payment-page-heading {
+  max-width: 44rem;
+}
+
+.payment-page-heading p {
+  color: #526b70;
+}
+
+.payment-saved {
+  padding-block: 1rem;
+  border-block: 1px solid #bdd0d2;
+}
+
+.customer .payment-plan-form {
+  gap: 1.5rem;
+  max-width: none;
+  margin-top: 2rem;
+}
+
+.payment-plan-form fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.payment-plan-form legend {
+  padding: 0;
+  margin-bottom: 1rem;
+  font-weight: 600;
+}
+
+.payment-plan-form [role="alert"] {
+  margin-bottom: 1rem;
+}
+
+.payment-options {
+  display: grid;
+  gap: 1.5rem;
+}
+
+.payment-option {
+  min-width: 0;
+  padding: 1.25rem;
+  border: 1px solid #bdd0d2;
+  border-top-width: 3px;
+}
+
+.payment-option:has(input:checked) {
+  border-color: var(--brand-ink);
+  background: #ffffff;
+}
+
+.payment-option-heading {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+.payment-plan-summary {
+  display: grid;
+  gap: 0.25rem;
+  margin-top: 1rem;
+  padding-block: 1rem;
+  border-block: 1px solid #bdd0d2;
+  font-variant-numeric: tabular-nums;
+}
+
+.payment-plan-summary p + p {
+  color: #526b70;
+}
+
+.payment-schedule-heading {
+  margin: 1.25rem 0 0.5rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.payment-schedule {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.payment-schedule li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.75rem;
+  padding-block: 0.75rem;
+  border-bottom: 1px solid #bdd0d2;
+}
+
+.payment-schedule li:last-child {
+  border-bottom: 0;
+}
+
+.payment-schedule li > span {
+  overflow-wrap: anywhere;
+}
+
+.payment-installment-amount {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.payment-review a {
+  display: inline-block;
+  box-sizing: border-box;
+  min-height: 44px;
+  padding-block: 0.5rem;
+  color: var(--brand-ink);
+  text-underline-offset: 0.2em;
+}
+
+.payment-review a:hover {
+  text-decoration-thickness: 2px;
+}
+
+@media (min-width: 64rem) {
+  .payment-options {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .payment-option-heading {
+    min-height: 4.5rem;
+  }
+}
+
+@media (max-height: 620px) {
+  .customer {
+    padding-block: max(1rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-bottom));
+  }
+
+  .customer main {
+    gap: 1rem;
+  }
+
+  .customer-logo {
+    width: 4.5rem;
+  }
+
+  .customer-primary {
+    margin-top: 1.25rem;
+  }
 }
 
 .customer-not-found {
