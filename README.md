@@ -26,7 +26,7 @@ Links are not invoice-bound or matched to a unique person yet. Students holds ca
 
 **Test/development only:** management is authenticated, but invoice and payment workflows are not implemented. Use disposable data, never real customer/payment data.
 
-This implementation is local; no commit, push, or deployment is part of this work. The existing server-side phone dependency requires a verified non-production Railway preview before any future merge or push to `master`.
+The existing server-side phone dependency requires a verified non-production Railway preview before any future merge or push to `master`.
 
 ## Stack and development
 
@@ -399,7 +399,7 @@ Each integration test creates its own PostgreSQL schema through one schema-scope
 - Digest-only storage and token boundaries; status progression from any populated field, field-isolated and concurrent drafts/explicit clears without enrollment, independent links, hard access cutoffs, and verified staff attribution for creation/cancellation.
 - Source-link foreign-key protection against deletion/hash changes, and repeated current-model `AutoMigrate` preserving links and students.
 - Exactly one coherent four-field enrollment under concurrent final submissions; rollback of every contact field/completion/expiry on student insert or deferred commit failure; successful retry; submission/cancellation races with either completion plus one student or cancellation plus none.
-- Completed GET/final-POST HTTP 200 replay without answer/deadline changes or contact/confirmation disclosure, including invalid-body replay precedence, stale keyed-draft 409, retryable customer fragments retaining all attempted controls, and completed-access expiry without student loss.
+- Completed GET/final-POST replays return HTTP 303 (HTMX POST: HTTP 200 with `HX-Redirect`) without answer/deadline changes or contact/confirmation disclosure, including invalid-body replay precedence, stale keyed-draft 409, retryable customer fragments retaining all attempted controls, and completed-access expiry without student loss.
 - The exact 24-hour completion boundary, next-render main-page archival, no completed records in Trash, stale HTMX cancels that only acknowledge while the refreshed list leaves archived rows out, and Students retention after source expiry.
 - Student newest-first reads, all-field validation/allowlisting and escaped rendering, one-column canonical edits isolated from other fields/students and the four-field source snapshot, native municipality select/cancel/error behavior, full-page/HTMX editor and modal/OOB-row contracts, rejected requests without mutation, and honest empty/error responses.
 - Name/phone-only personal-data projection in main/Trash rows, with email/municipality absent even when populated, and canonical phone edits isolated from registry phone.
