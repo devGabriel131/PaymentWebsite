@@ -119,6 +119,9 @@ func TestMoney(t *testing.T) {
 			if got := payments.Money(tc.cents); got != tc.want {
 				t.Errorf("Money(%d) = %q, want %q", tc.cents, got, tc.want)
 			}
+			if got := payments.Money64(int64(tc.cents)); got != tc.want {
+				t.Errorf("Money64(%d) = %q, want %q", tc.cents, got, tc.want)
+			}
 		})
 	}
 }

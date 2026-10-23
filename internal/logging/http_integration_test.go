@@ -18,9 +18,11 @@ import (
 	"time"
 
 	"github.com/alexedwards/argon2id"
+	"github.com/stripe/stripe-go/v87"
 	"gorm.io/gorm"
 
 	"paymentwebsite/internal/auth"
+	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/customer"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
@@ -310,7 +312,7 @@ func TestAgreementAndChoiceFailuresLogOnceWithoutContactData(t *testing.T) {
 	rec = serveHTTPLogging(t, handler, http.MethodPost, path+"/payments", url.Values{"payment_plan": {"six"}}, nil)
 	fixture.requireFailure(t, rec, httpFailure{
 		method: http.MethodPost, route: "POST /customer/{token}/payments",
-		operation: "final_submit", stage: "save", kind: "database", sqlstate: "23514",
+		operation: "checkout_start", stage: "checkout", kind: "database", sqlstate: "23514",
 	}, private...)
 	if after := fixture.link(t, entry.Token); !reflect.DeepEqual(after, before) {
 		t.Fatal("failed choice changed contact, consent, or saved choice")
@@ -321,8 +323,8 @@ func TestAgreementAndChoiceFailuresLogOnceWithoutContactData(t *testing.T) {
 	fixture.out.Reset()
 	for range 2 {
 		rec = serveHTTPLogging(t, handler, http.MethodPost, path+"/payments", url.Values{"payment_plan": {"six"}}, nil)
-		if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != path+"/payments" || rec.Body.Len() != 0 {
-			t.Fatal("choice retry or replay did not advance quietly")
+		if rec.Code != http.StatusSeeOther || !strings.HasPrefix(rec.Header().Get("Location"), "https://checkout.stripe.com") || rec.Body.Len() != 0 {
+			t.Fatalf("plan retry did not redirect quietly to Stripe: code=%d, loc=%s", rec.Code, rec.Header().Get("Location"))
 		}
 		fixture.requireQuiet(t)
 	}
@@ -366,10 +368,45 @@ func newHTTPLoggingFixture(t *testing.T) *httpLoggingFixture {
 	t.Helper()
 	fixture := &httpLoggingFixture{}
 	fixture.log = logging.New(&fixture.out)
-	db := testdb.Open(t, &auth.User{}, &auth.Session{}, &links.Link{}, &students.Student{}, &settings.Settings{})
+	models := append([]any{&auth.User{}, &auth.Session{}, &links.Link{}, &students.Student{}, &settings.Settings{}}, billing.Models()...)
+	db := testdb.Open(t, models...)
 	fixture.db = db.Session(&gorm.Session{Logger: logging.NewDBLogger(fixture.log)})
 	fixture.store = links.New(fixture.db, nil)
 	return fixture
+}
+
+func (fixture *httpLoggingFixture) mockStripe(t *testing.T) *stripe.Client {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/customers":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "cus_log_test", "object": "customer"})
+		case "/v1/checkout/sessions":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":             "cs_log_test",
+				"object":         "checkout.session",
+				"url":            "https://checkout.stripe.com/pay/cs_log_test",
+				"currency":       "usd",
+				"mode":           "payment",
+				"customer":       "cus_log_test",
+				"status":         "open",
+				"payment_status": "unpaid",
+				"amount_total":   10835,
+			})
+		default:
+			http.Error(w, `{"error":{"message":"not found"}}`, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	maxRetries := int64(0)
+	backends := stripe.NewBackendsWithConfig(&stripe.BackendConfig{
+		URL:               stripe.String(ts.URL),
+		HTTPClient:        ts.Client(),
+		MaxNetworkRetries: &maxRetries,
+		LeveledLogger:     &stripe.LeveledLogger{Level: stripe.LevelNull},
+	})
+	return stripe.NewClient("sk_test_mock", stripe.WithBackends(backends))
 }
 
 func (fixture *httpLoggingFixture) routes(t *testing.T, store *links.Store) http.Handler {
@@ -380,13 +417,32 @@ func (fixture *httpLoggingFixture) routes(t *testing.T, store *links.Store) http
 	}
 	t.Cleanup(manager.Close)
 	child := http.NewServeMux()
-	if err := management.RegisterRoutes(child, store, students.New(fixture.db, nil), settings.New(fixture.db), auth.Staff); err != nil {
+	cfg := billing.Config{
+		BaseURL:                      "http://127.0.0.1:3000",
+		WebhookSecret:                "whsec_dummy",
+		PaymentMethodConfigurationID: "pmc_dummy",
+		PortalConfigurationID:        "bpc_dummy",
+		Live:                         false,
+	}
+	catalog := billing.Catalog{
+		Full:          "pr_full",
+		ThreeFirst:    "pr_three_1",
+		ThreeLater:    "pr_three_2",
+		SixFirst:      "pr_six_1",
+		SixLater:      "pr_six_2",
+		Reinstatement: "pr_reinstatement",
+	}
+	biller, err := billing.New(fixture.db, fixture.mockStripe(t), cfg, catalog, nil, fixture.log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := management.RegisterRoutes(child, store, students.New(fixture.db, nil), settings.New(fixture.db), auth.Staff, biller); err != nil {
 		t.Fatal(err)
 	}
 	root := http.NewServeMux()
 	manager.RegisterRoutes(root)
 	root.Handle("/management/", manager.Require(child))
-	if err := customer.RegisterRoutes(root, store, settings.New(fixture.db)); err != nil {
+	if err := customer.RegisterRoutes(root, store, settings.New(fixture.db), biller); err != nil {
 		t.Fatal(err)
 	}
 	return logging.Requests(fixture.log, http.NewCrossOriginProtection().Handler(root))

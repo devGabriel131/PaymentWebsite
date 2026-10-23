@@ -857,6 +857,88 @@ button.management-button-danger:enabled:hover {
   font-size: 0.875rem;
 }
 
+.management .status-badge {
+  display: inline-block;
+  padding: 0.125rem 0.625rem;
+  border: 1px solid var(--control);
+  border-radius: 999px;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.management .status-active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.management .status-suspended {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.management .student-billing {
+  min-width: 0;
+  padding-block: 1.25rem;
+  border-top: 1px solid var(--line);
+}
+
+.management .student-billing-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 0.75rem 1.5rem;
+  margin: 0.75rem 0 0;
+}
+
+.management .student-billing-summary dt {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.management .student-billing-summary dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.management .student-billing-review {
+  margin: 1rem 0 0;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+.management .student-billing-installments {
+  width: 100%;
+  margin-top: 1rem;
+  border-collapse: collapse;
+}
+
+.management .student-billing-installments caption {
+  padding-bottom: 0.5rem;
+  font-weight: 600;
+  text-align: left;
+}
+
+.management .student-billing-installments :is(th, td) {
+  padding: 0.5rem 0.75rem 0.5rem 0;
+  text-align: left;
+  vertical-align: top;
+}
+
+.management .student-billing-installments th {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.management .student-billing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  margin-top: 1rem;
+}
+
+.management .student-billing-portal:not(:empty) {
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 960px) {
   .management-workspace {
     grid-template: "header" auto "nav" auto "main" 1fr / minmax(0, 1fr);

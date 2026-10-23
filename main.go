@@ -18,6 +18,7 @@ import (
 	"gorm.io/gorm"
 
 	"paymentwebsite/internal/auth"
+	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/customer"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/live"
@@ -124,8 +125,14 @@ func run(log *slog.Logger) (err error) {
 		return fmt.Errorf("connect to PostgreSQL: %w", err)
 	}
 	stage = "database_migrate"
-	err = db.WithContext(logging.WithOperation(ctx, "startup_migrate")).
-		AutoMigrate(&auth.User{}, &auth.Session{}, &settings.Settings{}, &links.Link{}, &students.Student{})
+	migrateModels := append([]any{
+		&auth.User{},
+		&auth.Session{},
+		&settings.Settings{},
+		&links.Link{},
+		&students.Student{},
+	}, billing.Models()...)
+	err = db.WithContext(logging.WithOperation(ctx, "startup_migrate")).AutoMigrate(migrateModels...)
 	slow.Flush()
 	if err != nil {
 		return fmt.Errorf("migrate database: %w", err)
@@ -145,12 +152,32 @@ func run(log *slog.Logger) (err error) {
 	if value, ok := os.LookupEnv("SESSION_COOKIE_SECURE"); ok {
 		secureCookies, err = strconv.ParseBool(value)
 		if err != nil {
-			return errors.New("SESSION_COOKIE_SECURE must be true or false")
+			return fmt.Errorf("SESSION_COOKIE_SECURE must be true or false: %w", err)
 		}
 	}
 	// Committed writes tell open management pages to refresh themselves.
 	feed := live.New()
 	store := links.New(db, feed.Changed)
+
+	stage = "billing_configuration"
+	billingCfg, stripeAPIKey, err := billing.LoadConfigFromEnv()
+	if err != nil {
+		return fmt.Errorf("configure stripe: %w", err)
+	}
+	stripeClient := billing.NewStripeClient(stripeAPIKey)
+	catalogCtx, cancelCatalog := context.WithTimeout(signalContext, 15*time.Second)
+	defer cancelCatalog()
+	stage = "billing_catalog"
+	catalog, err := billing.LoadCatalog(catalogCtx, stripeClient, billingCfg.Live)
+	if err != nil {
+		return fmt.Errorf("load stripe catalog: %w", err)
+	}
+	stage = "billing_initialize"
+	biller, err := billing.New(db, stripeClient, billingCfg, catalog, feed.Changed, log)
+	if err != nil {
+		return fmt.Errorf("initialize billing: %w", err)
+	}
+
 	stage = "auth_initialize"
 	authentication, err := auth.New(db, secureCookies, log)
 	if err != nil {
@@ -169,15 +196,26 @@ func run(log *slog.Logger) (err error) {
 	managementMux := http.NewServeMux()
 	managementMux.Handle("GET /management/events", logging.Operation("live_updates", feed))
 	stage = "management_routes"
-	if err := management.RegisterRoutes(managementMux, store, students.New(db, feed.Changed), settings.New(db), auth.Staff); err != nil {
+	if err := management.RegisterRoutes(managementMux, store, students.New(db, feed.Changed), settings.New(db), auth.Staff, biller); err != nil {
 		return fmt.Errorf("register management routes: %w", err)
 	}
 	mux.Handle("/management/", authentication.Require(managementMux))
 	stage = "customer_routes"
-	if err := customer.RegisterRoutes(mux, store, settings.New(db)); err != nil {
+	if err := customer.RegisterRoutes(mux, store, settings.New(db), biller); err != nil {
 		return fmt.Errorf("register customer routes: %w", err)
 	}
+	mux.Handle("POST /webhooks/stripe", logging.Operation("stripe_webhook", http.HandlerFunc(biller.Webhook)))
 
+	workerCtx, cancelWorker := context.WithCancel(signalContext)
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		biller.Run(workerCtx)
+	}()
+	defer func() {
+		cancelWorker()
+		<-workerDone
+	}()
 	addr := "127.0.0.1:3000"
 	if port := os.Getenv("PORT"); port != "" {
 		addr = ":" + port

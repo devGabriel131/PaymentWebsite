@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"html"
 	"io"
@@ -20,9 +21,10 @@ import (
 	"time"
 
 	"github.com/alexedwards/argon2id"
+	"github.com/stripe/stripe-go/v87"
 	"gorm.io/gorm"
-
 	"paymentwebsite/internal/auth"
+	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/settings"
@@ -44,11 +46,78 @@ type app struct {
 	store *links.Store
 }
 
+// newBiller builds a billing service with a local mock Stripe server for testing management billing routes.
+func newBiller(t *testing.T, db *gorm.DB) *billing.Service {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/billing_portal/sessions", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":     "bps_test",
+			"object": "billing_portal.session",
+			"url":    "https://billing.stripe.com/session/test",
+		})
+	})
+	mux.HandleFunc("GET /v1/invoices/{id}", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if id == "inv_draft_no_url" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":     id,
+				"object": "invoice",
+				"status": "draft",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":                 id,
+			"object":             "invoice",
+			"status":             "open",
+			"hosted_invoice_url": "https://invoice.stripe.com/test_" + id,
+			"lines": map[string]any{
+				"object": "list",
+				"data":   []map[string]any{{"amount": 20833, "currency": "usd"}},
+			},
+		})
+	})
+	mux.HandleFunc("GET /v1/customers/{id}", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":       r.PathValue("id"),
+			"object":   "customer",
+			"livemode": false,
+			"invoice_settings": map[string]any{
+				"default_payment_method": map[string]any{"id": "pm_card_test"},
+			},
+		})
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	maxRetries := int64(0)
+	backends := stripe.NewBackendsWithConfig(&stripe.BackendConfig{
+		URL:               stripe.String(server.URL),
+		HTTPClient:        server.Client(),
+		MaxNetworkRetries: &maxRetries,
+		LeveledLogger:     &stripe.LeveledLogger{Level: stripe.LevelNull},
+	})
+	client := stripe.NewClient("sk_test_dummy", stripe.WithBackends(backends))
+
+	biller, err := billing.New(db, client, billing.Config{
+		BaseURL:                      "http://127.0.0.1:3000",
+		WebhookSecret:                "whsec_test",
+		PaymentMethodConfigurationID: "pmc_test",
+		PortalConfigurationID:        "bpc_test",
+	}, billing.Catalog{Reinstatement: "price_reinstatement"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return biller
+}
+
 // newApp wires routes like main.go: auth owns session middleware and the root
 // mux retains outer origin protection.
 func newApp(t *testing.T) *app {
 	t.Helper()
-	db := testdb.Open(t, &auth.User{}, &auth.Session{}, &links.Link{}, &students.Student{}, &settings.Settings{})
+	models := append([]any{&links.Link{}, &students.Student{}, &settings.Settings{}, &auth.User{}, &auth.Session{}}, billing.Models()...)
+	db := testdb.Open(t, models...)
 	store := links.New(db, nil)
 	log := logging.New(io.Discard)
 	manager, err := auth.New(db, false, log)
@@ -57,7 +126,7 @@ func newApp(t *testing.T) *app {
 	}
 	t.Cleanup(manager.Close)
 	child := http.NewServeMux()
-	if err := RegisterRoutes(child, store, students.New(db, nil), settings.New(db), auth.Staff); err != nil {
+	if err := RegisterRoutes(child, store, students.New(db, nil), settings.New(db), auth.Staff, newBiller(t, db)); err != nil {
 		t.Fatal(err)
 	}
 	root := http.NewServeMux()
@@ -152,7 +221,10 @@ func (a *app) requireRegistry(t *testing.T, want ...links.Entry) {
 }
 
 func writePaths(id string) []string {
-	return []string{"/management/links", "/management/links/" + id + "/cancel", "/management/links/cancel", "/management/settings", "/management/program-start-date", "/management/students/1/fields/name"}
+	return []string{
+		"/management/links", "/management/links/" + id + "/cancel", "/management/links/cancel", "/management/settings", "/management/program-start-date",
+		"/management/students/1/fields/name", "/management/students/1/billing/reconcile", "/management/students/1/billing/reinstatement", "/management/students/1/billing/portal",
+	}
 }
 
 // createdToken returns the one customer URL token a creating response shows.
@@ -312,6 +384,8 @@ func TestUnauthorizedRequestsCannotUseManagement(t *testing.T) {
 			"/management/students/1",
 			"/management/students/1/fields/name?edit=1",
 			"/management/students/1/fields/name",
+			"/management/students/1/billing",
+			"/management/students/1/billing/invoices/1",
 		} {
 			for _, mode := range modes {
 				t.Run(b.name+"/"+mode.name+"/read"+path, func(t *testing.T) {
@@ -780,7 +854,7 @@ func TestStoreFailuresAreServerErrors(t *testing.T) {
 	// A signed-in username lets cancellation reach the database instead of
 	// stopping at the audit check.
 	staff := func(context.Context) string { return "staff" }
-	if err := RegisterRoutes(mux, links.New(failed, nil), students.New(failed, nil), settings.New(failed), staff); err != nil {
+	if err := RegisterRoutes(mux, links.New(failed, nil), students.New(failed, nil), settings.New(failed), staff, newBiller(t, db)); err != nil {
 		t.Fatal(err)
 	}
 	handler := logging.Requests(logging.New(io.Discard), mux)
@@ -1022,7 +1096,7 @@ func TestRegistryLoadsProgramSettingsOnlyForFullMainPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	if err := RegisterRoutes(mux, a.store, students.New(a.db, nil), settings.New(failed), func(context.Context) string { return "staff" }); err != nil {
+	if err := RegisterRoutes(mux, a.store, students.New(a.db, nil), settings.New(failed), func(context.Context) string { return "staff" }, newBiller(t, a.db)); err != nil {
 		t.Fatal(err)
 	}
 	handler := logging.Requests(logging.New(io.Discard), mux)
@@ -1048,4 +1122,178 @@ func TestRegistryLoadsProgramSettingsOnlyForFullMainPage(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestManagementBillingRoutes drives every staff billing route through the real session stack.
+// The mock Stripe server answers only portal sessions, invoice reads and customer reads, so the
+// seeded rows keep reconcile and reinstatement away from any other provider call: Student A's
+// later installments have no invoice item (invoice sync leaves them alone), and Student B is
+// unfunded with its fee invoice already armed.
+func TestManagementBillingRoutes(t *testing.T) {
+	const planName = "Plan de 3 Pagos Mensuales"
+	a := newApp(t)
+	admin := a.signIn(t, "admin_user")
+	db := a.db.WithContext(t.Context())
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	ptr := func(s string) *string { return &s }
+	create := func(row any) {
+		t.Helper()
+		if err := db.Create(row).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	enroll := func(name string) students.Student {
+		student, _ := enrollStudent(t, a, name)
+		return student
+	}
+	seedContract := func(student students.Student, funded *time.Time) billing.Contract {
+		t.Helper()
+		contract := billing.Contract{
+			StudentID: student.ID, Reference: rand.Text(), PlanID: "three", PlanName: planName,
+			InstallmentCount: 3, Currency: "usd", TotalCents: 62500, FundedAt: funded,
+			StripeCustomerID: ptr(fmt.Sprintf("cus_%d", student.ID)),
+		}
+		create(&contract)
+		return contract
+	}
+	seedObligation := func(contract billing.Contract, o billing.Obligation) billing.Obligation {
+		t.Helper()
+		o.ContractID, o.Reference, o.StripePriceID, o.CollectionDisposition = contract.ID, rand.Text(), "price_test", "collect"
+		create(&o)
+		return o
+	}
+
+	active, suspended, plain := enroll("Active Student"), enroll("Suspended Student"), enroll("Plain Student")
+
+	// Student A: active and funded; installment 1 paid, 2 has a hosted invoice, 3 is a draft without one.
+	contractA := seedContract(active, &now)
+	seedObligation(contractA, billing.Obligation{Kind: "tuition", Number: 1, AmountCents: 20834, AmountPaidCents: 20834,
+		FirstSettledAt: &now, LatestStripeStatus: ptr("paid")})
+	ready := seedObligation(contractA, billing.Obligation{Kind: "tuition", Number: 2, AmountCents: 20833, AmountRemainingCents: 20833,
+		StripeInvoiceID: ptr("inv_ready"), LatestStripeStatus: ptr("open")})
+	draft := seedObligation(contractA, billing.Obligation{Kind: "tuition", Number: 3, AmountCents: 20833, AmountRemainingCents: 20833,
+		StripeInvoiceID: ptr("inv_draft_no_url"), LatestStripeStatus: ptr("draft")})
+
+	// Student B: inactive with an open suspension and a ready fee invoice. Student C has no contract.
+	if err := db.Model(&students.Student{}).Where("id = ?", suspended.ID).Update("is_active", false).Error; err != nil {
+		t.Fatal(err)
+	}
+	contractB := seedContract(suspended, nil)
+	episode := billing.Suspension{ContractID: contractB.ID, TriggeringTuitionInstallmentNumber: 1,
+		TuitionDeadline: now.AddDate(0, 0, -30), StartedAt: now.AddDate(0, 0, -16), DetectedAt: now.AddDate(0, 0, -15)}
+	create(&episode)
+	fee := seedObligation(contractB, billing.Obligation{Kind: "reinstatement", AmountCents: billing.ReinstatementFeeCents,
+		AmountRemainingCents: billing.ReinstatementFeeCents, SuspensionID: &episode.ID, StripeInvoiceID: ptr("inv_fee"),
+		StripeInvoiceItemID: ptr("ii_fee"), ScheduledFinalizationAt: &now, LatestStripeStatus: ptr("open")})
+
+	billingPath := func(student any, rest string) string {
+		return fmt.Sprintf("/management/students/%v/billing%s", student, rest)
+	}
+	invoicePath := func(student, obligation any) string {
+		return billingPath(student, fmt.Sprintf("/invoices/%v", obligation))
+	}
+	fragment := func(id uint64) string { return fmt.Sprintf(`id="student-billing-%d"`, id) }
+	tooBig, unknown := fmt.Sprint(uint64(1)<<63), fmt.Sprint(uint64(1)<<63-1)
+	missing := []string{"0", tooBig, unknown}
+
+	request := func(method, path string, want int) (*http.Response, string) {
+		t.Helper()
+		res, body := a.send(t, admin, method, path, nil, nil)
+		if res.StatusCode != want {
+			t.Fatalf("%s %s: status = %d, want %d: %s", method, path, res.StatusCode, want, body)
+		}
+		return res, body
+	}
+	requireText := func(what, body string, want bool, parts ...string) {
+		t.Helper()
+		for _, part := range parts {
+			if strings.Contains(body, part) != want {
+				t.Fatalf("%s: contains %q = %t, want %t: %s", what, part, !want, want, body)
+			}
+		}
+	}
+	requireHeaders := func(res *http.Response, want map[string]string) {
+		t.Helper()
+		for name, value := range want {
+			if got := res.Header.Get(name); got != value {
+				t.Fatalf("%s = %q, want %q", name, got, value)
+			}
+		}
+	}
+
+	// GET fragment: out-of-range and unknown students are 404; a student without a contract still gets the shell.
+	for _, id := range missing {
+		request(http.MethodGet, billingPath(id, ""), http.StatusNotFound)
+	}
+	_, body := request(http.MethodGet, billingPath(plain.ID, ""), http.StatusOK)
+	requireText("student without contract", body, true, fragment(plain.ID), "No billing record for this student.")
+	_, body = request(http.MethodGet, billingPath(active.ID, ""), http.StatusOK)
+	requireText("active student", body, true, fragment(active.ID), planName, "<dt>Tuition total</dt><dd>$625.00</dd>",
+		"<dt>Status</dt><dd>Active</dd>", "<dt>Last synced</dt><dd>Never</dd>", `href="`+invoicePath(active.ID, ready.ID)+`"`)
+	requireText("active student", body, false, "Billing-suspended", billingPath(active.ID, "/reinstatement"),
+		`href="`+invoicePath(active.ID, draft.ID)+`"`)
+
+	// POST reconcile refreshes the contract and answers with the fresh fragment.
+	for _, id := range missing {
+		request(http.MethodPost, billingPath(id, "/reconcile"), http.StatusNotFound)
+	}
+	_, body = request(http.MethodPost, billingPath(active.ID, "/reconcile"), http.StatusOK)
+	requireText("reconciled student", body, true, fragment(active.ID), planName, "<dt>Status</dt><dd>Active</dd>")
+	requireText("reconciled student", body, false, "<dt>Last synced</dt><dd>Never</dd>")
+
+	// POST reinstatement: only a suspended student with a contract can request it.
+	for _, id := range missing {
+		request(http.MethodPost, billingPath(id, "/reinstatement"), http.StatusNotFound)
+	}
+	request(http.MethodPost, billingPath(plain.ID, "/reinstatement"), http.StatusNotFound)
+	_, body = request(http.MethodPost, billingPath(active.ID, "/reinstatement"), http.StatusConflict)
+	requireText("reinstating an active student", body, true, "This student is not suspended for billing.")
+	_, body = request(http.MethodPost, billingPath(suspended.ID, "/reinstatement"), http.StatusOK)
+	requireText("reinstatement request", body, true, fragment(suspended.ID), "<dt>Status</dt><dd>Billing-suspended</dd>",
+		"Reinstatement fee: $25.00 remaining", `href="`+invoicePath(suspended.ID, fee.ID)+`"`)
+	var requested billing.Suspension
+	if err := db.Take(&requested, episode.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if requested.ReinstatementRequestedAt == nil || requested.RequestedBy == nil || *requested.RequestedBy != "admin_user" || requested.ClosedAt != nil {
+		t.Fatalf("reinstatement request must be recorded for staff and leave the episode open: %+v", requested)
+	}
+
+	// GET invoice: bounds, another student's obligation and unknown obligations are 404; only a hosted invoice redirects.
+	for _, path := range []string{
+		invoicePath(active.ID, "0"), invoicePath(active.ID, tooBig), invoicePath(active.ID, unknown),
+		invoicePath("0", ready.ID), invoicePath(tooBig, ready.ID), invoicePath(unknown, ready.ID),
+		invoicePath(suspended.ID, ready.ID), invoicePath(active.ID, fee.ID), invoicePath(plain.ID, ready.ID),
+	} {
+		request(http.MethodGet, path, http.StatusNotFound)
+	}
+	_, body = request(http.MethodGet, invoicePath(active.ID, draft.ID), http.StatusConflict)
+	requireText("draft invoice", body, true, "This invoice is not ready yet.")
+	res, _ := request(http.MethodGet, invoicePath(active.ID, ready.ID), http.StatusSeeOther)
+	if location := res.Header.Get("Location"); !strings.HasPrefix(location, "https://invoice.stripe.com/") {
+		t.Fatalf("Location = %q, want a hosted invoice URL", location)
+	}
+	requireHeaders(res, map[string]string{"Cache-Control": "no-store"})
+
+	// POST portal: only a student with a Stripe customer gets a link, and it is never cached or referred.
+	for _, id := range missing {
+		request(http.MethodPost, billingPath(id, "/portal"), http.StatusNotFound)
+	}
+	request(http.MethodPost, billingPath(plain.ID, "/portal"), http.StatusNotFound)
+	res, body = request(http.MethodPost, billingPath(active.ID, "/portal"), http.StatusOK)
+	requireText("portal", body, true, `href="https://billing.stripe.com/session/test"`)
+	requireHeaders(res, map[string]string{"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+	// Student table: the Status column shows each student's own badge.
+	_, body = request(http.MethodGet, "/management/students", http.StatusOK)
+	requireText("student table", body, true, `<th scope="col">Status</th>`)
+	rowOf := func(id uint64) string {
+		_, rest, _ := strings.Cut(body, fmt.Sprintf(`<tr id="student-row-%d"`, id))
+		row, _, _ := strings.Cut(rest, "</tr>")
+		return row
+	}
+	requireText("active row", rowOf(active.ID), true, `<span class="status-badge status-active">Active</span>`)
+	requireText("active row", rowOf(active.ID), false, "status-suspended")
+	requireText("suspended row", rowOf(suspended.ID), true, `<span class="status-badge status-suspended">Suspended</span>`)
+	requireText("suspended row", rowOf(suspended.ID), false, "status-active")
 }

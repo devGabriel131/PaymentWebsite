@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/payments"
@@ -34,14 +35,21 @@ type pageData struct {
 	PaymentPlan       string
 	SelectedPlan      string
 	Plans             []planView
+	// Billing is the contract summary; Processing marks a checkout the provider has not finished.
+	Billing    *billing.Summary
+	Processing bool
+	// Return is the token-free outcome shown after Stripe Checkout.
+	Return *billing.ReturnStatus
 }
 
-func RegisterRoutes(mux *http.ServeMux, store *links.Store, configuration *settings.Store) error {
+func RegisterRoutes(mux *http.ServeMux, store *links.Store, configuration *settings.Store, biller *billing.Service) error {
 	page, err := template.New("index.html").Funcs(template.FuncMap{
 		"municipalities": students.MunicipalityOptions,
 		"trim":           strings.TrimSpace,
 		"money":          payments.Money,
+		"money64":        payments.Money64,
 		"spanishDate":    payments.SpanishDate,
+		"billingDate":    func(t time.Time) string { return payments.SpanishDate(t.In(payments.PuertoRico)) },
 	}).ParseFS(templates, "templates/*.html")
 	if err != nil {
 		return err
@@ -211,6 +219,8 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, configuration *setti
 	mux.Handle("POST /customer/{token}", logging.Operation("final_submit", handle("form")))
 	mux.Handle("POST /customer/{token}/draft/{field}", logging.Operation("draft_save", handle("save-status")))
 	registerAgreementRoutes(mux, store, configuration, page)
+	registerPaymentRoutes(mux, store, biller, page)
+	mux.Handle("GET /payments/return", logging.Operation("link_read", paymentReturn(biller, page)))
 	return nil
 }
 

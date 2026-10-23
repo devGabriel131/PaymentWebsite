@@ -9,6 +9,7 @@ require (
 	github.com/alexedwards/scs/postgresstore v0.0.0-20251002162104-209de6e426de
 	github.com/alexedwards/scs/v2 v2.9.0
 	github.com/nyaruka/phonenumbers/v2 v2.0.15
+	github.com/stripe/stripe-go/v87 v87.0.0
 	golang.org/x/term v0.47.0
 	golang.org/x/time v0.16.0
 	gorm.io/driver/postgres v1.6.3
@@ -39,6 +40,7 @@ require (
 	github.com/mattn/go-isatty v0.0.22 // indirect
 	github.com/pelletier/go-toml v1.9.5 // indirect
 	github.com/pelletier/go-toml/v2 v2.4.3 // indirect
+	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/spf13/afero v1.15.0 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/tdewolff/parse/v2 v2.8.12 // indirect

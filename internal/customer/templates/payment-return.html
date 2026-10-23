@@ -1,0 +1,16 @@
+{{define "payment-return"}}
+<article class="payment-selection" aria-labelledby="payment-return-title">
+  <h1 id="payment-return-title">Estado de tu pago</h1>
+  {{with .Error}}
+  <p id="payment-error" role="alert">{{.}}</p>
+  {{else}}{{with .Return}}
+  {{if eq .Status "paid"}}
+  <p class="payment-saved" role="status"><strong>Pagado.</strong> Confirmamos tu pago inicial de <strong>{{money64 .AmountCents}}</strong>. Gracias.</p>
+  {{else if eq .Status "pending"}}
+  <p class="payment-saved" role="status"><strong>En proceso.</strong> Todavía estamos confirmando tu pago{{if .AmountCents}} de <strong>{{money64 .AmountCents}}</strong>{{end}}. Aún no está registrado como pagado; actualiza esta página en unos minutos.</p>
+  {{else}}
+  <p class="payment-saved" role="status"><strong>No completado.</strong> Este intento de pago no se completó. Para intentarlo de nuevo, vuelve a abrir tu enlace de matrícula.</p>
+  {{end}}
+  {{end}}{{end}}
+</article>
+{{end}}

@@ -11,8 +11,10 @@ import (
 	"strconv"
 	"time"
 
+	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
+	"paymentwebsite/internal/payments"
 	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
 )
@@ -39,8 +41,11 @@ type settingsData struct {
 
 // RegisterRoutes serves customer links, Students, Trash, and settings; staff
 // returns the verified username of the signed-in account for the audit trail.
-func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Store, config *settings.Store, staff func(context.Context) string) error {
-	page, err := template.ParseFS(templates, "templates/*.html")
+// biller supplies each student's billing summary and the staff billing actions.
+func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Store, config *settings.Store, staff func(context.Context) string, biller *billing.Service) error {
+	page, err := template.New("management").Funcs(template.FuncMap{
+		"money64": payments.Money64,
+	}).ParseFS(templates, "templates/*.html")
 	if err != nil {
 		return err
 	}
@@ -54,7 +59,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			logging.RecordError(r, "render", err)
 		}
 	}
-	registerStudentRoutes(mux, roster, staff, execute)
+	registerStudentRoutes(mux, roster, biller, staff, execute)
 
 	// htmx reports whether r comes from htmx, which never gets a full page:
 	// live list refreshes get rows, and actions get their notice.

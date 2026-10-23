@@ -4,6 +4,8 @@ package customer
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"html"
 	"html/template"
@@ -18,8 +20,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stripe/stripe-go/v87"
 	"gorm.io/gorm"
 
+	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/settings"
@@ -31,7 +35,7 @@ import (
 var later = time.Now().Add(time.Hour)
 
 func TestErrorResponsesKeepStudentForm(t *testing.T) {
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store := links.New(db, nil)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -83,7 +87,7 @@ func TestErrorResponsesKeepStudentForm(t *testing.T) {
 }
 
 func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store := links.New(db, nil)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -186,7 +190,7 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 }
 
 func TestUnusableLinksTakePrecedence(t *testing.T) {
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store := links.New(db, nil)
 	expired, err := store.Create(t.Context(), "staff", time.Now().Add(-time.Minute))
 	if err != nil {
@@ -238,7 +242,7 @@ func TestUnusableLinksTakePrecedence(t *testing.T) {
 func TestSubmissionFailureRollsBackAndAllowsRetry(t *testing.T) {
 	for _, mode := range []string{"ordinary", "htmx"} {
 		t.Run(mode, func(t *testing.T) {
-			db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+			db := customerDatabase(t)
 			store := links.New(db, nil)
 			entry, err := store.Create(t.Context(), "staff", later)
 			if err != nil {
@@ -300,7 +304,7 @@ func TestSubmissionFailureRollsBackAndAllowsRetry(t *testing.T) {
 }
 
 func TestCompletedAccessAndReplay(t *testing.T) {
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store := links.New(db, nil)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -423,7 +427,7 @@ func TestCompletedAccessAndReplay(t *testing.T) {
 // TestHeadChecksLinkWithoutChangingIt follows one link through its life. HEAD
 // only reports whether it opens; GET still records the customer's first visit.
 func TestHeadChecksLinkWithoutChangingIt(t *testing.T) {
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store := links.New(db, nil)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -494,7 +498,7 @@ func TestHeadChecksLinkWithoutChangingIt(t *testing.T) {
 }
 
 func TestHeadRejectsUnusableLinks(t *testing.T) {
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store := links.New(db, nil)
 	canceled, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -522,7 +526,7 @@ func TestHeadRejectsUnusableLinks(t *testing.T) {
 }
 
 func TestConcurrentDraftFieldsRemainIsolated(t *testing.T) {
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store := links.New(db, nil)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -557,7 +561,7 @@ func TestConcurrentDraftFieldsRemainIsolated(t *testing.T) {
 }
 
 func TestDraftCardinalityAllowlistAndFailures(t *testing.T) {
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store := links.New(db, nil)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -623,7 +627,7 @@ func TestDraftCardinalityAllowlistAndFailures(t *testing.T) {
 }
 
 func TestFinalValidationAndEmailConfirmation(t *testing.T) {
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store := links.New(db, nil)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -708,7 +712,7 @@ func TestFinalValidationAndEmailConfirmation(t *testing.T) {
 }
 
 func TestHostilePersistedDetailsRemainEscaped(t *testing.T) {
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store := links.New(db, nil)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -824,10 +828,95 @@ func requireAttempted(t *testing.T, body string, form url.Values) {
 // httpTimeout bounds each HTTP exchange, so a stuck handler fails its test.
 const httpTimeout = 10 * time.Second
 
+func customerDatabase(t *testing.T) *gorm.DB {
+	t.Helper()
+	models := append([]any{&links.Link{}, &students.Student{}, &settings.Settings{}}, billing.Models()...)
+	return testdb.Open(t, models...)
+}
+
+func testCustomerBiller(t *testing.T, db *gorm.DB) *billing.Service {
+	t.Helper()
+	cfg := billing.Config{
+		BaseURL:                      "http://127.0.0.1:3000",
+		WebhookSecret:                "whsec_dummy",
+		PaymentMethodConfigurationID: "pmc_dummy",
+		PortalConfigurationID:        "bpc_dummy",
+		Live:                         false,
+	}
+	catalog := billing.Catalog{
+		Full:          "pr_full",
+		ThreeFirst:    "pr_three_1",
+		ThreeLater:    "pr_three_2",
+		SixFirst:      "pr_six_1",
+		SixLater:      "pr_six_2",
+		Reinstatement: "pr_reinstatement",
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/customers":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "cus_cust_test", "object": "customer"})
+		case r.URL.Path == "/v1/checkout/sessions":
+			_ = r.ParseForm()
+			price := r.FormValue("line_items[0][price]")
+			amountTotal := int64(60000)
+			switch price {
+			case "pr_three_1":
+				amountTotal = 20834
+			case "pr_six_1":
+				amountTotal = 10835
+			}
+			sessID := "cs_cust_test_" + rand.Text()[:8]
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":             sessID,
+				"object":         "checkout.session",
+				"url":            "https://checkout.stripe.com/pay/" + sessID,
+				"currency":       "usd",
+				"mode":           "payment",
+				"customer":       "cus_cust_test",
+				"status":         "open",
+				"payment_status": "unpaid",
+				"amount_total":   amountTotal,
+			})
+		case strings.HasSuffix(r.URL.Path, "/expire"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":             "cs_cust_test",
+				"object":         "checkout.session",
+				"status":         "expired",
+				"payment_status": "unpaid",
+			})
+		case strings.HasPrefix(r.URL.Path, "/v1/checkout/sessions/"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":             "cs_cust_test",
+				"object":         "checkout.session",
+				"status":         "expired",
+				"payment_status": "unpaid",
+			})
+		default:
+			http.Error(w, `{"error":{"message":"not found"}}`, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	maxRetries := int64(0)
+	backends := stripe.NewBackendsWithConfig(&stripe.BackendConfig{
+		URL:               stripe.String(ts.URL),
+		HTTPClient:        ts.Client(),
+		MaxNetworkRetries: &maxRetries,
+		LeveledLogger:     &stripe.LeveledLogger{Level: stripe.LevelNull},
+	})
+	client := stripe.NewClient("sk_test_mock", stripe.WithBackends(backends))
+	biller, err := billing.New(db, client, cfg, catalog, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return biller
+}
+
 func newMux(t *testing.T, db *gorm.DB, store *links.Store) http.Handler {
 	t.Helper()
 	mux := http.NewServeMux()
-	if err := RegisterRoutes(mux, store, settings.New(db)); err != nil {
+	biller := testCustomerBiller(t, db)
+	if err := RegisterRoutes(mux, store, settings.New(db), biller); err != nil {
 		t.Fatal(err)
 	}
 	return logging.Requests(logging.New(io.Discard), mux)

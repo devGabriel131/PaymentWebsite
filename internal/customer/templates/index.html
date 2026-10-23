@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{if eq .View "welcome"}}Bienvenidos{{else if eq .View "agreement"}}Acuerdo de Pago y Términos y Condiciones{{else if eq .View "payments"}}Selección del plan de pago{{else}}Información del estudiante{{end}} | Masterminds</title>
+  <title>{{if eq .View "welcome"}}Bienvenidos{{else if eq .View "agreement"}}Acuerdo de Pago y Términos y Condiciones{{else if eq .View "payments"}}Selección del plan de pago{{else if eq .View "payment-return"}}Estado del pago{{else}}Información del estudiante{{end}} | Masterminds</title>
   <link rel="icon" type="image/vnd.microsoft.icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
   {{if eq .View "form"}}
-  <meta name="htmx-config" content='{"reportValidityOfForms":true,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"422","swap":true,"error":false},{"code":"[45]..","swap":true,"error":true}]}'>
+  <meta name="htmx-config" content='{"reportValidityOfForms":true,"includeIndicatorStyles":false,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"422","swap":true,"error":false},{"code":"[45]..","swap":true,"error":true}]}'>
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js"
     integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg"
     crossorigin="anonymous" defer></script>
@@ -33,6 +33,8 @@
 {{template "agreement" .}}
 {{else if eq .View "payments"}}
 {{template "payments" .}}
+{{else if eq .View "payment-return"}}
+{{template "payment-return" .}}
 {{else if eq .View "welcome"}}
 <h1>¡Bienvenidos a Masterminds!</h1>
 <p class="customer-lead">Ya estás un paso más cerca de asegurar tu matrícula en nuestro programa.</p>

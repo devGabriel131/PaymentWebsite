@@ -25,8 +25,8 @@ var plans = []Plan{
 	{ID: "six", Name: "Plan de 6 Pagos Mensuales", Amounts: []int{10835, 10833, 10833, 10833, 10833, 10833}},
 }
 
-// Puerto Rico uses UTC-4 without modern daylight saving time.
-var puertoRico = time.FixedZone("America/Puerto_Rico", -4*60*60)
+// PuertoRico uses UTC-4 without modern daylight saving time.
+var PuertoRico = time.FixedZone("America/Puerto_Rico", -4*60*60)
 
 // Plans returns the ordered registry. Callers must not modify the slice or Amounts.
 func Plans() []Plan {
@@ -53,12 +53,12 @@ func (p Plan) TotalCents() int {
 
 // Schedule returns local midnight dates anchored to the original Puerto Rico day.
 func (p Plan) Schedule(now time.Time) []Installment {
-	year, month, day := now.In(puertoRico).Date()
+	year, month, day := now.In(PuertoRico).Date()
 	schedule := make([]Installment, len(p.Amounts))
 	for i, amount := range p.Amounts {
 		targetMonth := month + time.Month(i)
-		lastDay := time.Date(year, targetMonth+1, 0, 0, 0, 0, 0, puertoRico).Day()
-		date := time.Date(year, targetMonth, min(day, lastDay), 0, 0, 0, 0, puertoRico)
+		lastDay := time.Date(year, targetMonth+1, 0, 0, 0, 0, 0, PuertoRico).Day()
+		date := time.Date(year, targetMonth, min(day, lastDay), 0, 0, 0, 0, PuertoRico)
 		schedule[i] = Installment{Date: date, AmountCents: amount}
 	}
 	return schedule
@@ -69,6 +69,11 @@ func Money(cents int) string {
 		return fmt.Sprintf("-$%d.%02d", -(cents / 100), -(cents % 100))
 	}
 	return fmt.Sprintf("$%d.%02d", cents/100, cents%100)
+}
+
+// Money64 formats an int64 cents value as US currency.
+func Money64(cents int64) string {
+	return Money(int(cents))
 }
 
 var spanishMonths = [...]string{

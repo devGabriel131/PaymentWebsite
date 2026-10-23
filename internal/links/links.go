@@ -12,7 +12,6 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"paymentwebsite/internal/payments"
 	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
 )
@@ -298,36 +297,6 @@ func (s *Store) AcceptTerms(ctx context.Context, token, shownStartDate string) (
 		return link, nil
 	}
 	return nil, ErrProgramStartChanged
-}
-
-// ChoosePlan saves an allowed local choice for a submitted, accepted link.
-// Changing the choice never enrolls another student or moves money.
-func (s *Store) ChoosePlan(ctx context.Context, token, planID string) (*Link, error) {
-	plan, ok := payments.Find(planID)
-	if !ok {
-		return nil, payments.ErrUnknownPlan
-	}
-	digest, ok := tokenDigest(token)
-	if !ok {
-		return nil, nil
-	}
-	var link Link
-	result := s.active(ctx, digest).Model(&link).
-		Where("submitted_at IS NOT NULL AND terms_accepted_at IS NOT NULL").
-		Where("payment_plan <> ?", plan.ID).
-		Clauses(clause.Returning{}).Update("payment_plan", plan.ID)
-	if result.Error != nil {
-		return nil, result.Error
-	}
-	if result.RowsAffected > 0 {
-		s.changed()
-		return &link, nil
-	}
-	current, err := s.Lookup(ctx, token)
-	if err != nil || current == nil || current.SubmittedAt == nil || current.TermsAcceptedAt == nil {
-		return nil, err
-	}
-	return current, nil
 }
 
 func (s *Store) saveResult(ctx context.Context, digest []byte, result *gorm.DB, unfinishedResult SaveResult) (SaveResult, error) {

@@ -17,7 +17,6 @@ import (
 
 	"gorm.io/gorm"
 
-	"paymentwebsite/internal/payments"
 	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
@@ -1521,9 +1520,6 @@ func TestAcceptTermsRequiresContactAndCurrentDisplayedDate(t *testing.T) {
 			if got, err := store.AcceptTerms(ctx, entry.Token, firstDate); err != nil || got != nil {
 				t.Fatalf("accept before submission: link=%+v, err=%v", got, err)
 			}
-			if got, err := store.ChoosePlan(ctx, entry.Token, "full"); err != nil || got != nil {
-				t.Fatalf("choose before submission: link=%+v, err=%v", got, err)
-			}
 			if after, err := store.Lookup(ctx, entry.Token); err != nil || !reflect.DeepEqual(after, before) ||
 				len(studentsFor(t, db, ctx, entry.Token)) != 0 {
 				t.Fatalf("premature agreement changed contact: link=%+v, err=%v", after, err)
@@ -1540,9 +1536,6 @@ func TestAcceptTermsRequiresContactAndCurrentDisplayedDate(t *testing.T) {
 	enrolled := studentsFor(t, db, ctx, entry.Token)
 	writes := 0
 	store = New(db, func() { writes++ })
-	if got, err := store.ChoosePlan(ctx, entry.Token, "full"); err != nil || got != nil {
-		t.Fatalf("choose before acceptance: link=%+v, err=%v", got, err)
-	}
 	if err := options.SetProgramStartDate(ctx, currentDate, staff); err != nil {
 		t.Fatal(err)
 	}
@@ -1690,81 +1683,6 @@ func TestAcceptTermsObservesConcurrentStartDateChange(t *testing.T) {
 	}
 }
 
-func TestChoosePlanPersistsIsolatedChoicesWithoutEnrollment(t *testing.T) {
-	db, store, ctx := testStore(t)
-	if err := settings.New(db).SetProgramStartDate(ctx, "2026-11-10", staff); err != nil {
-		t.Fatal(err)
-	}
-	var entries [2]Entry
-	var accepted [2]*Link
-	for i := range entries {
-		entry, err := store.Create(ctx, staff, later)
-		if err != nil {
-			t.Fatal(err)
-		}
-		entries[i] = entry
-		if saved, err := store.Submit(ctx, entry.Token, contactDetails("Submitted contact")); err != nil || saved != Saved {
-			t.Fatalf("submit: saved=%v, err=%v", saved, err)
-		}
-		accepted[i], err = store.AcceptTerms(ctx, entry.Token, "2026-11-10")
-		if err != nil || accepted[i] == nil {
-			t.Fatalf("accept: link=%+v, err=%v", accepted[i], err)
-		}
-	}
-	firstStudents := studentsFor(t, db, ctx, entries[0].Token)
-	if len(firstStudents) != 1 || !firstStudents[0].IsActive {
-		t.Fatalf("new enrollment not active: %+v", firstStudents)
-	}
-	if err := db.WithContext(ctx).Model(&students.Student{}).Where("id = ?", firstStudents[0].ID).Update("is_active", false).Error; err != nil {
-		t.Fatal(err)
-	}
-	before := [2][]students.Student{
-		studentsFor(t, db, ctx, entries[0].Token), studentsFor(t, db, ctx, entries[1].Token),
-	}
-	writes := 0
-	store = New(db, func() { writes++ })
-	for _, forged := range []string{"", "FULL", "full ", "unknown", "full'; DROP TABLE links; --"} {
-		if got, err := store.ChoosePlan(ctx, entries[0].Token, forged); got != nil || !errors.Is(err, payments.ErrUnknownPlan) {
-			t.Fatalf("forged choice %q: link=%+v, err=%v", forged, got, err)
-		}
-	}
-	if writes != 0 {
-		t.Fatalf("forged choices announced %d writes", writes)
-	}
-	for _, step := range []struct {
-		name, plan string
-		index      int
-		writes     int
-	}{
-		{"first choice", "full", 0, 1},
-		{"unchanged replay", "full", 0, 1},
-		{"changed choice", "three", 0, 2},
-		{"other link choice", "six", 1, 3},
-	} {
-		t.Run(step.name, func(t *testing.T) {
-			got, err := store.ChoosePlan(ctx, entries[step.index].Token, step.plan)
-			want := *accepted[step.index]
-			want.PaymentPlan = step.plan
-			if err != nil || got == nil || !reflect.DeepEqual(*got, want) || writes != step.writes {
-				t.Fatalf("choose: link=%+v, want=%+v, writes=%d, err=%v", got, want, writes, err)
-			}
-			accepted[step.index] = &want
-			for i, entry := range entries {
-				if persisted, err := store.Lookup(ctx, entry.Token); err != nil || !reflect.DeepEqual(persisted, accepted[i]) {
-					t.Fatalf("choice not isolated or persisted: link=%+v, want=%+v, err=%v", persisted, accepted[i], err)
-				}
-				if after := studentsFor(t, db, ctx, entry.Token); !reflect.DeepEqual(after, before[i]) {
-					t.Fatalf("choice changed retained enrollment: students=%+v, want=%+v", after, before[i])
-				}
-			}
-		})
-	}
-	var count int64
-	if err := db.WithContext(ctx).Model(&students.Student{}).Count(&count).Error; err != nil || count != 2 {
-		t.Fatalf("choice enrolled another student: count=%d, err=%v", count, err)
-	}
-}
-
 func TestAgreementWritesRejectUnusableTokens(t *testing.T) {
 	db, store, ctx := testStore(t)
 	if err := settings.New(db).SetProgramStartDate(ctx, "2026-11-10", staff); err != nil {
@@ -1782,9 +1700,6 @@ func TestAgreementWritesRejectUnusableTokens(t *testing.T) {
 		if stage != "expired submission" {
 			if got, err := store.AcceptTerms(ctx, entry.Token, "2026-11-10"); err != nil || got == nil {
 				t.Fatalf("accept: link=%+v, err=%v", got, err)
-			}
-			if got, err := store.ChoosePlan(ctx, entry.Token, "three"); err != nil || got == nil {
-				t.Fatalf("choose: link=%+v, err=%v", got, err)
 			}
 		}
 		column := "expires_at"
@@ -1819,9 +1734,6 @@ func TestAgreementWritesRejectUnusableTokens(t *testing.T) {
 	for _, token := range unusable {
 		if got, err := store.AcceptTerms(ctx, token, "2026-11-10"); err != nil || got != nil {
 			t.Fatalf("unusable acceptance: link=%+v, err=%v", got, err)
-		}
-		if got, err := store.ChoosePlan(ctx, token, "six"); err != nil || got != nil {
-			t.Fatalf("unusable choice: link=%+v, err=%v", got, err)
 		}
 	}
 	var linksAfter []Link
@@ -1860,9 +1772,6 @@ func TestAgreementDatabaseFailuresDoNotAnnounceWrites(t *testing.T) {
 	if got, err := store.AcceptTerms(cancelled, entry.Token, "2026-11-10"); got != nil || err == nil {
 		t.Fatalf("failed acceptance: link=%+v, err=%v", got, err)
 	}
-	if got, err := store.ChoosePlan(cancelled, entry.Token, "full"); got != nil || err == nil {
-		t.Fatalf("failed choice: link=%+v, err=%v", got, err)
-	}
 	if err := db.WithContext(ctx).Exec("ALTER TABLE links ADD CONSTRAINT test_acceptance_failure CHECK (terms_accepted_at IS NULL)").Error; err != nil {
 		t.Fatal(err)
 	}
@@ -1878,15 +1787,6 @@ func TestAgreementDatabaseFailuresDoNotAnnounceWrites(t *testing.T) {
 	accepted, err := store.AcceptTerms(ctx, entry.Token, "2026-11-10")
 	if err != nil || accepted == nil || writes != 1 {
 		t.Fatalf("acceptance retry: link=%+v, writes=%d, err=%v", accepted, writes, err)
-	}
-	if err := db.WithContext(ctx).Exec("ALTER TABLE links ADD CONSTRAINT test_choice_failure CHECK (payment_plan = '')").Error; err != nil {
-		t.Fatal(err)
-	}
-	if got, err := store.ChoosePlan(ctx, entry.Token, "three"); got != nil || err == nil {
-		t.Fatalf("rejected choice: link=%+v, err=%v", got, err)
-	}
-	if after, err := store.Lookup(ctx, entry.Token); err != nil || !reflect.DeepEqual(after, accepted) || writes != 1 {
-		t.Fatalf("failed choice changed agreement: link=%+v, writes=%d, err=%v", after, writes, err)
 	}
 }
 

@@ -31,6 +31,13 @@ var operationNames = [...]string{
 	"startup_migrate",
 	"session_cleanup",
 	"cli_user",
+	"checkout_start",
+	"stripe_webhook",
+	"billing_reconcile",
+	"billing_reinstatement",
+	"billing_portal",
+	"billing_invoice_read",
+	"billing_worker",
 	"other",
 }
 

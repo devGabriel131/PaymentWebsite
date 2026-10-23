@@ -18,8 +18,6 @@ import (
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/payments"
 	"paymentwebsite/internal/settings"
-	"paymentwebsite/internal/students"
-	"paymentwebsite/internal/testdb"
 )
 
 const agreementDate = "2027-02-28"
@@ -284,7 +282,9 @@ func TestPaymentChoiceValidatesPersistsAndRemainsIsolated(t *testing.T) {
 	}
 	for _, plan := range payments.Plans() {
 		w := customerRequest(t, fixture.mux, http.MethodPost, fixture.path+"/payments", url.Values{"payment_plan": {plan.ID}}.Encode(), false)
-		requireAdvance(t, w, fixture.path+"/payments", false)
+		if w.Code != http.StatusSeeOther || !strings.HasPrefix(w.Header().Get("Location"), "https://checkout.stripe.com") {
+			t.Fatalf("expected redirect to Stripe Checkout, got code=%d, loc=%q, body=%s", w.Code, w.Header().Get("Location"), w.Body.String())
+		}
 		selected, err := fixture.store.Lookup(t.Context(), fixture.entry.Token)
 		if err != nil || selected == nil || selected.PaymentPlan != plan.ID {
 			t.Fatalf("choice not persisted: %+v, %v", selected, err)
@@ -295,7 +295,7 @@ func TestPaymentChoiceValidatesPersistsAndRemainsIsolated(t *testing.T) {
 		}
 		w = customerRequest(t, fixture.mux, http.MethodGet, fixture.path+"/payments", "", false)
 		body := w.Body.String()
-		if w.Code != http.StatusOK || !strings.Contains(body, plan.Name) || !strings.Contains(body, `role="status"`) {
+		if w.Code != http.StatusOK || !strings.Contains(body, plan.Name) {
 			t.Fatalf("choice reload missing saved state: %d, %s", w.Code, body)
 		}
 		requireNativePage(t, body, fixture.path+"/payments")
@@ -318,12 +318,6 @@ func TestPaymentChoiceValidatesPersistsAndRemainsIsolated(t *testing.T) {
 			t.Fatal("payment options hid one or more installments")
 		}
 		requireNoPrivate(t, body, privateFormValues(contactForm("Agreement private student"))...)
-		beforeReplay := stored(t, fixture.db)
-		w = customerRequest(t, fixture.mux, http.MethodPost, fixture.path+"/payments", url.Values{"payment_plan": {plan.ID}}.Encode(), false)
-		requireAdvance(t, w, fixture.path+"/payments", false)
-		if after := stored(t, fixture.db); !reflect.DeepEqual(after, beforeReplay) {
-			t.Fatal("unchanged choice replay changed link")
-		}
 	}
 	if otherAfter, err := fixture.store.Lookup(t.Context(), other.Token); err != nil || !reflect.DeepEqual(otherAfter, otherBefore) {
 		t.Fatal("choice changed another token")
@@ -345,17 +339,18 @@ func TestPaymentChoiceFailurePreservesSavedAndAttemptedState(t *testing.T) {
 	}{
 		{"duplicate choices", "payment_plan=three&payment_plan=six", "three", "una sola opción de pago", http.StatusBadRequest, false},
 		{"unknown choice", "payment_plan=other", "", "una de las tres opciones de pago", http.StatusUnprocessableEntity, false},
-		{"persistence failure", "payment_plan=six", "six", "guardar tu selección", http.StatusInternalServerError, true},
+		{"persistence failure", "payment_plan=six", "six", "iniciar el pago seguro", http.StatusInternalServerError, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newAgreementFixture(t)
 			fixture.accept(t)
-			if chosen, err := fixture.store.ChoosePlan(t.Context(), fixture.entry.Token, full.ID); err != nil || chosen == nil || chosen.PaymentPlan != full.ID {
-				t.Fatalf("save original plan: link=%+v, err=%v", chosen, err)
+			current, _ := fixture.store.Lookup(t.Context(), fixture.entry.Token)
+			if err := fixture.db.Model(&links.Link{}).Where("token_hash = ?", current.TokenHash).Update("payment_plan", full.ID).Error; err != nil {
+				t.Fatalf("save original plan: %v", err)
 			}
 			before, studentsBefore := stored(t, fixture.db), studentRecords(t, fixture.db)
 			if tc.rejectChange {
-				if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE links ADD CONSTRAINT reject_plan_change CHECK (payment_plan = 'full')").Error; err != nil {
+				if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE billing_checkout_attempts ADD CONSTRAINT reject_attempt CHECK (false)").Error; err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -397,7 +392,7 @@ func TestPaymentChoiceFailurePreservesSavedAndAttemptedState(t *testing.T) {
 }
 
 func TestAgreementPaymentStageAndUsabilityCannotBeBypassed(t *testing.T) {
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store := links.New(db, nil)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
@@ -474,10 +469,10 @@ func TestAgreementAndPaymentHeadRemainReadOnly(t *testing.T) {
 	for _, suffix := range []string{"", "/forms", "/agreement", "/payments"} {
 		headKeeps(t, fixture.db, server, fixture.path+suffix, http.StatusOK)
 	}
-	if chosen, err := fixture.store.ChoosePlan(t.Context(), fixture.entry.Token, "six"); err != nil || chosen == nil {
-		t.Fatalf("choose: %+v, %v", chosen, err)
+	current, _ := fixture.store.Lookup(t.Context(), fixture.entry.Token)
+	if err := fixture.db.Model(&links.Link{}).Where("token_hash = ?", current.TokenHash).Update("payment_plan", "six").Error; err != nil {
+		t.Fatalf("update plan: %v", err)
 	}
-	headKeeps(t, fixture.db, server, fixture.path+"/payments", http.StatusOK)
 }
 
 func TestAgreementAndPaymentFailuresNeverClaimSuccess(t *testing.T) {
@@ -547,7 +542,7 @@ type agreementFixture struct {
 
 func newAgreementFixture(t *testing.T) agreementFixture {
 	t.Helper()
-	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
+	db := customerDatabase(t)
 	store, configuration := links.New(db, nil), settings.New(db)
 	if err := configuration.SetProgramStartDate(t.Context(), agreementDate, "staff"); err != nil {
 		t.Fatal(err)

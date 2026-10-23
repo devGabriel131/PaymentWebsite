@@ -14,9 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stripe/stripe-go/v87"
 	"golang.org/x/time/rate"
 	"gorm.io/gorm"
 
+	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/customer"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
@@ -263,11 +265,28 @@ func TestSessionCleanupDeletesOnlyExpired(t *testing.T) {
 
 func newAuthDatabase(t *testing.T) *gorm.DB {
 	t.Helper()
-	db := testdb.Open(t, &User{}, &Session{}, &links.Link{}, &students.Student{}, &settings.Settings{})
+	models := append([]any{&User{}, &Session{}, &links.Link{}, &students.Student{}, &settings.Settings{}}, billing.Models()...)
+	db := testdb.Open(t, models...)
 	if _, err := links.New(db, nil).Create(t.Context(), "seed", later); err != nil {
 		t.Fatal(err)
 	}
 	return db
+}
+
+func newTestBiller(t *testing.T, db *gorm.DB) *billing.Service {
+	t.Helper()
+	cfg := billing.Config{
+		BaseURL:                      "http://127.0.0.1:3000",
+		WebhookSecret:                "whsec_dummy",
+		PaymentMethodConfigurationID: "pmc_dummy",
+		PortalConfigurationID:        "bpc_dummy",
+		Live:                         false,
+	}
+	biller, err := billing.New(db, stripe.NewClient("sk_test_dummy"), cfg, billing.Catalog{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return biller
 }
 
 // newApp wires auth like main: staff-only sessions, origin protection, and public customer routes.
@@ -282,12 +301,13 @@ func newApp(t *testing.T, db *gorm.DB) (http.Handler, *Manager) {
 	mux := http.NewServeMux()
 	manager.RegisterRoutes(mux)
 	store := links.New(db, nil)
+	biller := newTestBiller(t, db)
 	managementMux := http.NewServeMux()
-	if err := management.RegisterRoutes(managementMux, store, students.New(db, nil), settings.New(db), Staff); err != nil {
+	if err := management.RegisterRoutes(managementMux, store, students.New(db, nil), settings.New(db), Staff, biller); err != nil {
 		t.Fatal(err)
 	}
 	mux.Handle("/management/", manager.Require(managementMux))
-	if err := customer.RegisterRoutes(mux, store, settings.New(db)); err != nil {
+	if err := customer.RegisterRoutes(mux, store, settings.New(db), biller); err != nil {
 		t.Fatal(err)
 	}
 	return logging.Requests(log, http.NewCrossOriginProtection().Handler(mux)), manager
