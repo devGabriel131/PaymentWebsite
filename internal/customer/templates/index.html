@@ -120,5 +120,5 @@
 {{define "save-status"}}
 {{with .Error}}<p role="alert">No se guardó. {{.}}</p>
 {{else}}{{with index .FieldErrors .DraftField}}<p role="alert" data-validation="invalid">No se guardó. {{.}}</p>
-{{else}}<p data-validation="valid">Guardado.</p>{{end}}{{end}}
+{{else}}<p>Guardado.</p>{{end}}{{end}}
 {{end}}

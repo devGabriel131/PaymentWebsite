@@ -2,9 +2,11 @@ const createForm = document.querySelector("#create-link");
 const tokens = document.querySelector("#link-tokens");
 const links = document.querySelector("#generated-links");
 const status = document.querySelector("#link-status");
+const refreshError = document.querySelector("#link-refresh-error");
 const toast = document.querySelector("#copy-toast");
 let requestSequence = 0;
 let pendingCreationFeedback = null;
+let clipboardError = null;
 
 // Saved rows render relative paths; show the absolute URL staff will share.
 for (const link of links.querySelectorAll("a")) link.textContent = link.href;
@@ -13,7 +15,16 @@ for (const link of links.querySelectorAll("a")) link.textContent = link.href;
 // empties the live region.
 toast.addEventListener("animationend", () => { toast.textContent = ""; });
 
+// Keep node identity so copy recovery cannot clear a newer action's status.
+function showCopyError(message, prefix = "") {
+  status.textContent = prefix;
+  clipboardError = document.createTextNode(message);
+  status.append(clipboardError);
+}
+
 function confirmCopy() {
+  clipboardError?.remove();
+  clipboardError = null;
   toast.textContent = "Link has been copied.";
   // Another copy while the toast shows replays it from the bottom.
   for (const animation of toast.getAnimations()) animation.currentTime = 0;
@@ -30,7 +41,7 @@ function showCreationFeedback() {
 
   pendingCreationFeedback = null;
   if (success) confirmCopy();
-  else status.textContent = "Link created. Clipboard unavailable; copy the link below.";
+  else showCopyError("Clipboard unavailable; copy the link below.", "Link created. ");
 }
 
 links.addEventListener("htmx:afterSwap", showCreationFeedback);
@@ -55,7 +66,7 @@ links.addEventListener("click", async ({ target }) => {
   }
   if (sequence === requestSequence) {
     if (copied) confirmCopy();
-    else status.textContent = "Clipboard unavailable; select the link to copy it manually.";
+    else showCopyError("Clipboard unavailable; select the link to copy it manually.");
   }
 });
 
@@ -97,7 +108,13 @@ document.body.addEventListener("htmx:beforeRequest", ({ target }) => {
   }, { once: true });
 });
 
-document.body.addEventListener("htmx:afterRequest", ({ detail }) => {
+document.body.addEventListener("htmx:afterRequest", ({ target, detail }) => {
+  if (target === links) {
+    refreshError.textContent = detail.successful
+      ? ""
+      : detail.xhr.responseText || "Could not refresh links. Reload to try again.";
+    return;
+  }
   if (!detail.successful) {
     status.textContent = detail.xhr.responseText || "Request failed. Please try again.";
   }

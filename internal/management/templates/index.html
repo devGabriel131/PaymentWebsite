@@ -60,6 +60,7 @@
         <p>{{if .Trash}}These links no longer open the customer form. Their data is kept.{{else}}Each URL is shown only once, right after you create it. Finished links stay here for 24 hours.{{end}}</p>
       </div>
       <p id="link-status" role="status">{{.Notice}}</p>
+      <p id="link-refresh-error" role="status"></p>
       {{/* A created link's URL and copy button wait here until a list refresh
         moves them into their row. Placed before the list so a row's placeholders
         resolve to these first. */}}

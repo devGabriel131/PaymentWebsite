@@ -56,6 +56,15 @@
     return isDraft(control) && control.isConnected && control.form === currentForm();
   }
 
+  // Generic save errors replace validation feedback without marking the field invalid.
+  function reconcileDraftValidity(control, status) {
+    if (status.querySelector('[data-validation="invalid"]')) {
+      control.setAttribute('aria-invalid', 'true');
+    } else {
+      control.removeAttribute('aria-invalid');
+    }
+  }
+
   function ignoreDetachedDraft(event) {
     if (!activeDraft(event.currentTarget)) event.preventDefault();
   }
@@ -81,9 +90,7 @@
       if (!activeDraft(source)) return;
       const status = document.getElementById(`save-status-${source.name}`);
       if (event.detail.elt !== status) return;
-      const validation = status.querySelector('[data-validation]')?.dataset.validation;
-      if (validation === 'invalid') source.setAttribute('aria-invalid', 'true');
-      if (validation === 'valid') source.removeAttribute('aria-invalid');
+      reconcileDraftValidity(source, status);
       return;
     }
     if (!source?.matches('form[hx-target="#customer-content"]')) return;
@@ -99,7 +106,8 @@
     if (event.detail.xhr.status !== 0) return;
     const source = event.detail.requestConfig?.elt;
     const form = currentForm();
-    const target = activeDraft(source)
+    const draft = activeDraft(source);
+    const target = draft
       ? document.getElementById(`save-status-${source.name}`)
       : source === form ? form.querySelector('#form-error') : null;
     if (!target) return;
@@ -107,6 +115,7 @@
     message.setAttribute('role', 'alert');
     message.textContent = 'No se guardó. Verifica tu conexión e intenta de nuevo.';
     target.replaceChildren(message);
+    if (draft) source.removeAttribute('aria-invalid');
   });
 
   reconcileEmails();

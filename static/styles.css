@@ -275,17 +275,23 @@ button.management-button-danger:enabled:hover {
   color: var(--muted);
 }
 
-/* The live region stays rendered; it only gains a strip while it has a message. */
-#link-status {
+/* Live regions stay rendered and only gain strips while they have messages. */
+#link-status,
+#link-refresh-error {
   margin: 0;
   padding-inline: var(--inset);
   overflow-wrap: anywhere;
 }
 
-#link-status:not(:empty) {
+#link-status:not(:empty),
+#link-refresh-error:not(:empty) {
   padding-block: 0.75rem;
   border-bottom: 1px solid var(--line);
   background: var(--raised);
+}
+
+#link-refresh-error {
+  color: var(--danger);
 }
 
 /* Copy confirmation. Like #link-status, the live region stays rendered and only

@@ -119,12 +119,8 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 			if w.Code != step.code || strings.Contains(w.Body.String(), "<input") {
 				t.Fatalf("draft status = %d, want %d, fragment %s", w.Code, step.code, w.Body.String())
 			}
-			marker := `data-validation="valid"`
-			if step.code == http.StatusUnprocessableEntity {
-				marker = `data-validation="invalid"`
-			}
-			if !strings.Contains(w.Body.String(), marker) {
-				t.Fatalf("draft lacks validation marker %s: %s", marker, w.Body.String())
+			if step.code == http.StatusUnprocessableEntity && !strings.Contains(w.Body.String(), `data-validation="invalid"`) {
+				t.Fatalf("draft lacks invalid validation marker: %s", w.Body.String())
 			}
 			switch step.key {
 			case "name":

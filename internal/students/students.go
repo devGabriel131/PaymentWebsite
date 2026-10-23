@@ -64,6 +64,7 @@ func (s *Store) Get(ctx context.Context, id uint64) (*Student, error) {
 var ErrUnknownField = errors.New("students: unknown field")
 
 // UpdateField changes only the registered column and returns its persisted row.
+// Normalized no-ops return the current row without writing or notifying.
 func (s *Store) UpdateField(ctx context.Context, id uint64, key, raw string) (*Student, error) {
 	field, ok := FindField(key)
 	if !ok {
@@ -76,12 +77,33 @@ func (s *Store) UpdateField(ctx context.Context, id uint64, key, raw string) (*S
 	if id == 0 || id > 1<<63-1 {
 		return nil, nil
 	}
-	var record Student
-	result := s.db.WithContext(ctx).Model(&record).Where("id = ?", id).
-		Clauses(clause.Returning{}).Update(field.Key, value)
-	if result.Error != nil || result.RowsAffected == 0 {
-		return nil, result.Error
+	var persisted *Student
+	wrote := false
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var record Student
+		// Lock the current row so comparison and write share one version.
+		result := tx.Where("id = ?", id).
+			Clauses(clause.Locking{Strength: clause.LockingStrengthUpdate}).Limit(1).Find(&record)
+		if result.Error != nil || result.RowsAffected == 0 {
+			return result.Error
+		}
+		if field.Value(record) == value {
+			persisted = &record
+			return nil
+		}
+		result = tx.Model(&record).
+			Clauses(clause.Returning{}).Update(field.Key, value)
+		if result.Error != nil || result.RowsAffected == 0 {
+			return result.Error
+		}
+		persisted, wrote = &record, true
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	s.changed()
-	return &record, nil
+	if wrote {
+		s.changed()
+	}
+	return persisted, nil
 }

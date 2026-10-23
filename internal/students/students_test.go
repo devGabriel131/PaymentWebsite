@@ -146,6 +146,21 @@ func TestUpdateFieldChangesOnlySelectedCanonicalColumn(t *testing.T) {
 			if !reflect.DeepEqual(sourceBefore, sourceAfter) {
 				t.Fatalf("immutable source changed: before %+v, after %+v", sourceBefore, sourceAfter)
 			}
+			xmin, writesBefore := studentXmin(t, db, ctx, original.ID), writes
+			replayed, err := roster.UpdateField(ctx, original.ID, tc.key, tc.raw)
+			if err != nil || replayed == nil || !reflect.DeepEqual(*replayed, want) {
+				t.Fatalf("normalized replay = %+v, %v, want %+v", replayed, err, want)
+			}
+			if after := studentXmin(t, db, ctx, original.ID); after != xmin {
+				t.Errorf("normalized replay rewrote row: xmin %q -> %q", xmin, after)
+			}
+			if writes != writesBefore {
+				t.Errorf("normalized replay notified %d writes, want zero", writes-writesBefore)
+			}
+			persisted, err = roster.Get(ctx, original.ID)
+			if err != nil || persisted == nil || !reflect.DeepEqual(*persisted, want) {
+				t.Fatalf("replay changed persisted student: %+v, %v, want %+v", persisted, err, want)
+			}
 			original = want
 		})
 	}
@@ -251,6 +266,14 @@ func TestUpdateFieldSuppressedWritesAreNotReportedAsSaved(t *testing.T) {
 			if got, err := roster.UpdateField(ctx, original.ID, field.Key, field.Value(attempt)); got != nil || err != nil {
 				t.Fatalf("suppressed UpdateField = %+v, %v, want absent row without error", got, err)
 			}
+			xmin := studentXmin(t, db, ctx, original.ID)
+			got, err := roster.UpdateField(ctx, original.ID, field.Key, field.Value(original))
+			if err != nil || got == nil || !reflect.DeepEqual(*got, original) {
+				t.Fatalf("unchanged save under suppressing trigger = %+v, %v, want %+v", got, err, original)
+			}
+			if after := studentXmin(t, db, ctx, original.ID); after != xmin {
+				t.Fatalf("unchanged save under suppressing trigger rewrote row: xmin %q -> %q", xmin, after)
+			}
 		})
 	}
 	if got, err := roster.Get(ctx, original.ID); err != nil || got == nil || !reflect.DeepEqual(*got, original) {
@@ -258,6 +281,152 @@ func TestUpdateFieldSuppressedWritesAreNotReportedAsSaved(t *testing.T) {
 	}
 	if writes != 0 {
 		t.Fatalf("suppressed edits notified %d writes", writes)
+	}
+}
+
+func TestUpdateFieldObservesConcurrentEdits(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw          string
+		deleted, wantWrite bool
+	}{
+		{name: "concurrent_equal", raw: " Concurrent\u2003student "},
+		{name: "concurrent_noop_becomes_change", raw: " Original\u2003student ", wantWrite: true},
+		{name: "concurrent_delete", raw: "Changed student", deleted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, _, sources, ctx := studentStores(t)
+			_, original := enroll(t, db, sources, ctx, "Original student")
+			writes := 0
+			roster := students.New(db, func() { writes++ })
+			blocker := db.WithContext(ctx).Begin()
+			if blocker.Error != nil {
+				t.Fatal(blocker.Error)
+			}
+			saveCtx, cancelSave := context.WithCancel(ctx)
+			type result struct {
+				record *students.Student
+				err    error
+			}
+			var results chan result
+			defer func() {
+				blocker.Rollback()
+				cancelSave()
+				if results != nil {
+					for range results {
+					}
+				}
+			}()
+			var blockerPID int
+			if err := blocker.Raw("SELECT pg_backend_pid()").Scan(&blockerPID).Error; err != nil {
+				t.Fatal(err)
+			}
+			row := blocker.Model(&students.Student{}).Where("id = ?", original.ID)
+			var held *gorm.DB
+			if tc.deleted {
+				held = row.Delete(&students.Student{})
+			} else {
+				held = row.Updates(map[string]any{"name": "Concurrent student", "email": "Concurrent.Student@example.org"})
+			}
+			if held.Error != nil || held.RowsAffected != 1 {
+				t.Fatalf("hold concurrent edit: rows=%d, err=%v", held.RowsAffected, held.Error)
+			}
+			var xmin string
+			if !tc.deleted {
+				xmin = studentXmin(t, blocker, ctx, original.ID)
+			}
+			results = make(chan result, 1)
+			go func() {
+				defer close(results)
+				record, err := roster.UpdateField(saveCtx, original.ID, "name", tc.raw)
+				results <- result{record: record, err: err}
+			}()
+			// Observe the lock before committing; elapsed time cannot prove a wait.
+			poll := time.NewTicker(10 * time.Millisecond)
+			defer poll.Stop()
+			for {
+				var waiting bool
+				if err := db.WithContext(ctx).Raw(
+					"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE ? = ANY(pg_blocking_pids(pid)))",
+					blockerPID,
+				).Scan(&waiting).Error; err != nil {
+					t.Fatalf("observe save lock wait: %v", err)
+				}
+				if waiting {
+					break
+				}
+				select {
+				case got := <-results:
+					t.Fatalf("save returned before waiting on edit: record=%+v, err=%v", got.record, got.err)
+				case <-ctx.Done():
+					t.Fatalf("save did not wait on edit: %v", ctx.Err())
+				case <-poll.C:
+				}
+			}
+			if err := blocker.Commit().Error; err != nil {
+				t.Fatal(err)
+			}
+			got := <-results
+			if got.err != nil {
+				t.Fatalf("save after concurrent edit: %v", got.err)
+			}
+			persisted, err := roster.Get(ctx, original.ID)
+			if tc.deleted {
+				if got.record != nil || err != nil || persisted != nil || writes != 0 {
+					t.Fatalf("save ignored deletion: result=%+v, persisted=%+v, err=%v, writes=%d", got.record, persisted, err, writes)
+				}
+				return
+			}
+			want := original
+			want.Email = "Concurrent.Student@example.org"
+			wantWrites := 0
+			if tc.wantWrite {
+				wantWrites = 1
+			} else {
+				want.Name = "Concurrent student"
+			}
+			if got.record == nil || !reflect.DeepEqual(*got.record, want) ||
+				err != nil || persisted == nil || !reflect.DeepEqual(*persisted, want) || writes != wantWrites {
+				t.Fatalf("save after edit: result=%+v, persisted=%+v, err=%v, writes=%d; want %+v, writes=%d",
+					got.record, persisted, err, writes, want, wantWrites)
+			}
+			if after := studentXmin(t, db, ctx, original.ID); (after != xmin) != tc.wantWrite {
+				t.Fatalf("xmin %q -> %q, want UPDATE=%t", xmin, after, tc.wantWrite)
+			}
+		})
+	}
+}
+
+func TestUpdateFieldCommitFailureDoesNotNotify(t *testing.T) {
+	db, _, sources, ctx := studentStores(t)
+	_, original := enroll(t, db, sources, ctx, "Original student")
+	_, other := enroll(t, db, sources, ctx, "Other student")
+	if err := db.WithContext(ctx).Exec(`ALTER TABLE students ADD CONSTRAINT test_student_name_unique UNIQUE (name) DEFERRABLE INITIALLY DEFERRED`).Error; err != nil {
+		t.Fatal(err)
+	}
+	writes := 0
+	roster := students.New(db, func() { writes++ })
+	xmin := studentXmin(t, db, ctx, original.ID)
+	if got, err := roster.UpdateField(ctx, original.ID, "name", other.Name); got != nil || err == nil {
+		t.Fatalf("commit failure reported success: student=%+v, err=%v", got, err)
+	}
+	for _, want := range []students.Student{original, other} {
+		got, err := roster.Get(ctx, want.ID)
+		if err != nil || got == nil || !reflect.DeepEqual(*got, want) {
+			t.Fatalf("failed commit changed student: %+v, %v, want %+v", got, err, want)
+		}
+	}
+	if after := studentXmin(t, db, ctx, original.ID); after != xmin || writes != 0 {
+		t.Fatalf("failed commit changed row or notified: xmin %q -> %q, writes=%d", xmin, after, writes)
+	}
+	got, err := roster.UpdateField(ctx, original.ID, "name", "Recovered student")
+	want := original
+	want.Name = "Recovered student"
+	if err != nil || got == nil || !reflect.DeepEqual(*got, want) || writes != 1 {
+		t.Fatalf("retry after commit failure: student=%+v, err=%v, writes=%d; want %+v, one write", got, err, writes, want)
+	}
+	persisted, err := roster.Get(ctx, original.ID)
+	if err != nil || persisted == nil || !reflect.DeepEqual(*persisted, want) {
+		t.Fatalf("retry did not persist: %+v, %v, want %+v", persisted, err, want)
 	}
 }
 
@@ -299,6 +468,18 @@ func TestStorePropagatesDatabaseFailuresAfterFieldValidation(t *testing.T) {
 	if got, err := roster.Get(ctx, original.ID); err != nil || got == nil || !reflect.DeepEqual(*got, original) {
 		t.Fatalf("failed edits changed student: %+v, %v", got, err)
 	}
+}
+
+func studentXmin(t *testing.T, db *gorm.DB, ctx context.Context, id uint64) string {
+	t.Helper()
+	var xmin string
+	if err := db.WithContext(ctx).Raw("SELECT xmin::text FROM students WHERE id = ?", id).Scan(&xmin).Error; err != nil {
+		t.Fatal(err)
+	}
+	if xmin == "" {
+		t.Fatal("student row missing xmin")
+	}
+	return xmin
 }
 
 func studentStores(t *testing.T) (*gorm.DB, *students.Store, *links.Store, context.Context) {
