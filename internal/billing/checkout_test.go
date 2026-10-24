@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,6 +37,7 @@ type mockStripeServer struct {
 	receivedCurrency          string
 	receivedCustomer          string
 	receivedLinkDisplay       string
+	receivedExcluded          []string
 	customersCreated          map[string]string         // contractRef -> customerID
 	sessionsCreated           map[string]string         // attemptRef -> sessionID
 	sessions                  map[string]map[string]any // sessionID -> stored Session
@@ -96,6 +98,12 @@ func newMockStripeServer() *mockStripeServer {
 		m.receivedCurrency = r.FormValue("currency")
 		m.receivedCustomer = r.FormValue("customer")
 		m.receivedLinkDisplay = r.FormValue("wallet_options[link][display]")
+		m.receivedExcluded = m.receivedExcluded[:0]
+		for key, values := range r.Form {
+			if strings.HasPrefix(key, "excluded_payment_method_types[") {
+				m.receivedExcluded = append(m.receivedExcluded, values...)
+			}
+		}
 
 		sessID := "cs_mock_" + rand.Text()[:8]
 		idemp := r.Header.Get("Idempotency-Key")
@@ -324,6 +332,11 @@ func TestCheckoutConcurrencyAndRecovery(t *testing.T) {
 		}
 		if mock.receivedLinkDisplay != "never" {
 			t.Errorf("expected wallet_options[link][display]='never', got %q", mock.receivedLinkDisplay)
+		}
+		for _, method := range []string{"klarna", "cashapp", "amazon_pay"} {
+			if !slices.Contains(mock.receivedExcluded, method) {
+				t.Errorf("installment Checkout must exclude %q, excluded %v", method, mock.receivedExcluded)
+			}
 		}
 		mock.mu.Unlock()
 	})

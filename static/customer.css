@@ -646,7 +646,7 @@
   font-weight: 700;
 }
 
-/* The financial-responsibility clause is the one people most need to see; the owner already sets it in capitals. */
+/* The financial-responsibility clause is the one people most need to see; it is set in bold on a highlighted band. */
 .agreement-clauses .is-key {
   margin-inline: -1.25rem;
   padding-inline: 1.25rem;

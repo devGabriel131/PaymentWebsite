@@ -29,6 +29,12 @@ const integrationIdentifier = "tuition_checkout"
 // activeAttemptStates are the nonterminal states guarded by idx_active_checkout_attempt.
 var activeAttemptStates = []string{"creating", "open", "processing", "expiring", "uncertain"}
 
+// installmentExcluded are the non-card methods Checkout hides on installment plans: later invoices
+// charge the saved card, and a first payment by anything else flags the contract for review. Stripe
+// cannot express "card only" next to a payment method configuration, so this is a deny list; extend
+// it when a new non-card method is enabled on the account.
+var installmentExcluded = []string{"affirm", "afterpay_clearpay", "alipay", "amazon_pay", "cashapp", "klarna", "pay_by_bank", "paypal", "revolut_pay", "us_bank_account", "wechat_pay", "zip"}
+
 // inFlightAttemptStates are the active states where money may be in transit, blocking contact edits.
 var inFlightAttemptStates = []string{"processing", "uncertain", "expiring"}
 
@@ -385,6 +391,7 @@ func (s *Service) sessionParams(contract Contract, first Obligation, attempt Che
 				Display: stripe.String(string(stripe.CheckoutSessionWalletOptionsLinkDisplayNever)),
 			},
 		}
+		params.ExcludedPaymentMethodTypes = stripe.StringSlice(installmentExcluded)
 	}
 	params.SetIdempotencyKey(fmt.Sprintf("tuition:%s:checkout", attempt.Reference))
 	return params
