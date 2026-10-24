@@ -11,31 +11,30 @@ func (Contract) TableName() string        { return "billing_contracts" }
 func (Obligation) TableName() string      { return "billing_obligations" }
 func (CheckoutAttempt) TableName() string { return "billing_checkout_attempts" }
 func (Payment) TableName() string         { return "billing_payments" }
-func (Allocation) TableName() string      { return "billing_allocations" }
 func (Suspension) TableName() string      { return "billing_suspensions" }
 func (WebhookEvent) TableName() string    { return "billing_webhook_events" }
 
 // Contract represents the financial agreement and durable Stripe customer binding for an enrollment.
 type Contract struct {
-	ID                              uint64            `gorm:"primaryKey"`
-	StudentID                       uint64            `gorm:"not null;uniqueIndex;check:contract_student_id,student_id > 0"`
-	Student                         *students.Student `gorm:"foreignKey:StudentID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
-	Reference                       string            `gorm:"not null;uniqueIndex"`
-	PlanID                          string            `gorm:"not null"`
-	PlanName                        string            `gorm:"not null"`
-	InstallmentCount                int               `gorm:"not null;check:contract_installment_count,installment_count > 0"`
-	Currency                        string            `gorm:"not null;default:'usd';check:contract_currency,currency = 'usd'"`
-	TotalCents                      int64             `gorm:"not null;check:contract_total_cents,total_cents > 0"`
-	FundedAt                        *time.Time
-	StripeCustomerID                *string `gorm:"uniqueIndex"`
-	CurrentCheckoutAttemptReference *string
-	AttentionReason                 *string
-	LastSyncedAt                    *time.Time
-	NextSyncAt                      *time.Time
-	LeaseToken                      *string
-	LeaseExpiresAt                  *time.Time
-	CreatedAt                       time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
-	UpdatedAt                       time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
+	ID                  uint64            `gorm:"primaryKey"`
+	StudentID           uint64            `gorm:"not null;uniqueIndex;check:contract_student_id,student_id > 0"`
+	Student             *students.Student `gorm:"foreignKey:StudentID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
+	Reference           string            `gorm:"not null;uniqueIndex"`
+	PlanID              string            `gorm:"not null"`
+	PlanName            string            `gorm:"not null"`
+	InstallmentCount    int               `gorm:"not null;check:contract_installment_count,installment_count > 0"`
+	TotalCents          int64             `gorm:"not null;check:contract_total_cents,total_cents > 0"`
+	FundedAt            *time.Time
+	StripeCustomerID    *string `gorm:"uniqueIndex"`
+	SyncedCustomerName  string
+	SyncedCustomerEmail string
+	AttentionReason     *string
+	LastSyncedAt        *time.Time
+	NextSyncAt          *time.Time
+	LeaseToken          *string
+	LeaseExpiresAt      *time.Time
+	CreatedAt           time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
+	UpdatedAt           time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
 }
 
 // Obligation represents a scheduled or completed tuition installment or reinstatement fee.
@@ -70,22 +69,19 @@ type Obligation struct {
 
 // CheckoutAttempt tracks a single hosted Checkout session creation and payment attempt.
 type CheckoutAttempt struct {
-	ID                    uint64    `gorm:"primaryKey"`
-	ContractID            uint64    `gorm:"not null;index;uniqueIndex:idx_active_checkout_attempt,where:state = 'creating' OR state = 'open' OR state = 'processing' OR state = 'expiring' OR state = 'uncertain'"`
-	Contract              *Contract `gorm:"foreignKey:ContractID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
-	Reference             string    `gorm:"not null;uniqueIndex"`
-	PlanID                string    `gorm:"not null"`
-	FirstAmountCents      int64     `gorm:"not null;check:attempt_first_amount_cents,first_amount_cents > 0"`
-	StripePriceID         string    `gorm:"not null"`
-	IntegrationIdentifier string    `gorm:"not null"`
-	CreationStartedAt     time.Time `gorm:"not null"`
-	StripeSessionID       *string   `gorm:"uniqueIndex"`
-	StripePaymentIntentID *string   `gorm:"uniqueIndex"`
-	CheckoutURL           *string
-	ExpiresAt             *time.Time
-	State                 string    `gorm:"not null;check:attempt_state,state IN ('creating', 'open', 'processing', 'expiring', 'uncertain', 'expired', 'failed', 'paid')"`
-	CreatedAt             time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
-	UpdatedAt             time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
+	ID                uint64    `gorm:"primaryKey"`
+	ContractID        uint64    `gorm:"not null;index;uniqueIndex:idx_active_checkout_attempt,where:state = 'creating' OR state = 'open' OR state = 'processing' OR state = 'expiring' OR state = 'uncertain'"`
+	Contract          *Contract `gorm:"foreignKey:ContractID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
+	Reference         string    `gorm:"not null;uniqueIndex"`
+	PlanID            string    `gorm:"not null"`
+	FirstAmountCents  int64     `gorm:"not null;check:attempt_first_amount_cents,first_amount_cents > 0"`
+	StripePriceID     string    `gorm:"not null"`
+	CreationStartedAt time.Time `gorm:"not null"`
+	StripeSessionID   *string   `gorm:"uniqueIndex"`
+	CheckoutURL       *string
+	State             string    `gorm:"not null;check:attempt_state,state IN ('creating', 'open', 'processing', 'expiring', 'uncertain', 'expired', 'failed', 'paid')"`
+	CreatedAt         time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
+	UpdatedAt         time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
 }
 
 // Payment records a confirmed Stripe PaymentIntent and balance transaction details.
@@ -94,7 +90,6 @@ type Payment struct {
 	ContractID                uint64    `gorm:"not null;index"`
 	Contract                  *Contract `gorm:"foreignKey:ContractID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
 	StripeChargeID            *string   `gorm:"uniqueIndex"`
-	Currency                  string    `gorm:"not null;default:'usd';check:payment_currency,currency = 'usd'"`
 	GrossReceivedCents        int64     `gorm:"not null;check:payment_gross_received,gross_received_cents >= 0"`
 	GrossRefundedCents        int64     `gorm:"not null;default:0;check:payment_gross_refunded,gross_refunded_cents >= 0"`
 	PaymentTime               time.Time `gorm:"not null"`
@@ -106,29 +101,13 @@ type Payment struct {
 	UpdatedAt                 time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
 }
 
-// Allocation records how a PaymentIntent settles an Obligation via Stripe InvoicePayment.
-type Allocation struct {
-	ID               string      `gorm:"primaryKey"`
-	ObligationID     uint64      `gorm:"not null;index"`
-	Obligation       *Obligation `gorm:"foreignKey:ObligationID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
-	PaymentID        *string     `gorm:"index"`
-	Payment          *Payment    `gorm:"foreignKey:PaymentID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
-	AllocationStatus string      `gorm:"not null"`
-	AllocationType   string      `gorm:"not null"`
-	AmountCents      int64       `gorm:"not null;check:allocation_amount_cents,amount_cents > 0"`
-	CreatedAt        time.Time   `gorm:"not null;default:CURRENT_TIMESTAMP"`
-	UpdatedAt        time.Time   `gorm:"not null;default:CURRENT_TIMESTAMP"`
-}
-
 // Suspension represents an active or historic academic suspension due to missed tuition deadline.
 type Suspension struct {
 	ID                                 uint64    `gorm:"primaryKey"`
 	ContractID                         uint64    `gorm:"not null;index;uniqueIndex:idx_active_suspension,where:closed_at IS NULL"`
 	Contract                           *Contract `gorm:"foreignKey:ContractID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
 	TriggeringTuitionInstallmentNumber int       `gorm:"not null"`
-	TuitionDeadline                    time.Time `gorm:"not null"`
 	StartedAt                          time.Time `gorm:"not null"`
-	DetectedAt                         time.Time `gorm:"not null"`
 	ReinstatementRequestedAt           *time.Time
 	RequestedBy                        *string
 	ClosedAt                           *time.Time
@@ -139,20 +118,16 @@ type Suspension struct {
 
 // WebhookEvent persists received Stripe events for idempotent asynchronous processing.
 type WebhookEvent struct {
-	ID                  string    `gorm:"primaryKey"`
-	EventType           string    `gorm:"not null;index"`
-	ResourceID          string    `gorm:"not null;index"`
-	APIVersion          string    `gorm:"not null"`
-	Livemode            bool      `gorm:"not null"`
-	ReceivedAt          time.Time `gorm:"not null"`
-	ProcessedAt         *time.Time
-	RetryAt             *time.Time `gorm:"index"`
-	RetryCount          int        `gorm:"not null;default:0"`
-	LeaseToken          *string
-	LeaseExpiresAt      *time.Time
-	ErrorClassification *string
-	CreatedAt           time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
-	UpdatedAt           time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
+	ID             string `gorm:"primaryKey"`
+	EventType      string `gorm:"not null"`
+	ResourceID     string `gorm:"not null"`
+	ProcessedAt    *time.Time
+	RetryAt        *time.Time `gorm:"index"`
+	RetryCount     int        `gorm:"not null;default:0"`
+	LeaseToken     *string
+	LeaseExpiresAt *time.Time
+	CreatedAt      time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
+	UpdatedAt      time.Time `gorm:"not null;default:CURRENT_TIMESTAMP"`
 }
 
 // Models returns instances of all billing entities for GORM AutoMigrate.
@@ -162,7 +137,6 @@ func Models() []any {
 		&Obligation{},
 		&CheckoutAttempt{},
 		&Payment{},
-		&Allocation{},
 		&Suspension{},
 		&WebhookEvent{},
 	}

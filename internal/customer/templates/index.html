@@ -9,6 +9,9 @@
   {{if eq .View "form"}}
   <meta name="htmx-config" content='{"reportValidityOfForms":true,"includeIndicatorStyles":false,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"422","swap":true,"error":false},{"code":"[45]..","swap":true,"error":true}]}'>
   {{end}}
+  {{if eq .View "payment-return"}}
+  <meta name="htmx-config" content='{"includeIndicatorStyles":false,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"4..","swap":false,"error":true},{"code":"5..","swap":true,"error":true}]}'>
+  {{end}}
   {{if or (eq .View "form") (eq .View "payment-return")}}
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js"
     integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg"
@@ -33,10 +36,6 @@
 </body>
 </html>
 
-{{define "customer-response"}}
-{{template "customer-content" .}}
-{{end}}
-
 {{/* The three-step journey. Only the steps a person actually walks (contact, agreement, plan and payment) appear. */}}
 {{define "customer-steps"}}
 {{$step := 0}}{{if eq .View "form"}}{{$step = 1}}{{else if eq .View "agreement"}}{{$step = 2}}{{else if eq .View "payments"}}{{$step = 3}}{{end}}
@@ -44,7 +43,7 @@
 <ol class="customer-steps" aria-label="Progreso de la matrícula">
   <li{{if lt 1 $step}} class="is-done"{{else if eq $step 1}} aria-current="step"{{end}}>{{if lt 1 $step}}<span class="visually-hidden">Completado: </span>{{end}}Estudiante</li>
   <li{{if lt 2 $step}} class="is-done"{{else if eq $step 2}} aria-current="step"{{end}}>{{if lt 2 $step}}<span class="visually-hidden">Completado: </span>{{end}}Acuerdo</li>
-  <li{{if .Funded}} class="is-done"{{else if eq $step 3}} aria-current="step"{{end}}>{{if .Funded}}<span class="visually-hidden">Completado: </span>{{end}}Pago</li>
+  <li{{if and .Billing .Billing.Funded}} class="is-done"{{else if eq $step 3}} aria-current="step"{{end}}>{{if and .Billing .Billing.Funded}}<span class="visually-hidden">Completado: </span>{{end}}Pago</li>
 </ol>
 {{end}}
 {{end}}
@@ -182,6 +181,6 @@
 
 {{define "save-status"}}
 {{with .Error}}<p role="alert">No se guardó. {{.}}</p>
-{{else}}{{with index .FieldErrors .DraftField}}<p role="alert" data-validation="invalid">No se guardó. {{.}}</p>
+{{else}}{{range .FieldErrors}}<p role="alert" data-validation="invalid">No se guardó. {{.}}</p>
 {{else}}<p>Guardado.</p>{{end}}{{end}}
 {{end}}

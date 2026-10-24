@@ -15,7 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stripe/stripe-go/v87"
 	"paymentwebsite/internal/billing"
+	"paymentwebsite/internal/billing/billingtest"
 	"paymentwebsite/internal/testdb"
 )
 
@@ -49,31 +51,10 @@ func makeStripeEventJSON(id, eventType, resourceID string, livemode bool, apiVer
 }
 
 func TestWebhookAuthenticityAndReplay(t *testing.T) {
-	mock := newMockStripeServer()
-	defer mock.Close()
-
-	secret := "whsec_test_secret"
-	cfg := billing.Config{
-		BaseURL:                      "http://127.0.0.1:3000",
-		WebhookSecret:                secret,
-		PaymentMethodConfigurationID: "pmc_test",
-		PortalConfigurationID:        "bpc_test",
-		Live:                         false,
-	}
-	catalog := billing.Catalog{
-		Full:          "pr_full",
-		ThreeFirst:    "pr_three_1",
-		ThreeLater:    "pr_three_2",
-		SixFirst:      "pr_six_1",
-		SixLater:      "pr_six_2",
-		Reinstatement: "pr_reinstatement",
-	}
+	secret := billingtest.Config().WebhookSecret
 
 	db := testdb.Open(t, billing.Models()...)
-	svc, err := billing.New(db, mock.Client(), cfg, catalog, nil, nil)
-	if err != nil {
-		t.Fatalf("billing.New: %v", err)
-	}
+	svc := billingtest.New(t, db, nil)
 
 	const apiVersion = "2026-09-30.endive"
 
@@ -207,30 +188,14 @@ func TestWebhookAuthenticityAndReplay(t *testing.T) {
 // A stored webhook must wake the worker well before the 5s tick. The sentinel shows Run is up
 // and idle, so the second event finishing within 3s can only come from the wake.
 func TestWebhookWakesWorker(t *testing.T) {
-	mock := newMockStripeServer()
-	defer mock.Close()
-
-	const secret = "whsec_test_secret"
-	cfg := billing.Config{
-		BaseURL:                      "http://127.0.0.1:3000",
-		WebhookSecret:                secret,
-		PaymentMethodConfigurationID: "pmc_test",
-		PortalConfigurationID:        "bpc_test",
-	}
-	catalog := billing.Catalog{
-		Full: "pr_full", ThreeFirst: "pr_three_1", ThreeLater: "pr_three_2",
-		SixFirst: "pr_six_1", SixLater: "pr_six_2", Reinstatement: "pr_reinstatement",
-	}
+	secret := billingtest.Config().WebhookSecret
 	db := testdb.Open(t, billing.Models()...)
-	svc, err := billing.New(db, mock.Client(), cfg, catalog, nil, nil)
-	if err != nil {
-		t.Fatalf("billing.New: %v", err)
-	}
+	svc := billingtest.New(t, db, nil)
 
 	post := func(id string) {
 		t.Helper()
 		// An unknown invoice maps to no obligation, so the worker finishes it without Stripe.
-		payload := makeStripeEventJSON(id, "invoice.paid", "in_unknown", false, "2026-09-30.endive")
+		payload := makeStripeEventJSON(id, "invoice.paid", "in_unknown", false, stripe.APIVersion)
 		req := httptest.NewRequest(http.MethodPost, "/webhooks/stripe", bytes.NewReader(payload))
 		req.Header.Set("Stripe-Signature", signWebhookPayload(t, payload, secret, time.Now()))
 		rec := httptest.NewRecorder()

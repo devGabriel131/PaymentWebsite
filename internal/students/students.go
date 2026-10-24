@@ -2,6 +2,7 @@ package students
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"time"
 
@@ -62,6 +63,19 @@ func (s *Store) Get(ctx context.Context, id uint64) (*Student, error) {
 	return &record, nil
 }
 
+// BySourceLinkHash returns nil for an absent student by the original link's token digest.
+func (s *Store) BySourceLinkHash(ctx context.Context, sourceLinkHash []byte) (*Student, error) {
+	if len(sourceLinkHash) != sha256.Size {
+		return nil, nil
+	}
+	var record Student
+	result := s.db.WithContext(ctx).Where("source_link_hash = ?", sourceLinkHash).Limit(1).Find(&record)
+	if result.Error != nil || result.RowsAffected == 0 {
+		return nil, result.Error
+	}
+	return &record, nil
+}
+
 var ErrUnknownField = errors.New("students: unknown field")
 
 // UpdateField changes only the registered column and returns its persisted row.
@@ -71,7 +85,7 @@ func (s *Store) UpdateField(ctx context.Context, id uint64, key, raw string) (*S
 	if !ok {
 		return nil, ErrUnknownField
 	}
-	value, err := field.Parse(raw, field.Required)
+	value, err := field.Parse(raw, true)
 	if err != nil {
 		return nil, err
 	}
@@ -88,12 +102,13 @@ func (s *Store) UpdateField(ctx context.Context, id uint64, key, raw string) (*S
 		if result.Error != nil || result.RowsAffected == 0 {
 			return result.Error
 		}
-		if field.Value(record) == value {
+		if field.Value(record.Details) == value {
 			persisted = &record
 			return nil
 		}
 		result = tx.Model(&record).
 			Clauses(clause.Returning{}).Update(field.Key, value)
+		// Zero rows after the locked read means the database suppressed the write (a trigger): not a save.
 		if result.Error != nil || result.RowsAffected == 0 {
 			return result.Error
 		}

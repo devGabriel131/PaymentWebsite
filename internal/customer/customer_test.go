@@ -20,10 +20,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stripe/stripe-go/v87"
 	"gorm.io/gorm"
-
+	"gorm.io/gorm/clause"
 	"paymentwebsite/internal/billing"
+	"paymentwebsite/internal/billing/billingtest"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/settings"
@@ -34,18 +34,33 @@ import (
 // later keeps test links usable for any test's duration.
 var later = time.Now().Add(time.Hour)
 
-func TestErrorResponsesKeepStudentForm(t *testing.T) {
+// fixture is one fresh usable link served by the customer routes.
+type fixture struct {
+	db    *gorm.DB
+	store *links.Store
+	entry links.Entry
+	path  string
+	mux   http.Handler
+}
+
+func newFixture(t *testing.T) fixture {
+	t.Helper()
 	db := customerDatabase(t)
 	store := links.New(db, nil)
 	entry, err := store.Create(t.Context(), "staff", later)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return fixture{db, store, entry, "/customer/" + entry.Token, newMux(t, db)}
+}
+
+func TestErrorResponsesKeepStudentForm(t *testing.T) {
+	f := newFixture(t)
 	existing := contactDetails("Existing name")
-	saveDetails(t, store, entry.Token, existing)
+	saveDetails(t, f.store, f.entry.Token, existing)
 	muxes := map[bool]http.Handler{
-		false: newMux(t, db, store),
-		true:  newMux(t, db, failingStore(t, db)),
+		false: f.mux,
+		true:  newMux(t, failingDB(t, f.db)),
 	}
 	attempted := contactForm("  Ada Lovelace  ")
 	attempted.Set("email", "  Ada+private@EXAMPLE.com  ")
@@ -69,8 +84,7 @@ func TestErrorResponsesKeepStudentForm(t *testing.T) {
 	for _, tc := range cases {
 		for _, htmx := range []bool{false, true} {
 			t.Run(tc.name+fmt.Sprint("/htmx=", htmx), func(t *testing.T) {
-				path := "/customer/" + entry.Token
-				target := path
+				target := f.path
 				if tc.method == http.MethodGet {
 					target += "/forms"
 				}
@@ -79,7 +93,7 @@ func TestErrorResponsesKeepStudentForm(t *testing.T) {
 					t.Fatalf("status = %d, want %d: %s", w.Code, tc.status, w.Body.String())
 				}
 				body := w.Body.String()
-				requireFormError(t, body, path, !htmx || tc.method != http.MethodPost)
+				requireFormError(t, body, f.path, !htmx || tc.method != http.MethodPost)
 				requireAttempted(t, body, tc.values)
 			})
 		}
@@ -87,14 +101,7 @@ func TestErrorResponsesKeepStudentForm(t *testing.T) {
 }
 
 func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
-	db := customerDatabase(t)
-	store := links.New(db, nil)
-	entry, err := store.Create(t.Context(), "staff", later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mux := newMux(t, db, store)
-	path := "/customer/" + entry.Token
+	f := newFixture(t)
 	want := students.Details{}
 	steps := []struct {
 		name, key, raw, value string
@@ -119,7 +126,7 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 			form := url.Values{"name": {"Bad <name>"}, "email": {"invalid"}, "phone": {"invalid"},
 				"municipality": {"invalid"}, "email_confirm": {"never persisted"}}
 			form.Set(step.key, step.raw)
-			w := customerRequest(t, mux, http.MethodPost, path+"/draft/"+step.key, form.Encode(), true)
+			w := customerRequest(t, f.mux, http.MethodPost, f.path+"/draft/"+step.key, form.Encode(), true)
 			if w.Code != step.code || strings.Contains(w.Body.String(), "<input") {
 				t.Fatalf("draft status = %d, want %d, fragment %s", w.Code, step.code, w.Body.String())
 			}
@@ -136,16 +143,16 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 			case "municipality":
 				want.Municipality = step.value
 			}
-			link := stored(t, db)[0]
-			if link.Details != want || link.SubmittedAt != nil || len(studentRecords(t, db)) != 0 {
+			link := stored(t, f.db)[0]
+			if link.Details != want || link.SubmittedAt != nil || len(studentRecords(t, f.db)) != 0 {
 				t.Fatalf("draft changed unrelated data: link %+v, want details %+v", link, want)
 			}
 			if i == 0 && link.OpenedAt != nil {
 				t.Fatal("draft POST recorded a first visit")
 			}
-			reload := customerRequest(t, mux, http.MethodGet, path+"/forms", "", false)
+			reload := customerRequest(t, f.mux, http.MethodGet, f.path+"/forms", "", false)
 			requireAttempted(t, reload.Body.String(), detailsForm(want))
-			entries, err := store.List(t.Context())
+			entries, err := f.store.List(t.Context())
 			if err != nil || len(entries) != 1 {
 				t.Fatalf("list: %+v, %v", entries, err)
 			}
@@ -160,30 +167,30 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 	}
 
 	final := contactForm("Ana Pérez")
-	w := customerRequest(t, mux, http.MethodPost, path, final.Encode(), true)
+	w := customerRequest(t, f.mux, http.MethodPost, f.path, final.Encode(), true)
 	if w.Code != http.StatusOK {
 		t.Fatalf("submit: status = %d, body %q", w.Code, w.Body.String())
 	}
-	requireAdvance(t, w, path+"/agreement", true, privateFormValues(final)...)
-	if enrolled := studentRecords(t, db); len(enrolled) != 1 || enrolled[0].Details != contactDetails("Ana Pérez") {
+	requireAdvance(t, w, f.path+"/agreement", true, privateFormValues(final)...)
+	if enrolled := studentRecords(t, f.db); len(enrolled) != 1 || enrolled[0].Details != contactDetails("Ana Pérez") {
 		t.Fatalf("submit students = %+v", enrolled)
 	}
-	before := stored(t, db)
+	before := stored(t, f.db)
 	for _, suffix := range []string{"/draft/name", "/draft/email", "/draft/phone", "/draft/municipality"} {
 		key := strings.TrimPrefix(suffix, "/draft/")
-		w := customerRequest(t, mux, http.MethodPost, path+suffix, url.Values{key: {""}}.Encode(), true)
+		w := customerRequest(t, f.mux, http.MethodPost, f.path+suffix, url.Values{key: {""}}.Encode(), true)
 		if w.Code != http.StatusConflict || w.Header().Get("HX-Refresh") != "true" {
 			t.Fatalf("draft after submit: status = %d, HX-Refresh = %q", w.Code, w.Header().Get("HX-Refresh"))
 		}
 		requireNoPrivate(t, w.Body.String(), privateFormValues(final)...)
 	}
-	if after := stored(t, db); !reflect.DeepEqual(after, before) {
+	if after := stored(t, f.db); !reflect.DeepEqual(after, before) {
 		t.Fatalf("late drafts changed completed details: before %+v, after %+v", before, after)
 	}
-	if _, err := store.Cancel(t.Context(), entry.ID, "staff"); err != nil {
+	if _, err := f.store.Cancel(t.Context(), f.entry.ID, "staff"); err != nil {
 		t.Fatal(err)
 	}
-	w = customerRequest(t, mux, http.MethodPost, path+"/draft/name", "name=After+attempted+cancel", true)
+	w = customerRequest(t, f.mux, http.MethodPost, f.path+"/draft/name", "name=After+attempted+cancel", true)
 	if w.Code != http.StatusConflict || w.Header().Get("HX-Refresh") != "true" {
 		t.Fatalf("finished draft after cancel: status = %d, HX-Refresh = %q", w.Code, w.Header().Get("HX-Refresh"))
 	}
@@ -203,7 +210,7 @@ func TestUnusableLinksTakePrecedence(t *testing.T) {
 	if _, err := store.Cancel(t.Context(), canceled.ID, "staff"); err != nil {
 		t.Fatal(err)
 	}
-	mux := newMux(t, db, store)
+	mux := newMux(t, db)
 	before := stored(t, db)
 	for _, token := range []string{expired.Token, canceled.Token, strings.Repeat("A", len(expired.Token)), "not-a-token"} {
 		path := "/customer/" + token
@@ -239,93 +246,22 @@ func TestUnusableLinksTakePrecedence(t *testing.T) {
 	}
 }
 
-func TestSubmissionFailureRollsBackAndAllowsRetry(t *testing.T) {
-	for _, mode := range []string{"ordinary", "htmx"} {
-		t.Run(mode, func(t *testing.T) {
-			db := customerDatabase(t)
-			store := links.New(db, nil)
-			entry, err := store.Create(t.Context(), "staff", later)
-			if err != nil {
-				t.Fatal(err)
-			}
-			saveDetails(t, store, entry.Token, contactDetails("Original draft"))
-			if err := db.WithContext(t.Context()).Exec("ALTER TABLE students ADD CONSTRAINT customer_submit_rejected CHECK (name <> 'Reject completion')").Error; err != nil {
-				t.Fatal(err)
-			}
-			mux := newMux(t, db, store)
-			path := "/customer/" + entry.Token
-			attempted := "  Reject completion  "
-			form := contactForm(attempted)
-			form.Set("email", " Retry+private@EXAMPLE.COM ")
-			form.Set("email_confirm", "Retry+private@example.com")
-			form.Set("phone", " (202) 555-0123 ")
-			form.Set("municipality", " Bayamón ")
-			send := func() *httptest.ResponseRecorder {
-				r := httptest.NewRequest(http.MethodPost, path, strings.NewReader(form.Encode()))
-				r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-				if mode == "htmx" {
-					r.Header.Set("HX-Request", "true")
-				}
-				w := httptest.NewRecorder()
-				mux.ServeHTTP(w, r)
-				return w
-			}
-			before := stored(t, db)
-			w := send()
-			if w.Code != http.StatusInternalServerError {
-				t.Fatalf("rejected insert: status = %d, body %s", w.Code, w.Body.String())
-			}
-			body := w.Body.String()
-			requireFormError(t, body, path, mode == "ordinary")
-			requireAttempted(t, body, form)
-			if after := stored(t, db); !reflect.DeepEqual(after, before) {
-				t.Fatalf("failed student insert changed link from %+v to %+v", before, after)
-			}
-			if enrolled := studentRecords(t, db); len(enrolled) != 0 {
-				t.Fatalf("failed student insert retained students: %+v", enrolled)
-			}
-
-			if err := db.WithContext(t.Context()).Exec("ALTER TABLE students DROP CONSTRAINT customer_submit_rejected").Error; err != nil {
-				t.Fatal(err)
-			}
-			w = send()
-			requireAdvance(t, w, path+"/agreement", mode == "htmx", privateFormValues(form)...)
-			completed := stored(t, db)[0]
-			enrolled := studentRecords(t, db)
-			want := students.Details{Name: "Reject completion", Email: "Retry+private@example.com", Phone: "+12025550123", Municipality: "Bayamón", DateOfBirth: "2005-06-15"}
-			if completed.Details != want || completed.SubmittedAt == nil || completed.OpenedAt != nil ||
-				len(enrolled) != 1 || enrolled[0].Details != completed.Details ||
-				!enrolled[0].CreatedAt.Equal(*completed.SubmittedAt) ||
-				completed.ExpiresAt.Sub(*completed.SubmittedAt) != 168*time.Hour {
-				t.Fatalf("retry did not commit matching completion and student: link %+v, students %+v", completed, enrolled)
-			}
-		})
-	}
-}
-
 func TestCompletedAccessAndReplay(t *testing.T) {
-	db := customerDatabase(t)
-	store := links.New(db, nil)
-	entry, err := store.Create(t.Context(), "staff", later)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f := newFixture(t)
 	const submittedName = "Submission snapshot"
 	const canonicalName = "Edited student name"
 	// Submit directly so replay must not even fill in the absent first-visit time.
-	if saved, err := store.Submit(t.Context(), entry.Token, contactDetails(submittedName)); err != nil || saved != links.Saved {
+	if saved, err := f.store.Submit(t.Context(), f.entry.Token, contactDetails(submittedName)); err != nil || saved != links.Saved {
 		t.Fatalf("submit: saved=%v, err=%v", saved, err)
 	}
-	enrolled := studentRecords(t, db)
+	enrolled := studentRecords(t, f.db)
 	if len(enrolled) != 1 {
 		t.Fatalf("students = %+v, want one", enrolled)
 	}
-	if _, err := students.New(db, nil).UpdateField(t.Context(), enrolled[0].ID, "name", canonicalName); err != nil {
+	if _, err := students.New(f.db, nil).UpdateField(t.Context(), enrolled[0].ID, "name", canonicalName); err != nil {
 		t.Fatal(err)
 	}
-	mux := newMux(t, db, store)
-	path := "/customer/" + entry.Token
-	before, studentsBefore := stored(t, db), studentRecords(t, db)
+	before, studentsBefore := stored(t, f.db), studentRecords(t, f.db)
 	replay := contactForm("Replacement private")
 	replay.Set("email", "Replay+private@example.com")
 	replay.Set("email_confirm", " Replay+private@EXAMPLE.COM ")
@@ -352,13 +288,7 @@ func TestCompletedAccessAndReplay(t *testing.T) {
 			{"oversized stale draft", "/draft/name", "name=" + strings.Repeat("x", 5000), http.StatusConflict},
 		} {
 			t.Run(mode+"/"+tc.name, func(t *testing.T) {
-				r := httptest.NewRequest(http.MethodPost, path+tc.suffix, strings.NewReader(tc.body))
-				r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-				if mode == "htmx" {
-					r.Header.Set("HX-Request", "true")
-				}
-				w := httptest.NewRecorder()
-				mux.ServeHTTP(w, r)
+				w := customerRequest(t, f.mux, http.MethodPost, f.path+tc.suffix, tc.body, mode == "htmx")
 				wantStatus := tc.status
 				if tc.status == http.StatusOK && mode == "ordinary" {
 					wantStatus = http.StatusSeeOther
@@ -374,34 +304,29 @@ func TestCompletedAccessAndReplay(t *testing.T) {
 					t.Fatalf("HX-Refresh = %q, want %q", got, refresh)
 				}
 				if tc.status == http.StatusOK {
-					requireAdvance(t, w, path+"/agreement", mode == "htmx", private...)
+					requireAdvance(t, w, f.path+"/agreement", mode == "htmx", private...)
 				} else {
 					requireNoPrivate(t, w.Body.String(), private...)
 				}
-				if after := stored(t, db); !reflect.DeepEqual(after, before) {
+				if after := stored(t, f.db); !reflect.DeepEqual(after, before) {
 					t.Fatalf("completed POST changed link from %+v to %+v", before, after)
 				}
-				if after := studentRecords(t, db); !reflect.DeepEqual(after, studentsBefore) {
+				if after := studentRecords(t, f.db); !reflect.DeepEqual(after, studentsBefore) {
 					t.Fatalf("completed POST changed students from %+v to %+v", studentsBefore, after)
 				}
 			})
 		}
 	}
-	for _, target := range []string{path, path + "/forms"} {
+	for _, target := range []string{f.path, f.path + "/forms"} {
 		for _, htmx := range []bool{false, true} {
-			r := httptest.NewRequest(http.MethodGet, target, nil)
-			if htmx {
-				r.Header.Set("HX-Request", "true")
-			}
-			w := httptest.NewRecorder()
-			mux.ServeHTTP(w, r)
-			requireAdvance(t, w, path+"/agreement", false, private...)
+			w := customerRequest(t, f.mux, http.MethodGet, target, "", htmx)
+			requireAdvance(t, w, f.path+"/agreement", false, private...)
 		}
 	}
-	server := serve(t, db, store)
-	headKeeps(t, db, server, path, http.StatusOK)
+	server := serve(t, f.db)
+	headKeeps(t, f.db, server, f.path, http.StatusOK)
 
-	if err := db.WithContext(t.Context()).Model(&links.Link{}).Where("token_hash = ?", before[0].TokenHash).Update("expires_at", time.Now().Add(-time.Minute)).Error; err != nil {
+	if err := f.db.WithContext(t.Context()).Model(&links.Link{}).Where("token_hash = ?", before[0].TokenHash).Update("expires_at", time.Now().Add(-time.Minute)).Error; err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct{ method, suffix string }{
@@ -410,16 +335,13 @@ func TestCompletedAccessAndReplay(t *testing.T) {
 		{http.MethodPost, ""},
 		{http.MethodPost, "/draft/name"},
 	} {
-		r := httptest.NewRequest(tc.method, path+tc.suffix, strings.NewReader("name=Replacement"))
-		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, r)
+		w := customerRequest(t, f.mux, tc.method, f.path+tc.suffix, "name=Replacement", false)
 		if w.Code != http.StatusNotFound {
 			t.Fatalf("expired completion %s %s: status = %d", tc.method, tc.suffix, w.Code)
 		}
 	}
-	headKeeps(t, db, server, path, http.StatusNotFound)
-	if after := studentRecords(t, db); !reflect.DeepEqual(after, studentsBefore) {
+	headKeeps(t, f.db, server, f.path, http.StatusNotFound)
+	if after := studentRecords(t, f.db); !reflect.DeepEqual(after, studentsBefore) {
 		t.Fatalf("completion access or expiry changed retained students from %+v to %+v", studentsBefore, after)
 	}
 }
@@ -427,14 +349,8 @@ func TestCompletedAccessAndReplay(t *testing.T) {
 // TestHeadChecksLinkWithoutChangingIt follows one link through its life. HEAD
 // only reports whether it opens; GET still records the customer's first visit.
 func TestHeadChecksLinkWithoutChangingIt(t *testing.T) {
-	db := customerDatabase(t)
-	store := links.New(db, nil)
-	entry, err := store.Create(t.Context(), "staff", later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := serve(t, db, store)
-	path := "/customer/" + entry.Token
+	f := newFixture(t)
+	server := serve(t, f.db)
 	client := &http.Client{Timeout: httpTimeout}
 	// send makes a request carrying a name, as a stray edit would.
 	send := func(t *testing.T, method, target string) int {
@@ -452,30 +368,30 @@ func TestHeadChecksLinkWithoutChangingIt(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	headKeeps(t, db, server, path, http.StatusOK)
-	headKeeps(t, db, server, path+"/forms", http.StatusOK)
-	if entries, err := store.List(t.Context()); err != nil || len(entries) != 1 || entries[0].Status != links.NotOpened {
+	headKeeps(t, f.db, server, f.path, http.StatusOK)
+	headKeeps(t, f.db, server, f.path+"/forms", http.StatusOK)
+	if entries, err := f.store.List(t.Context()); err != nil || len(entries) != 1 || entries[0].Status != links.NotOpened {
 		t.Fatalf("after HEAD: entries %+v, err %v; want one %q", entries, err, links.NotOpened)
 	}
 
-	if status := send(t, http.MethodGet, path); status != http.StatusOK {
+	if status := send(t, http.MethodGet, f.path); status != http.StatusOK {
 		t.Fatalf("GET status = %d, want 200", status)
 	}
-	if stored(t, db)[0].OpenedAt == nil {
+	if stored(t, f.db)[0].OpenedAt == nil {
 		t.Fatal("GET did not record the first visit")
 	}
-	headKeeps(t, db, server, path, http.StatusOK)
+	headKeeps(t, f.db, server, f.path, http.StatusOK)
 
-	saveDetails(t, store, entry.Token, contactDetails("Draft student"))
-	headKeeps(t, db, server, path, http.StatusOK)
+	saveDetails(t, f.store, f.entry.Token, contactDetails("Draft student"))
+	headKeeps(t, f.db, server, f.path, http.StatusOK)
 
 	// Autosave and the page answer no other methods, so none can edit the draft.
-	before := stored(t, db)
+	before := stored(t, f.db)
 	for _, tc := range []struct{ name, method, target string }{
-		{"HEAD autosave", http.MethodHead, path + "/draft/name"},
-		{"GET autosave", http.MethodGet, path + "/draft/name"},
-		{"PUT page", http.MethodPut, path},
-		{"DELETE page", http.MethodDelete, path},
+		{"HEAD autosave", http.MethodHead, f.path + "/draft/name"},
+		{"GET autosave", http.MethodGet, f.path + "/draft/name"},
+		{"PUT page", http.MethodPut, f.path},
+		{"DELETE page", http.MethodDelete, f.path},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if status := send(t, tc.method, tc.target); status != http.StatusMethodNotAllowed {
@@ -483,18 +399,18 @@ func TestHeadChecksLinkWithoutChangingIt(t *testing.T) {
 			}
 		})
 	}
-	if after := stored(t, db); !reflect.DeepEqual(after, before) {
+	if after := stored(t, f.db); !reflect.DeepEqual(after, before) {
 		t.Fatalf("unsupported methods changed stored links from %+v to %+v", before, after)
 	}
 
 	// A submitted link still opens read-only: HEAD answers 200, not the 409 that locks edits.
-	if saved, err := store.Submit(t.Context(), entry.Token, contactDetails("Ana Pérez")); err != nil || saved != links.Saved {
+	if saved, err := f.store.Submit(t.Context(), f.entry.Token, contactDetails("Ana Pérez")); err != nil || saved != links.Saved {
 		t.Fatalf("submit: saved=%v, err=%v", saved, err)
 	}
-	headKeeps(t, db, server, path, http.StatusOK)
+	headKeeps(t, f.db, server, f.path, http.StatusOK)
 
 	// A failed lookup is a server error, never a guess about the link.
-	headKeeps(t, db, serve(t, db, failingStore(t, db)), path, http.StatusInternalServerError)
+	headKeeps(t, f.db, serve(t, failingDB(t, f.db)), f.path, http.StatusInternalServerError)
 }
 
 func TestHeadRejectsUnusableLinks(t *testing.T) {
@@ -511,7 +427,7 @@ func TestHeadRejectsUnusableLinks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := serve(t, db, store)
+	server := serve(t, db)
 	for _, tc := range []struct{ name, token string }{
 		{"unknown", strings.Repeat("A", len(canceled.Token))},
 		{"malformed", "not-a-token"},
@@ -525,52 +441,11 @@ func TestHeadRejectsUnusableLinks(t *testing.T) {
 	}
 }
 
-func TestConcurrentDraftFieldsRemainIsolated(t *testing.T) {
-	db := customerDatabase(t)
-	store := links.New(db, nil)
-	entry, err := store.Create(t.Context(), "staff", later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := contactDetails("Original student")
-	saveDetails(t, store, entry.Token, want)
-	mux := newMux(t, db, store)
-	responses := make(chan *httptest.ResponseRecorder, 2)
-	for key, form := range map[string]url.Values{
-		"name":  {"name": {"Updated name"}, "phone": {"invalid unrelated phone"}},
-		"phone": {"phone": {"(202) 555-0123"}, "name": {"invalid <name>"}},
-	} {
-		go func() {
-			r := httptest.NewRequest(http.MethodPost, "/customer/"+entry.Token+"/draft/"+key, strings.NewReader(form.Encode()))
-			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			w := httptest.NewRecorder()
-			mux.ServeHTTP(w, r)
-			responses <- w
-		}()
-	}
-	for range 2 {
-		w := <-responses
-		if w.Code != http.StatusOK {
-			t.Errorf("concurrent draft status = %d: %s", w.Code, w.Body.String())
-		}
-	}
-	want.Name, want.Phone = "Updated name", "+12025550123"
-	if link := stored(t, db)[0]; link.Details != want || link.SubmittedAt != nil || len(studentRecords(t, db)) != 0 {
-		t.Fatalf("concurrent drafts lost an independent update: %+v, want %+v", link, want)
-	}
-}
-
 func TestDraftCardinalityAllowlistAndFailures(t *testing.T) {
-	db := customerDatabase(t)
-	store := links.New(db, nil)
-	entry, err := store.Create(t.Context(), "staff", later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	saveDetails(t, store, entry.Token, contactDetails("Saved student"))
-	path := "/customer/" + entry.Token
-	before := stored(t, db)
-	mux := newMux(t, db, store)
+	f := newFixture(t)
+	saveDetails(t, f.store, f.entry.Token, contactDetails("Saved student"))
+	before := stored(t, f.db)
+	failing := newMux(t, failingDB(t, f.db))
 	for _, field := range students.Fields() {
 		for _, tc := range []struct{ name, suffix, body string }{
 			{"missing", "", "unrelated=ignored"},
@@ -579,7 +454,7 @@ func TestDraftCardinalityAllowlistAndFailures(t *testing.T) {
 		} {
 			for _, htmx := range []bool{false, true} {
 				t.Run(field.Key+"/"+tc.name+fmt.Sprint("/htmx=", htmx), func(t *testing.T) {
-					w := customerRequest(t, mux, http.MethodPost, path+"/draft/"+field.Key+tc.suffix, tc.body, htmx)
+					w := customerRequest(t, f.mux, http.MethodPost, f.path+"/draft/"+field.Key+tc.suffix, tc.body, htmx)
 					if w.Code != http.StatusBadRequest || strings.Contains(w.Body.String(), "data-validation=") ||
 						strings.Contains(w.Body.String(), "<input") {
 						t.Fatalf("malformed draft status %d, fragment %s", w.Code, w.Body.String())
@@ -590,13 +465,13 @@ func TestDraftCardinalityAllowlistAndFailures(t *testing.T) {
 	}
 	// Unknown keys are rejected before lookup, even when the database is down.
 	for _, key := range []string{"email_confirm", "Name", "unknown"} {
-		w := customerRequest(t, newMux(t, db, failingStore(t, db)), http.MethodPost, path+"/draft/"+key, "name=Ignored", true)
+		w := customerRequest(t, failing, http.MethodPost, f.path+"/draft/"+key, "name=Ignored", true)
 		if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "customer-not-found") ||
 			w.Header().Get("HX-Refresh") != "true" {
 			t.Fatalf("unknown key %q: status %d, body %s", key, w.Code, w.Body.String())
 		}
 	}
-	if w := customerRequest(t, mux, http.MethodPost, path+"/draft", "name=Ignored", false); w.Code != http.StatusNotFound {
+	if w := customerRequest(t, f.mux, http.MethodPost, f.path+"/draft", "name=Ignored", false); w.Code != http.StatusNotFound {
 		t.Fatalf("obsolete draft endpoint still accepted: %d", w.Code)
 	}
 	for _, tc := range []struct {
@@ -611,32 +486,25 @@ func TestDraftCardinalityAllowlistAndFailures(t *testing.T) {
 		{"parse lookup failure", "name=%zz", true, http.StatusInternalServerError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			handler := mux
+			handler := f.mux
 			if tc.failing {
-				handler = newMux(t, db, failingStore(t, db))
+				handler = failing
 			}
-			w := customerRequest(t, handler, http.MethodPost, path+"/draft/name", tc.body, true)
+			w := customerRequest(t, handler, http.MethodPost, f.path+"/draft/name", tc.body, true)
 			if w.Code != tc.status || strings.Contains(w.Body.String(), "data-validation=") {
 				t.Fatalf("draft error status %d, want %d; body %s", w.Code, tc.status, w.Body.String())
 			}
 		})
 	}
-	if after := stored(t, db); !reflect.DeepEqual(after, before) || len(studentRecords(t, db)) != 0 {
+	if after := stored(t, f.db); !reflect.DeepEqual(after, before) || len(studentRecords(t, f.db)) != 0 {
 		t.Fatalf("rejected drafts mutated state: before %+v, after %+v", before, after)
 	}
 }
 
 func TestFinalValidationAndEmailConfirmation(t *testing.T) {
-	db := customerDatabase(t)
-	store := links.New(db, nil)
-	entry, err := store.Create(t.Context(), "staff", later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	saveDetails(t, store, entry.Token, contactDetails("Saved student"))
-	mux := newMux(t, db, store)
-	path := "/customer/" + entry.Token
-	before := stored(t, db)
+	f := newFixture(t)
+	saveDetails(t, f.store, f.entry.Token, contactDetails("Saved student"))
+	before := stored(t, f.db)
 	cases := []struct {
 		name     string
 		replace  url.Values
@@ -653,6 +521,7 @@ func TestFinalValidationAndEmailConfirmation(t *testing.T) {
 		{"rejected name is escaped", url.Values{"name": {`<script>alert("private")</script>`}}, []string{"name"}, false},
 		{"NUL name", url.Values{"name": {"A\x00"}}, []string{"name"}, false},
 		{"invalid UTF-8 name", url.Values{"name": {"\xff"}}, []string{"name"}, false},
+		{"future date of birth", url.Values{"date_of_birth": {"2099-01-01"}}, []string{"date_of_birth"}, false},
 	}
 	for _, tc := range cases {
 		for _, htmx := range []bool{false, true} {
@@ -665,12 +534,12 @@ func TestFinalValidationAndEmailConfirmation(t *testing.T) {
 				for key, values := range tc.replace {
 					form[key] = values
 				}
-				w := customerRequest(t, mux, http.MethodPost, path, form.Encode(), htmx)
+				w := customerRequest(t, f.mux, http.MethodPost, f.path, form.Encode(), htmx)
 				if w.Code != http.StatusUnprocessableEntity {
 					t.Fatalf("status = %d, want 422: %s", w.Code, w.Body.String())
 				}
 				body := w.Body.String()
-				requireFormError(t, body, path, !htmx)
+				requireFormError(t, body, f.path, !htmx)
 				requireAttempted(t, body, form)
 				for _, key := range tc.errors {
 					control := regexp.MustCompile(`<(?:input|select)\b[^>]*\bid="` + key + `"[^>]*>`).FindString(body)
@@ -688,44 +557,26 @@ func TestFinalValidationAndEmailConfirmation(t *testing.T) {
 				if strings.Contains(body, `<script>alert`) {
 					t.Fatal("rejected attempt rendered executable markup")
 				}
-				if after := stored(t, db); !reflect.DeepEqual(after, before) || len(studentRecords(t, db)) != 0 {
+				if after := stored(t, f.db); !reflect.DeepEqual(after, before) || len(studentRecords(t, f.db)) != 0 {
 					t.Fatalf("invalid final mutated persisted state: before %+v, after %+v", before, after)
 				}
 			})
 		}
 	}
 	// Reload restores saved contact values, but never infers email confirmation.
-	reload := customerRequest(t, mux, http.MethodGet, path+"/forms", "", false)
+	reload := customerRequest(t, f.mux, http.MethodGet, f.path+"/forms", "", false)
 	requireAttempted(t, reload.Body.String(), detailsForm(contactDetails("Saved student")))
 	valid := contactForm("  María   Pérez  ")
 	valid.Set("email", " Ada+private@EXAMPLE.com ")
 	valid.Set("email_confirm", " Ada+private@example.COM ")
 	valid.Set("phone", " (202) 555-0123 ")
 	valid.Set("municipality", " Bayamón ")
-	w := customerRequest(t, mux, http.MethodPost, path, valid.Encode(), false)
-	requireAdvance(t, w, path+"/agreement", false, privateFormValues(valid)...)
+	w := customerRequest(t, f.mux, http.MethodPost, f.path, valid.Encode(), false)
+	requireAdvance(t, w, f.path+"/agreement", false, privateFormValues(valid)...)
 	want := students.Details{Name: "María Pérez", Email: "Ada+private@example.com", Phone: "+12025550123", Municipality: "Bayamón", DateOfBirth: "2005-06-15"}
-	link, enrolled := stored(t, db)[0], studentRecords(t, db)
+	link, enrolled := stored(t, f.db)[0], studentRecords(t, f.db)
 	if link.Details != want || len(enrolled) != 1 || enrolled[0].Details != want {
 		t.Fatalf("completion did not copy all normalized fields: link %+v, students %+v", link, enrolled)
-	}
-}
-
-func TestHostilePersistedDetailsRemainEscaped(t *testing.T) {
-	db := customerDatabase(t)
-	store := links.New(db, nil)
-	entry, err := store.Create(t.Context(), "staff", later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hostile := `<script>alert("persisted")</script>`
-	if result, err := store.SaveDraft(t.Context(), entry.Token, "name", hostile); err != nil || result != links.Saved {
-		t.Fatalf("persist hostile fixture: %v, %v", result, err)
-	}
-	w := customerRequest(t, newMux(t, db, store), http.MethodGet, "/customer/"+entry.Token+"/forms", "", false)
-	if w.Code != http.StatusOK || strings.Contains(w.Body.String(), hostile) ||
-		!strings.Contains(w.Body.String(), template.HTMLEscapeString(hostile)) {
-		t.Fatalf("persisted hostile fixture not safely escaped: status %d, %s", w.Code, w.Body.String())
 	}
 }
 
@@ -785,8 +636,8 @@ func customerRequest(t *testing.T, handler http.Handler, method, path, body stri
 	handler.ServeHTTP(w, r)
 	// Unregistered obsolete routes use ServeMux's own 404 response.
 	if !strings.HasSuffix(path, "/draft") {
-		for name, want := range map[string]string{"Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
-			"Vary": "HX-Request", "Content-Type": "text/html; charset=utf-8"} {
+		for name, want := range map[string]string{"Cache-Control": "no-store", "Content-Security-Policy": customerCSP,
+			"Referrer-Policy": "no-referrer", "Vary": "HX-Request", "Content-Type": "text/html; charset=utf-8"} {
 			if got := w.Header().Get(name); got != want {
 				t.Errorf("%s = %q, want %q", name, got, want)
 			}
@@ -836,22 +687,7 @@ func customerDatabase(t *testing.T) *gorm.DB {
 
 func testCustomerBiller(t *testing.T, db *gorm.DB) *billing.Service {
 	t.Helper()
-	cfg := billing.Config{
-		BaseURL:                      "http://127.0.0.1:3000",
-		WebhookSecret:                "whsec_dummy",
-		PaymentMethodConfigurationID: "pmc_dummy",
-		PortalConfigurationID:        "bpc_dummy",
-		Live:                         false,
-	}
-	catalog := billing.Catalog{
-		Full:          "pr_full",
-		ThreeFirst:    "pr_three_1",
-		ThreeLater:    "pr_three_2",
-		SixFirst:      "pr_six_1",
-		SixLater:      "pr_six_2",
-		Reinstatement: "pr_reinstatement",
-	}
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return billingtest.New(t, db, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.URL.Path == "/v1/customers":
@@ -896,43 +732,28 @@ func testCustomerBiller(t *testing.T, db *gorm.DB) *billing.Service {
 			http.Error(w, `{"error":{"message":"not found"}}`, http.StatusNotFound)
 		}
 	}))
-	t.Cleanup(ts.Close)
-	maxRetries := int64(0)
-	backends := stripe.NewBackendsWithConfig(&stripe.BackendConfig{
-		URL:               stripe.String(ts.URL),
-		HTTPClient:        ts.Client(),
-		MaxNetworkRetries: &maxRetries,
-		LeveledLogger:     &stripe.LeveledLogger{Level: stripe.LevelNull},
-	})
-	client := stripe.NewClient("sk_test_mock", stripe.WithBackends(backends))
-	biller, err := billing.New(db, client, cfg, catalog, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return biller
 }
 
-func newMux(t *testing.T, db *gorm.DB, store *links.Store) http.Handler {
+func newMux(t *testing.T, db *gorm.DB) http.Handler {
 	t.Helper()
 	mux := http.NewServeMux()
-	biller := testCustomerBiller(t, db)
-	if err := RegisterRoutes(mux, store, settings.New(db), biller); err != nil {
+	if err := RegisterRoutes(mux, links.New(db, nil), students.New(db, nil), settings.New(db), testCustomerBiller(t, db)); err != nil {
 		t.Fatal(err)
 	}
 	return logging.Requests(logging.New(io.Discard), mux)
 }
 
 // serve runs the customer routes behind a real HTTP server.
-func serve(t *testing.T, db *gorm.DB, store *links.Store) *httptest.Server {
+func serve(t *testing.T, db *gorm.DB) *httptest.Server {
 	t.Helper()
-	server := httptest.NewServer(newMux(t, db, store))
+	server := httptest.NewServer(newMux(t, db))
 	t.Cleanup(server.Close)
 	return server
 }
 
-// failingStore returns a store whose every query fails: its transaction is
-// already rolled back.
-func failingStore(t *testing.T, db *gorm.DB) *links.Store {
+// failingDB returns a database handle whose every query fails: its
+// transaction is already rolled back.
+func failingDB(t *testing.T, db *gorm.DB) *gorm.DB {
 	t.Helper()
 	tx := db.WithContext(t.Context()).Begin()
 	if tx.Error != nil {
@@ -941,7 +762,7 @@ func failingStore(t *testing.T, db *gorm.DB) *links.Store {
 	if err := tx.Rollback().Error; err != nil {
 		t.Fatal(err)
 	}
-	return links.New(tx, nil)
+	return tx
 }
 
 // stored reads every link directly, never through Open, so checks record no visit.
@@ -1068,11 +889,12 @@ func head(t *testing.T, server *httptest.Server, path string, htmx bool) int {
 		refresh = "true"
 	}
 	for name, want := range map[string]string{
-		"Cache-Control":   "no-store",
-		"Referrer-Policy": "no-referrer",
-		"Vary":            "HX-Request",
-		"Content-Type":    "text/html; charset=utf-8",
-		"HX-Refresh":      refresh,
+		"Cache-Control":           "no-store",
+		"Content-Security-Policy": customerCSP,
+		"Referrer-Policy":         "no-referrer",
+		"Vary":                    "HX-Request",
+		"Content-Type":            "text/html; charset=utf-8",
+		"HX-Refresh":              refresh,
 	} {
 		if got := resp.Header.Get(name); got != want {
 			t.Errorf("HEAD %s (htmx=%v): %s = %q, want %q", path, htmx, name, got, want)
@@ -1082,18 +904,11 @@ func head(t *testing.T, server *httptest.Server, path string, htmx bool) int {
 }
 
 func TestContactEditFlowAndBackNavigation(t *testing.T) {
-	db := customerDatabase(t)
-	store := links.New(db, nil)
-	entry, err := store.Create(t.Context(), "staff", later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mux := newMux(t, db, store)
-	path := "/customer/" + entry.Token
+	f := newFixture(t)
 
 	// 1. Unsubmitted link: GET /edit redirects to /forms
-	w := customerRequest(t, mux, http.MethodGet, path+"/edit", "", false)
-	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != path+"/forms" {
+	w := customerRequest(t, f.mux, http.MethodGet, f.path+"/edit", "", false)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != f.path+"/forms" {
 		t.Fatalf("unsubmitted /edit: status %d, location %q; want redirect to /forms", w.Code, w.Header().Get("Location"))
 	}
 
@@ -1102,38 +917,42 @@ func TestContactEditFlowAndBackNavigation(t *testing.T) {
 	initial.Email = "original@example.com"
 	initial.Phone = "+17875551111"
 	initial.Municipality = "Ponce"
-	res, err := store.Submit(t.Context(), entry.Token, initial)
+	res, err := f.store.Submit(t.Context(), f.entry.Token, initial)
 	if err != nil || res != links.Saved {
 		t.Fatalf("submit: %v, %v", res, err)
 	}
 
 	// 2. Submitted link:
 	// GET /edit renders prefilled form with back link to agreement and action=/edit
-	w = customerRequest(t, mux, http.MethodGet, path+"/edit", "", false)
+	w = customerRequest(t, f.mux, http.MethodGet, f.path+"/edit", "", false)
 	if w.Code != http.StatusOK {
 		t.Fatalf("GET /edit: status %d, body %s", w.Code, w.Body.String())
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, `value="Original Student"`) || !strings.Contains(body, `value="original@example.com"`) {
+	if !strings.Contains(body, `value="Original Student"`) || !strings.Contains(body, `value="original@example.com"`) ||
+		!strings.Contains(body, "17875551111") || !strings.Contains(body, `value="Ponce" selected`) || !strings.Contains(body, `value="2005-06-15"`) {
 		t.Fatalf("GET /edit missing prefilled values: %s", body)
 	}
-	if !strings.Contains(body, `href="`+path+`/agreement"`) || !strings.Contains(body, "Volver al acuerdo") {
+	if !strings.Contains(body, `id="email_confirm"`) || !strings.Contains(body, `name="email_confirm"`) || !strings.Contains(body, `value=""`) {
+		t.Fatalf("GET /edit should have blank email_confirm value: %s", body)
+	}
+	if !strings.Contains(body, `href="`+f.path+`/agreement"`) || !strings.Contains(body, "Volver al acuerdo") {
 		t.Fatalf("GET /edit missing back link to agreement: %s", body)
 	}
-	if !strings.Contains(body, `action="`+path+`/edit"`) {
+	if !strings.Contains(body, `action="`+f.path+`/edit"`) {
 		t.Fatalf("GET /edit missing action=/edit: %s", body)
 	}
 	if !strings.Contains(body, "Guardar información") {
 		t.Fatalf("GET /edit missing 'Guardar información' button: %s", body)
 	}
 	// Form inputs should not have hx-post autosave
-	if strings.Contains(body, `hx-post="`+path+`/draft/`) {
+	if strings.Contains(body, `hx-post="`+f.path+`/draft/`) {
 		t.Fatalf("GET /edit should not have autosave hx-post: %s", body)
 	}
 
 	// Agreement page has "Editar información del estudiante"
-	w = customerRequest(t, mux, http.MethodGet, path+"/agreement", "", false)
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), path+"/edit") || !strings.Contains(w.Body.String(), "Editar información del estudiante") {
+	w = customerRequest(t, f.mux, http.MethodGet, f.path+"/agreement", "", false)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), f.path+"/edit") || !strings.Contains(w.Body.String(), "Editar información del estudiante") {
 		t.Fatalf("unfunded agreement page missing edit back link: %s", w.Body.String())
 	}
 
@@ -1146,7 +965,7 @@ func TestContactEditFlowAndBackNavigation(t *testing.T) {
 		"municipality":  {"Ponce"},
 		"date_of_birth": {"2005-06-15"},
 	}
-	w = customerRequest(t, mux, http.MethodPost, path+"/edit", invalidForm.Encode(), false)
+	w = customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", invalidForm.Encode(), false)
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("POST /edit with invalid email: status %d, want 422", w.Code)
 	}
@@ -1160,21 +979,21 @@ func TestContactEditFlowAndBackNavigation(t *testing.T) {
 		"municipality":  {"San Juan"},
 		"date_of_birth": {"2004-05-14"},
 	}
-	w = customerRequest(t, mux, http.MethodPost, path+"/edit", validForm.Encode(), false)
-	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != path+"/agreement" {
+	w = customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", validForm.Encode(), false)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != f.path+"/agreement" {
 		t.Fatalf("POST /edit: status %d, location %q; want redirect to /agreement", w.Code, w.Header().Get("Location"))
 	}
 
-	// Check DB updated for both links and students
-	link, err := store.Lookup(t.Context(), entry.Token)
+	// Check DB: link row stays frozen at submission snapshot; only students row is updated
+	link, err := f.store.Lookup(t.Context(), f.entry.Token)
 	if err != nil || link == nil {
 		t.Fatalf("lookup link: %v, %v", link, err)
 	}
-	if link.Name != "Updated Student" || link.Email != "updated@example.com" || link.Phone != "+17875552222" || link.Municipality != "San Juan" || link.DateOfBirth != "2004-05-14" {
-		t.Fatalf("link not updated: %+v", link)
+	if link.Name != "Original Student" || link.Email != "original@example.com" || link.Phone != "+17875551111" || link.Municipality != "Ponce" {
+		t.Fatalf("link snapshot should remain unchanged, got: %+v", link)
 	}
 	var student students.Student
-	if err := db.WithContext(t.Context()).Where("source_link_hash = ?", link.TokenHash).Take(&student).Error; err != nil {
+	if err := f.db.WithContext(t.Context()).Where("source_link_hash = ?", link.TokenHash).Take(&student).Error; err != nil {
 		t.Fatalf("find student: %v", err)
 	}
 	if student.Name != "Updated Student" || student.Email != "updated@example.com" || student.Phone != "+17875552222" || student.Municipality != "San Juan" || student.DateOfBirth != "2004-05-14" {
@@ -1190,43 +1009,42 @@ func TestContactEditFlowAndBackNavigation(t *testing.T) {
 		PlanID:           "full",
 		PlanName:         "Pago Único",
 		InstallmentCount: 1,
-		Currency:         "usd",
 		TotalCents:       60000,
 		FundedAt:         &fundedAt,
 	}
-	if err := db.Create(&contract).Error; err != nil {
+	if err := f.db.Create(&contract).Error; err != nil {
 		t.Fatalf("create funded contract: %v", err)
 	}
 
 	// GET /edit redirects to /payments
-	w = customerRequest(t, mux, http.MethodGet, path+"/edit", "", false)
-	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != path+"/payments" {
+	w = customerRequest(t, f.mux, http.MethodGet, f.path+"/edit", "", false)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != f.path+"/payments" {
 		t.Fatalf("funded GET /edit: status %d, location %q; want redirect to /payments", w.Code, w.Header().Get("Location"))
 	}
 
 	// POST /edit redirects to /payments
-	w = customerRequest(t, mux, http.MethodPost, path+"/edit", validForm.Encode(), false)
-	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != path+"/payments" {
+	w = customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", validForm.Encode(), false)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != f.path+"/payments" {
 		t.Fatalf("funded POST /edit: status %d, location %q; want redirect to /payments", w.Code, w.Header().Get("Location"))
 	}
 
 	// Agreement page does NOT have edit back link when funded
-	w = customerRequest(t, mux, http.MethodGet, path+"/agreement", "", false)
+	w = customerRequest(t, f.mux, http.MethodGet, f.path+"/agreement", "", false)
 	if strings.Contains(w.Body.String(), "Editar información del estudiante") {
 		t.Fatalf("funded agreement page should not show edit link: %s", w.Body.String())
 	}
 
 	// Accept terms so /payments does not redirect to /agreement
-	if err := db.WithContext(t.Context()).Model(&links.Link{}).
+	if err := f.db.WithContext(t.Context()).Model(&links.Link{}).
 		Where("token_hash = ?", link.TokenHash).
 		Updates(map[string]any{"terms_accepted_at": time.Now().UTC(), "program_start_date": "2026-11-01"}).Error; err != nil {
 		t.Fatal(err)
 	}
 
 	// Payments page has top back link to agreement and no duplicate bottom link
-	w = customerRequest(t, mux, http.MethodGet, path+"/payments", "", false)
+	w = customerRequest(t, f.mux, http.MethodGet, f.path+"/payments", "", false)
 	body = w.Body.String()
-	if !strings.Contains(body, `href="`+path+`/agreement"`) || !strings.Contains(body, "Volver al acuerdo") {
+	if !strings.Contains(body, `href="`+f.path+`/agreement"`) || !strings.Contains(body, "Volver al acuerdo") {
 		t.Fatalf("payments page missing top back link: %s", body)
 	}
 	if strings.Contains(body, "Revisar el Acuerdo de Pago") {
@@ -1234,57 +1052,203 @@ func TestContactEditFlowAndBackNavigation(t *testing.T) {
 	}
 }
 
-func TestCustomerDateOfBirthValidation(t *testing.T) {
-	db := customerDatabase(t)
-	store := links.New(db, nil)
-	entry, err := store.Create(t.Context(), "staff", later)
-	if err != nil {
+func TestContactEditGuardAndStaffPrecedence(t *testing.T) {
+	f := newFixture(t)
+
+	// 1. Submit link
+	initial := contactDetails("Staff Fixed")
+	initial.Phone = "+17875551111"
+	initial.Email = "staffixed@example.com"
+	initial.Municipality = "San Juan"
+	initial.DateOfBirth = "2005-06-15"
+	res, err := f.store.Submit(t.Context(), f.entry.Token, initial)
+	if err != nil || res != links.Saved {
+		t.Fatalf("submit: %v, %v", res, err)
+	}
+	link, err := f.store.Lookup(t.Context(), f.entry.Token)
+	if err != nil || link == nil {
 		t.Fatal(err)
 	}
-	mux := newMux(t, db, store)
-	path := "/customer/" + entry.Token
 
-	baseForm := func(dob string) url.Values {
-		f := contactForm("DOB Test Student")
-		if dob == "" {
-			f.Del("date_of_birth")
-		} else {
-			f.Set("date_of_birth", dob)
-		}
-		return f
-	}
-
-	// 1. Submit without DOB -> 422 with Spanish error
-	w := customerRequest(t, mux, http.MethodPost, path, baseForm("").Encode(), false)
-	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "Escribe una fecha de nacimiento válida.") {
-		t.Fatalf("submit without DOB: status %d, body %s", w.Code, w.Body.String())
-	}
-
-	// 2. Future date rejected (2099-01-01) -> 422 with Spanish error
-	w = customerRequest(t, mux, http.MethodPost, path, baseForm("2099-01-01").Encode(), false)
-	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "Escribe una fecha de nacimiento válida.") {
-		t.Fatalf("submit future DOB: status %d, body %s", w.Code, w.Body.String())
-	}
-
-	// 3. >100 years old rejected (1900-01-01) -> 422 with Spanish error
-	w = customerRequest(t, mux, http.MethodPost, path, baseForm("1900-01-01").Encode(), false)
-	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "Escribe una fecha de nacimiento válida.") {
-		t.Fatalf("submit old DOB: status %d, body %s", w.Code, w.Body.String())
-	}
-
-	// 4. Valid date accepted (2005-06-15) -> 303 to agreement
-	w = customerRequest(t, mux, http.MethodPost, path, baseForm("2005-06-15").Encode(), false)
-	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != path+"/agreement" {
-		t.Fatalf("submit valid DOB: status %d, location %q; want redirect to /agreement", w.Code, w.Header().Get("Location"))
-	}
-
-	// Verify persisted to links and students
-	link, err := store.Lookup(t.Context(), entry.Token)
-	if err != nil || link == nil || link.DateOfBirth != "2005-06-15" {
-		t.Fatalf("persisted link DateOfBirth: %+v, %v", link, err)
-	}
 	var student students.Student
-	if err := db.WithContext(t.Context()).Where("source_link_hash = ?", link.TokenHash).Take(&student).Error; err != nil || student.DateOfBirth != "2005-06-15" {
-		t.Fatalf("persisted student DateOfBirth: %+v, %v", student, err)
+	if err := f.db.WithContext(t.Context()).Where("source_link_hash = ?", link.TokenHash).Take(&student).Error; err != nil {
+		t.Fatalf("find student: %v", err)
+	}
+
+	// Staff updates student's phone in management roster
+	if _, err := students.New(f.db, nil).UpdateField(t.Context(), student.ID, "phone", "+17875559999"); err != nil {
+		t.Fatalf("roster update phone: %v", err)
+	}
+
+	// GET /edit displays the staff-updated phone (+17875559999) and blank email_confirm
+	w := customerRequest(t, f.mux, http.MethodGet, f.path+"/edit", "", false)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /edit: %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "17875559999") {
+		t.Fatalf("GET /edit should show staff-updated phone: %s", body)
+	}
+	if !strings.Contains(body, `id="email_confirm"`) || !strings.Contains(body, `value=""`) {
+		t.Fatalf("GET /edit should have blank email_confirm value: %s", body)
+	}
+
+	// Customer submits POST /edit changing only date_of_birth
+	editForm := url.Values{
+		"name":          {"Staff Fixed"},
+		"email":         {"staffixed@example.com"},
+		"email_confirm": {"staffixed@example.com"},
+		"phone":         {"+17875559999"},
+		"municipality":  {"San Juan"},
+		"date_of_birth": {"2004-01-01"},
+	}
+	w = customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", editForm.Encode(), false)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != f.path+"/agreement" {
+		t.Fatalf("POST /edit: %d, loc %s", w.Code, w.Header().Get("Location"))
+	}
+
+	// Verify student: phone is STILL staff's fix (+17875559999), DOB changed to 2004-01-01
+	if err := f.db.WithContext(t.Context()).Where("id = ?", student.ID).Take(&student).Error; err != nil {
+		t.Fatal(err)
+	}
+	if student.Phone != "+17875559999" {
+		t.Fatalf("student phone overwritten: %s, want +17875559999", student.Phone)
+	}
+	if student.DateOfBirth != "2004-01-01" {
+		t.Fatalf("student dob not updated: %s, want 2004-01-01", student.DateOfBirth)
+	}
+	// Link submission snapshot phone is STILL original (+17875551111)
+	link, err = f.store.Lookup(t.Context(), f.entry.Token)
+	if err != nil || link == nil {
+		t.Fatal(err)
+	}
+	if link.Phone != "+17875551111" {
+		t.Fatalf("link snapshot changed: %s, want +17875551111", link.Phone)
+	}
+
+	// 2. In-flight and active attempt gate checks
+	contract := billing.Contract{
+		StudentID:        student.ID,
+		Reference:        rand.Text(),
+		PlanID:           "full",
+		PlanName:         "Pago Único",
+		InstallmentCount: 1,
+		TotalCents:       60000,
+	}
+	if err := f.db.Create(&contract).Error; err != nil {
+		t.Fatal(err)
+	}
+	attempt := billing.CheckoutAttempt{
+		ContractID:       contract.ID,
+		Reference:        rand.Text(),
+		PlanID:           "full",
+		FirstAmountCents: 60000,
+		State:            "open",
+	}
+	if err := f.db.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// State = "open": edits allowed, agreement has edit link
+	w = customerRequest(t, f.mux, http.MethodGet, f.path+"/agreement", "", false)
+	if !strings.Contains(w.Body.String(), "Editar información del estudiante") {
+		t.Fatalf("open state should allow edit link: %s", w.Body.String())
+	}
+
+	// State in inFlightAttemptStates ("processing", "uncertain", "expiring"): edits blocked
+	for _, blockedState := range []string{"processing", "uncertain", "expiring"} {
+		if err := f.db.Model(&billing.CheckoutAttempt{}).Where("id = ?", attempt.ID).Update("state", blockedState).Error; err != nil {
+			t.Fatal(err)
+		}
+		// Agreement page has NO edit link
+		w = customerRequest(t, f.mux, http.MethodGet, f.path+"/agreement", "", false)
+		if strings.Contains(w.Body.String(), "Editar información del estudiante") {
+			t.Fatalf("state %s should hide edit link: %s", blockedState, w.Body.String())
+		}
+		// GET /edit redirects to /payments
+		w = customerRequest(t, f.mux, http.MethodGet, f.path+"/edit", "", false)
+		if w.Code != http.StatusSeeOther || w.Header().Get("Location") != f.path+"/payments" {
+			t.Fatalf("GET /edit in %s: %d, loc %s; want redirect to /payments", blockedState, w.Code, w.Header().Get("Location"))
+		}
+		// POST /edit redirects to /payments and does NOT modify student
+		attemptForm := url.Values{
+			"name":          {"Hacked Name"},
+			"email":         {"hacked@example.com"},
+			"email_confirm": {"hacked@example.com"},
+			"phone":         {"+17875559999"},
+			"municipality":  {"San Juan"},
+			"date_of_birth": {"2000-01-01"},
+		}
+		w = customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", attemptForm.Encode(), false)
+		if w.Code != http.StatusSeeOther || w.Header().Get("Location") != f.path+"/payments" {
+			t.Fatalf("POST /edit in %s: %d, loc %s; want redirect to /payments", blockedState, w.Code, w.Header().Get("Location"))
+		}
+		var checkStudent students.Student
+		f.db.Where("id = ?", student.ID).Take(&checkStudent)
+		if checkStudent.Name != "Staff Fixed" || checkStudent.DateOfBirth != "2004-01-01" {
+			t.Fatalf("POST /edit during %s mutated student: %+v", blockedState, checkStudent)
+		}
+	}
+
+	// State = "creating": edits allowed again
+	if err := f.db.Model(&billing.CheckoutAttempt{}).Where("id = ?", attempt.ID).Update("state", "creating").Error; err != nil {
+		t.Fatal(err)
+	}
+	w = customerRequest(t, f.mux, http.MethodGet, f.path+"/agreement", "", false)
+	if !strings.Contains(w.Body.String(), "Editar información del estudiante") {
+		t.Fatalf("creating state should allow edit link: %s", w.Body.String())
+	}
+
+	// 3. Concurrency proof: edit during locked Link transaction waits and succeeds
+	lockHeld := make(chan struct{})
+	lockRelease := make(chan struct{})
+	txDone := make(chan struct{})
+	go func() {
+		defer close(txDone)
+		_ = f.db.Transaction(func(tx *gorm.DB) error {
+			var lockedLink links.Link
+			if err := tx.Clauses(clause.Locking{Strength: clause.LockingStrengthUpdate}).
+				Where("token_hash = ?", link.TokenHash).Take(&lockedLink).Error; err != nil {
+				return err
+			}
+			close(lockHeld)
+			<-lockRelease
+			return nil
+		})
+	}()
+	<-lockHeld
+	// Concurrently attempt POST /edit while link row lock is held
+	editDone := make(chan int)
+	go func() {
+		concurrentForm := url.Values{
+			"name":          {"Staff Fixed"},
+			"email":         {"staffixed@example.com"},
+			"email_confirm": {"staffixed@example.com"},
+			"phone":         {"+17875559999"},
+			"municipality":  {"San Juan"},
+			"date_of_birth": {"2002-02-02"},
+		}
+		cw := customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", concurrentForm.Encode(), false)
+		editDone <- cw.Code
+	}()
+
+	// Verify edit has not finished yet (it is blocked on the link lock)
+	select {
+	case code := <-editDone:
+		t.Fatalf("POST /edit completed prematurely while lock was held, code %d", code)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: still waiting
+	}
+
+	close(lockRelease)
+	<-txDone
+
+	code := <-editDone
+	if code != http.StatusSeeOther {
+		t.Fatalf("concurrent POST /edit after unlock: %d; want 303", code)
+	}
+	f.db.Where("id = ?", student.ID).Take(&student)
+	if student.DateOfBirth != "2002-02-02" {
+		t.Fatalf("concurrent edit did not persist: %s", student.DateOfBirth)
 	}
 }

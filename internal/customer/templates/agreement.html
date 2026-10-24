@@ -1,6 +1,6 @@
 {{define "agreement"}}
 <article class="payment-agreement" aria-labelledby="agreement-title">
-  {{if not .Funded}}<a class="customer-back-link" href="{{.Path}}/edit">{{template "icon-arrow-left"}}Editar información del estudiante</a>{{end}}
+  {{if .ContactEditable}}<a class="customer-back-link" href="{{.Path}}/edit">{{template "icon-arrow-left"}}Editar información del estudiante</a>{{end}}
   <header class="customer-heading">
     <h1 id="agreement-title">Revisa y acepta el acuerdo</h1>
     <p>Aquí se presenta la información y los términos para la separación de su espacio en el Programa de preparación para el ASVAB, ofrecido por Masterminds Programa ASVAB.</p>

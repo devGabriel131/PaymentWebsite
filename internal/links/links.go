@@ -30,8 +30,6 @@ type Link struct {
 	// TermsAcceptedAt and ProgramStartDate retain the agreement first accepted.
 	TermsAcceptedAt  *time.Time `gorm:"type:timestamptz"`
 	ProgramStartDate string     `gorm:"type:text;not null;default:''"`
-	// PaymentPlan records a local choice, never payment completion.
-	PaymentPlan string `gorm:"type:text;not null;default:''"`
 	// CanceledAt revokes an unfinished token but keeps its draft for staff.
 	CanceledAt *time.Time
 	// ExpiresAt starts with the configured lifetime; completion replaces it
@@ -89,11 +87,6 @@ func (e Entry) Cancelable() bool {
 	return e.Status == NotOpened || e.Status == Opened || e.Status == InProgress
 }
 
-// AccessExpired reports whether the token's access deadline has passed.
-func (e Entry) AccessExpired() bool {
-	return !time.Now().Before(e.ExpiresAt)
-}
-
 // Archived reports whether completion is at least 24 hours old at now.
 func (e Entry) Archived(now time.Time) bool {
 	return e.Status == Finished && e.SubmittedAt != nil && !e.SubmittedAt.After(now.Add(-24*time.Hour))
@@ -117,7 +110,7 @@ func (l Link) entry(now time.Time) Entry {
 		e.Status = Finished
 	case !now.Before(l.ExpiresAt):
 		e.Status = Expired
-	case l.Name != "" || l.Email != "" || l.Phone != "" || l.Municipality != "" || l.DateOfBirth != "":
+	case l.Details != (students.Details{}):
 		e.Status = InProgress
 	case l.OpenedAt != nil:
 		e.Status = Opened
@@ -262,34 +255,6 @@ SELECT token_hash, name, email, phone, municipality, date_of_birth, submitted_at
 	return s.saveResult(ctx, digest, result, Unavailable)
 }
 
-// UpdateContact rewrites the contact details of an already-submitted link and its student together.
-// Submission time, expiry and accepted terms are untouched; unusable or unsubmitted links return Unavailable.
-func (s *Store) UpdateContact(ctx context.Context, token string, details students.Details) (SaveResult, error) {
-	digest, ok := tokenDigest(token)
-	if !ok {
-		return Unavailable, nil
-	}
-	contact := map[string]any{
-		"name": details.Name, "email": details.Email, "phone": details.Phone, "municipality": details.Municipality,
-		"date_of_birth": details.DateOfBirth,
-	}
-	saved := false
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&Link{}).
-			Where("token_hash = ? AND canceled_at IS NULL AND expires_at > now() AND submitted_at IS NOT NULL", digest).
-			Updates(contact)
-		if result.Error != nil || result.RowsAffected == 0 {
-			return result.Error
-		}
-		saved = true
-		return tx.Model(&students.Student{}).Where("source_link_hash = ?", digest).Updates(contact).Error
-	})
-	if err != nil || !saved {
-		return Unavailable, err
-	}
-	s.changed()
-	return Saved, nil
-}
 
 // AcceptTerms snapshots the displayed start date once, after contact submission.
 // Accepted replays preserve the original agreement even when settings change.
@@ -405,10 +370,14 @@ func (s *Store) active(ctx context.Context, digest []byte) *gorm.DB {
 	return s.usable(ctx).Where(&Link{TokenHash: digest})
 }
 
-// usable scopes a query to tokens that still open the enrollment flow:
+// Usable scopes a query to tokens that still open the enrollment flow:
 // neither canceled nor past their access deadline.
+func Usable(db *gorm.DB) *gorm.DB {
+	return db.Where("canceled_at IS NULL AND expires_at > now()")
+}
+
 func (s *Store) usable(ctx context.Context) *gorm.DB {
-	return s.db.WithContext(ctx).Model(&Link{}).Where("canceled_at IS NULL AND expires_at > now()")
+	return s.db.WithContext(ctx).Model(&Link{}).Scopes(Usable)
 }
 
 // tokenDigest rejects tokens of the wrong length before hashing.

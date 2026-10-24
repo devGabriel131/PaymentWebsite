@@ -11,22 +11,36 @@
 
 {{/* The polled block: HTMX swaps it whole, and only the pending variant carries a trigger. */}}
 {{define "payment-return-status"}}
+{{if .Error}}
+{{if .ReturnStopPoll}}
+<div id="payment-return-status" class="payment-saved" data-status="pending" role="status">
+  <span class="payment-return-icon">{{template "icon-refresh"}}</span>
+  <p><strong>No pudimos confirmar el estado de tu pago.</strong> Actualiza esta página en unos minutos.</p>
+</div>
+{{else}}
+<div id="payment-return-status" class="payment-saved" data-status="pending" role="status" hx-get="/payments/return?session_id={{urlquery .ReturnSessionID}}&amp;polls={{.ReturnPollsNext}}" hx-trigger="every 1.5s" hx-swap="outerHTML">
+  <div class="payment-spinner" aria-hidden="true"></div>
+  <p><strong>En proceso.</strong> Todavía estamos confirmando tu pago.</p>
+  <noscript><meta http-equiv="refresh" content="3;url=/payments/return?session_id={{urlquery .ReturnSessionID}}&amp;polls={{.ReturnPollsNext}}"></noscript>
+</div>
+{{end}}
+{{else}}
 {{with .Return}}
 {{if eq .Status "paid"}}
 <div id="payment-return-status" class="payment-saved" data-status="paid" role="status">
   <span class="payment-return-icon">{{template "icon-check"}}</span>
-  <p><strong>Pagado.</strong> Confirmamos tu pago inicial de <strong>{{money64 .AmountCents}}</strong>. Gracias.</p>
+  <p><strong>Pagado.</strong> Confirmamos tu pago inicial de <strong>{{money .AmountCents}}</strong>. Gracias.</p>
 </div>
 {{else if eq .Status "pending"}}
 {{if $.ReturnStopPoll}}
 <div id="payment-return-status" class="payment-saved" data-status="pending" role="status">
   <span class="payment-return-icon">{{template "icon-refresh"}}</span>
-  <p><strong>En proceso.</strong> Todavía estamos confirmando tu pago{{if .AmountCents}} de <strong>{{money64 .AmountCents}}</strong>{{end}}. Aún no está registrado como pagado; actualiza esta página en unos minutos.</p>
+  <p><strong>En proceso.</strong> Todavía estamos confirmando tu pago{{if .AmountCents}} de <strong>{{money .AmountCents}}</strong>{{end}}. Aún no está registrado como pagado; actualiza esta página en unos minutos.</p>
 </div>
 {{else}}
 <div id="payment-return-status" class="payment-saved" data-status="pending" role="status" hx-get="/payments/return?session_id={{urlquery $.ReturnSessionID}}&amp;polls={{$.ReturnPollsNext}}" hx-trigger="every 1.5s" hx-swap="outerHTML">
   <div class="payment-spinner" aria-hidden="true"></div>
-  <p><strong>En proceso.</strong> Todavía estamos confirmando tu pago{{if .AmountCents}} de <strong>{{money64 .AmountCents}}</strong>{{end}}.</p>
+  <p><strong>En proceso.</strong> Todavía estamos confirmando tu pago{{if .AmountCents}} de <strong>{{money .AmountCents}}</strong>{{end}}.</p>
   <noscript><meta http-equiv="refresh" content="3;url=/payments/return?session_id={{urlquery $.ReturnSessionID}}&amp;polls={{$.ReturnPollsNext}}"></noscript>
 </div>
 {{end}}
@@ -35,6 +49,7 @@
   <span class="payment-return-icon">{{template "icon-alert"}}</span>
   <p><strong>No completado.</strong> Este intento de pago no se completó. Para intentarlo de nuevo, vuelve a abrir tu enlace de matrícula.</p>
 </div>
+{{end}}
 {{end}}
 {{end}}
 {{end}}

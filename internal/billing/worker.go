@@ -59,46 +59,46 @@ type lease struct {
 // Run drains due webhook events, then due contracts, every workerTick or as soon as a webhook is stored, until ctx ends.
 func (s *Service) Run(ctx context.Context) {
 	ctx = logging.WithOperation(ctx, "billing_worker")
-	s.drainEvents(ctx)
-	s.drainContracts(ctx)
 	ticker := time.NewTicker(workerTick)
 	defer ticker.Stop()
 	for {
+		s.drain(ctx)
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.drainEvents(ctx)
-			s.drainContracts(ctx)
 		case <-s.wake:
 			ticker.Reset(workerTick)
-			s.drainEvents(ctx)
-			s.drainContracts(ctx)
 		}
 	}
 }
 
-// claim leases up to limit due rows with FOR UPDATE SKIP LOCKED in one short transaction;
-// provider work happens after it commits.
-func claim[T any](ctx context.Context, db *gorm.DB, due, order string, limit int, id func(T) any) (rows []T, token string, err error) {
+// drain runs one worker pass: due events, then due contracts.
+func (s *Service) drain(ctx context.Context) {
+	s.drainEvents(ctx)
+	s.drainContracts(ctx)
+}
+
+// claimEvents leases up to eventBatch due events with FOR UPDATE SKIP LOCKED in one short
+// transaction; provider work happens after it commits.
+func (s *Service) claimEvents(ctx context.Context) (events []WebhookEvent, token string, err error) {
 	token = rand.Text()
-	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Clauses(skipLocked).Where(due).Order(order).Limit(limit).Find(&rows).Error; err != nil || len(rows) == 0 {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(skipLocked).Where(eventsDue).Order("created_at ASC").Limit(eventBatch).Find(&events).Error; err != nil || len(events) == 0 {
 			return err
 		}
-		ids := make([]any, len(rows))
-		for i, row := range rows {
-			ids[i] = id(row)
+		ids := make([]string, len(events))
+		for i, e := range events {
+			ids[i] = e.ID
 		}
-		var model T
-		return tx.Model(&model).Where("id IN ?", ids).
+		return tx.Model(&WebhookEvent{}).Where("id IN ?", ids).
 			Updates(map[string]any{"lease_token": token, "lease_expires_at": gorm.Expr(leaseSQL)}).Error
 	})
-	return rows, token, err
+	return events, token, err
 }
 
 func (s *Service) drainEvents(ctx context.Context) {
-	events, token, err := claim(ctx, s.db, eventsDue, "received_at ASC", eventBatch, func(e WebhookEvent) any { return e.ID })
+	events, token, err := s.claimEvents(ctx)
 	if err != nil {
 		s.logFailure(ctx, "event_claim", "", err)
 		return
@@ -112,8 +112,8 @@ func (s *Service) drainEvents(ctx context.Context) {
 }
 
 func (s *Service) drainContracts(ctx context.Context) {
-	due, token, err := claim(ctx, s.db, contractsDue, "next_sync_at ASC NULLS FIRST", contractBatch, func(c Contract) any { return c.ID })
-	if err != nil {
+	var due []Contract
+	if err := s.db.WithContext(ctx).Where(contractsDue).Order("next_sync_at ASC NULLS FIRST").Limit(contractBatch).Find(&due).Error; err != nil {
 		s.logFailure(ctx, "contract_claim", "", err)
 		return
 	}
@@ -121,7 +121,7 @@ func (s *Service) drainContracts(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		s.syncContract(ctx, c, token)
+		s.syncContract(ctx, c)
 	}
 }
 
@@ -156,7 +156,6 @@ func (s *Service) processEvent(ctx context.Context, e WebhookEvent, token string
 	case err == nil:
 		updates["processed_at"] = gorm.Expr("now()")
 		updates["retry_at"] = nil
-		updates["error_classification"] = nil
 	case ctx.Err() != nil:
 		// Shutting down: hand the event back untouched.
 	case errors.Is(err, errContractBusy):
@@ -164,7 +163,6 @@ func (s *Service) processEvent(ctx context.Context, e WebhookEvent, token string
 	default:
 		updates["retry_count"] = e.RetryCount + 1
 		updates["retry_at"] = gorm.Expr("now() + make_interval(secs => ?)", backoff(e.RetryCount+1).Seconds())
-		updates["error_classification"] = classify(err)
 		s.logFailure(ctx, e.EventType, e.ID, err)
 	}
 	saveCtx, cancel := persistCtx(ctx)
@@ -177,25 +175,6 @@ func (s *Service) processEvent(ctx context.Context, e WebhookEvent, token string
 // backoff doubles from retryMin to retryMax.
 func backoff(attempt int) time.Duration {
 	return min(retryMax, retryMin<<min(attempt-1, 10))
-}
-
-// classify reduces an error to a bounded label safe to persist.
-func classify(err error) string {
-	var stripeErr *stripe.Error
-	switch {
-	case errors.Is(err, errLeaseLost):
-		return "lease_lost"
-	case errors.Is(err, errNotReady):
-		return "provider_not_ready"
-	case errors.As(err, &stripeErr):
-		if outcomeUnknown(err) {
-			return "provider_unavailable"
-		}
-		return "provider_rejected"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "timeout"
-	}
-	return "internal"
 }
 
 func isNotFound(err error) bool {
@@ -458,7 +437,7 @@ func (s *Service) syncAttempt(ctx context.Context, l lease, attemptID uint64, se
 	if a.StripeSessionID == nil {
 		// Recovering a Session whose ID was never recorded: only an exact same-Customer match binds.
 		if !sessionMatches(c, a, session) {
-			return s.mark(ctx, l, ReviewConfigurationMismatch, true)
+			return s.mark(ctx, l, reviewConfigurationMismatch, true)
 		}
 		err := s.leased(ctx, l, func(tx *gorm.DB, _ *Contract) error {
 			return tx.Model(&CheckoutAttempt{}).Where("id = ?", a.ID).Update("stripe_session_id", session.ID).Error
@@ -491,11 +470,10 @@ func (s *Service) syncAttempt(ctx context.Context, l lease, attemptID uint64, se
 			return tx.Model(&CheckoutAttempt{}).Where("id = ? AND state = ?", a.ID, a.State).Updates(map[string]any{
 				"state":        "open",
 				"checkout_url": session.URL,
-				"expires_at":   time.Unix(session.ExpiresAt, 0).UTC(),
 			}).Error
 		})
 	case a.State == "expiring":
-		_, _, err := s.expireAttempt(ctx, &a) // finishes an abandoned plan's Expire call
+		_, err := s.expireAttempt(ctx, &a) // finishes an abandoned plan's Expire call
 		return err
 	}
 	return nil
@@ -541,7 +519,7 @@ func (s *Service) resumeCreate(ctx context.Context, l lease, a CheckoutAttempt) 
 		}
 		return s.syncAttempt(ctx, l, a.ID, session)
 	case len(found) > 1:
-		return s.mark(ctx, l, ReviewUnresolvedProviderCreate, true)
+		return s.mark(ctx, l, reviewUnresolvedProviderCreate, true)
 	case time.Since(a.CreationStartedAt) < checkoutKeyRetention:
 		var first Obligation
 		if err := require(firstRow(db, &first, "contract_id = ? AND kind = 'tuition' AND number = 1", c.ID)); err != nil {
@@ -587,7 +565,7 @@ func (s *Service) fund(ctx context.Context, l lease, c Contract, a CheckoutAttem
 		return errors.Join(s.moveAttempt(ctx, l, a.ID, "processing"), errNotReady)
 	}
 	if inv.AmountPaid != a.FirstAmountCents || !invoiceMatches(first, inv) {
-		return errors.Join(s.moveAttempt(ctx, l, a.ID, "processing"), s.mark(ctx, l, ReviewInvoiceMismatch, true))
+		return errors.Join(s.moveAttempt(ctx, l, a.ID, "processing"), s.mark(ctx, l, reviewInvoiceMismatch, true))
 	}
 	fundedAt := time.Unix(inv.StatusTransitions.PaidAt, 0).UTC()
 
@@ -606,7 +584,7 @@ func (s *Service) fund(ctx context.Context, l lease, c Contract, a CheckoutAttem
 		return errNotReady
 	}
 	if initial.AmountPaid != a.FirstAmountCents {
-		return errors.Join(s.moveAttempt(ctx, l, a.ID, "processing"), s.mark(ctx, l, ReviewInvoiceMismatch, true))
+		return errors.Join(s.moveAttempt(ctx, l, a.ID, "processing"), s.mark(ctx, l, reviewInvoiceMismatch, true))
 	}
 	pay, err := s.paymentFrom(ctx, c.ID, intentID, fundedAt)
 	if err != nil {
@@ -623,13 +601,11 @@ func (s *Service) fund(ctx context.Context, l lease, c Contract, a CheckoutAttem
 			return err
 		}
 		// Dates come from the contract's frozen plan and persisted amounts, never today's registry.
-		amounts := make([]int, len(obligations))
+		amounts := make([]int64, len(obligations))
 		for i, o := range obligations {
-			amounts[i] = int(o.AmountCents)
+			amounts[i] = o.AmountCents
 		}
 		schedule := payments.Plan{ID: cur.PlanID, Name: cur.PlanName, Amounts: amounts}.Schedule(fundedAt)
-		// Sync no later than the nearest installment date, and at least daily.
-		nextSync := fundedAt.Add(auditEvery)
 		for i, o := range obligations {
 			updates := map[string]any{"due_at": schedule[i].Date, "amount_remaining_cents": o.AmountCents}
 			if i == 0 {
@@ -641,8 +617,6 @@ func (s *Service) fund(ctx context.Context, l lease, c Contract, a CheckoutAttem
 					"amount_remaining_cents": 0,
 					"first_settled_at":       fundedAt,
 				}
-			} else if schedule[i].Date.Before(nextSync) {
-				nextSync = schedule[i].Date
 			}
 			if err := tx.Model(&Obligation{}).Where("id = ?", o.ID).Updates(updates).Error; err != nil {
 				return err
@@ -651,24 +625,16 @@ func (s *Service) fund(ctx context.Context, l lease, c Contract, a CheckoutAttem
 		if _, err := savePayment(tx, pay); err != nil {
 			return err
 		}
-		alloc := allocationFor(initial, first.ID)
-		if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&alloc).Error; err != nil {
+		if err := tx.Model(&CheckoutAttempt{}).Where("id = ?", a.ID).Update("state", "paid").Error; err != nil {
 			return err
 		}
-		if err := tx.Model(&CheckoutAttempt{}).Where("id = ?", a.ID).Updates(map[string]any{
-			"state":                    "paid",
-			"stripe_session_id":        session.ID,
-			"stripe_payment_intent_id": intentID,
-		}).Error; err != nil {
-			return err
-		}
-		for _, reason := range []string{ReviewInvoiceMismatch, ReviewConfigurationMismatch} {
+		for _, reason := range []string{reviewInvoiceMismatch, reviewConfigurationMismatch} {
 			if _, err := markContract(tx, cur, reason, false); err != nil {
 				return err
 			}
 		}
 		funded = true
-		return tx.Model(&Contract{}).Where("id = ?", cur.ID).Updates(map[string]any{"funded_at": fundedAt, "next_sync_at": nextSync}).Error
+		return tx.Model(&Contract{}).Where("id = ?", cur.ID).Updates(map[string]any{"funded_at": fundedAt, "next_sync_at": nil}).Error
 	})
 	if err != nil {
 		return err
@@ -694,21 +660,6 @@ func (s *Service) paidInvoicePayments(ctx context.Context, invoiceID string) ([]
 	return paid, nil
 }
 
-// allocationFor records how one paid InvoicePayment settles an obligation.
-func allocationFor(ip *stripe.InvoicePayment, obligationID uint64) Allocation {
-	a := Allocation{
-		ID:               ip.ID,
-		ObligationID:     obligationID,
-		AllocationStatus: ip.Status,
-		AllocationType:   string(ip.Payment.Type),
-		AmountCents:      ip.AmountPaid,
-	}
-	if pi := ip.Payment.PaymentIntent; pi != nil {
-		a.PaymentID = &pi.ID
-	}
-	return a
-}
-
 func paidAt(ip *stripe.InvoicePayment) time.Time {
 	if t := ip.StatusTransitions; t != nil && t.PaidAt > 0 {
 		return time.Unix(t.PaidAt, 0).UTC()
@@ -730,7 +681,7 @@ func (s *Service) paymentFrom(ctx context.Context, contractID uint64, intentID s
 	if pi.Status != stripe.PaymentIntentStatusSucceeded {
 		return Payment{}, errNotReady
 	}
-	p := Payment{ID: pi.ID, ContractID: contractID, Currency: "usd", GrossReceivedCents: pi.AmountReceived, PaymentTime: at}
+	p := Payment{ID: pi.ID, ContractID: contractID, GrossReceivedCents: pi.AmountReceived, PaymentTime: at}
 	ch := pi.LatestCharge
 	if ch == nil || ch.ID == "" {
 		return p, nil
@@ -818,7 +769,7 @@ func (s *Service) syncPayment(ctx context.Context, l lease, id string) error {
 	if err != nil {
 		return err
 	}
-	return s.store(ctx, l, nil, []Payment{pay}, nil)
+	return s.store(ctx, l, nil, []Payment{pay})
 }
 
 // ---- invoices
@@ -865,7 +816,7 @@ func invoiceMatches(o Obligation, inv *stripe.Invoice) bool {
 // reviewFor keeps a reason owned by another workflow; otherwise the invoice-derived one wins.
 func reviewFor(o Obligation, computed string) string {
 	switch current := deref(o.ReviewReason); current {
-	case "", ReviewInvoiceMismatch, ReviewMissingInvoice:
+	case "", reviewInvoiceMismatch, reviewMissingInvoice:
 		return computed
 	default:
 		return current
@@ -892,7 +843,7 @@ func invoiceStateOf(o Obligation, inv *stripe.Invoice) (st invoiceState, settled
 			settledAt = time.Unix(inv.StatusTransitions.PaidAt, 0).UTC()
 		}
 		if o.CollectionDisposition == "cancel" {
-			computed = ReviewPaymentReview // a corrected fee was collected anyway: staff refund review
+			computed = reviewPaymentReview // a corrected fee was collected anyway: staff refund review
 		}
 	case stripe.InvoiceStatusOpen:
 		st.Remaining = inv.AmountRemaining
@@ -900,11 +851,11 @@ func invoiceStateOf(o Obligation, inv *stripe.Invoice) (st invoiceState, settled
 	default: // void, uncollectible
 		if o.CollectionDisposition != "cancel" { // a corrected fee is meant to be void
 			st.Remaining = max(0, o.AmountCents-st.Paid-st.Other)
-			computed = ReviewInvoiceMismatch
+			computed = reviewInvoiceMismatch
 		}
 	}
 	if !invoiceMatches(o, inv) {
-		computed = ReviewInvoiceMismatch
+		computed = reviewInvoiceMismatch
 	}
 	st.Review = reviewFor(o, computed)
 	return st, settledAt
@@ -925,11 +876,11 @@ func (s *Service) syncInvoice(ctx context.Context, l lease, obligationID uint64)
 	if isNotFound(err) || (err == nil && inv.Deleted) {
 		// A known invoice that vanished is reviewed, never replaced.
 		st := o.state()
-		st.Status, st.Review = "deleted", reviewFor(o, ReviewMissingInvoice)
+		st.Status, st.Review = "deleted", reviewFor(o, reviewMissingInvoice)
 		if o.CollectionDisposition == "cancel" { // a corrected fee's invoice is meant to vanish
 			st.Review, st.Remaining = reviewFor(o, ""), 0
 		}
-		return s.store(ctx, l, &invoiceRead{o: o, st: st}, nil, nil)
+		return s.store(ctx, l, &invoiceRead{o: o, st: st}, nil)
 	}
 	if err != nil {
 		return err
@@ -939,10 +890,8 @@ func (s *Service) syncInvoice(ctx context.Context, l lease, obligationID uint64)
 		return err
 	}
 	var pays []Payment
-	var allocs []Allocation
 	seen := map[string]bool{}
 	for _, ip := range paid {
-		allocs = append(allocs, allocationFor(ip, o.ID))
 		pi := ip.Payment.PaymentIntent
 		if pi == nil || seen[pi.ID] {
 			continue
@@ -955,7 +904,7 @@ func (s *Service) syncInvoice(ctx context.Context, l lease, obligationID uint64)
 		pays = append(pays, pay)
 	}
 	st, settledAt := invoiceStateOf(o, inv)
-	if err := s.store(ctx, l, &invoiceRead{o, st, settledAt}, pays, allocs); err != nil {
+	if err := s.store(ctx, l, &invoiceRead{o, st, settledAt}, pays); err != nil {
 		return err
 	}
 	// The review is persisted first; only then stop an unexpected invoice from collecting.
@@ -975,7 +924,7 @@ func (s *Service) holdInvoice(ctx context.Context, l lease, id string) error {
 
 // store applies one provider read under the lease in a single transaction and announces
 // only changes a viewer can see. read is nil for payment-only refreshes.
-func (s *Service) store(ctx context.Context, l lease, read *invoiceRead, pays []Payment, allocs []Allocation) error {
+func (s *Service) store(ctx context.Context, l lease, read *invoiceRead, pays []Payment) error {
 	var changed bool
 	var obligationRef, contractRef string
 	err := s.leased(ctx, l, func(tx *gorm.DB, c *Contract) error {
@@ -1008,13 +957,6 @@ func (s *Service) store(ctx context.Context, l lease, read *invoiceRead, pays []
 			}
 			changed = changed || did
 		}
-		for _, a := range allocs {
-			res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&a)
-			if res.Error != nil {
-				return res.Error
-			}
-			changed = changed || res.RowsAffected > 0
-		}
 		// Refunds, disputes and fraud warnings are surfaced for staff; nothing is rebilled or refunded.
 		var flagged int64
 		if err := tx.Model(&Payment{}).
@@ -1022,7 +964,7 @@ func (s *Service) store(ctx context.Context, l lease, read *invoiceRead, pays []
 			Count(&flagged).Error; err != nil {
 			return err
 		}
-		did, err := markContract(tx, c, ReviewPaymentReview, flagged > 0)
+		did, err := markContract(tx, c, reviewPaymentReview, flagged > 0)
 		changed = changed || did
 		return err
 	})
@@ -1212,7 +1154,7 @@ func (s *Service) adopt(ctx context.Context, l lease, o *Obligation, found []str
 	case 1:
 		return found[0], nil
 	}
-	return "", s.reviewObligation(ctx, l, o, ReviewUnresolvedProviderCreate)
+	return "", s.reviewObligation(ctx, l, o, reviewUnresolvedProviderCreate)
 }
 
 // arm is stage three: validate the exact quote, then let Stripe finalize on the due date.
@@ -1221,13 +1163,13 @@ func (s *Service) adopt(ctx context.Context, l lease, o *Obligation, found []str
 func (s *Service) arm(ctx context.Context, l lease, o *Obligation) error {
 	inv, err := s.client.V1Invoices.Retrieve(ctx, *o.StripeInvoiceID, nil)
 	if isNotFound(err) {
-		return s.reviewObligation(ctx, l, o, ReviewMissingInvoice)
+		return s.reviewObligation(ctx, l, o, reviewMissingInvoice)
 	}
 	if err != nil {
 		return err
 	}
 	if !invoiceMatches(*o, inv) || (o.Kind == "reinstatement" && inv.Total != o.AmountCents) {
-		if err := s.reviewObligation(ctx, l, o, ReviewInvoiceMismatch); !errors.Is(err, errReviewed) {
+		if err := s.reviewObligation(ctx, l, o, reviewInvoiceMismatch); !errors.Is(err, errReviewed) {
 			return err
 		}
 		if inv.AutoAdvance {
@@ -1331,7 +1273,7 @@ func (s *Service) ensureDefaultPaymentMethod(ctx context.Context, l lease, c Con
 		return false, err
 	}
 	if is := customer.InvoiceSettings; is != nil && is.DefaultPaymentMethod != nil && is.DefaultPaymentMethod.ID != "" {
-		return true, s.mark(ctx, l, ReviewUnsupportedPaymentMethod, false)
+		return true, s.mark(ctx, l, reviewUnsupportedPaymentMethod, false)
 	}
 	var first Payment
 	if err := require(firstRow(s.db.WithContext(ctx).Order("payment_time ASC"), &first, "contract_id = ?", c.ID)); err != nil {
@@ -1342,14 +1284,14 @@ func (s *Service) ensureDefaultPaymentMethod(ctx context.Context, l lease, c Con
 		return false, err
 	}
 	if pi.PaymentMethod == nil || pi.PaymentMethod.ID == "" {
-		return false, s.mark(ctx, l, ReviewUnsupportedPaymentMethod, true)
+		return false, s.mark(ctx, l, reviewUnsupportedPaymentMethod, true)
 	}
 	pm, err := s.client.V1PaymentMethods.Retrieve(ctx, pi.PaymentMethod.ID, nil)
 	if err != nil {
 		return false, err
 	}
 	if pm.Type != stripe.PaymentMethodTypeCard || pm.Customer == nil || pm.Customer.ID != *c.StripeCustomerID {
-		return false, s.mark(ctx, l, ReviewUnsupportedPaymentMethod, true)
+		return false, s.mark(ctx, l, reviewUnsupportedPaymentMethod, true)
 	}
 	if err := s.renew(ctx, l); err != nil {
 		return false, err
@@ -1361,43 +1303,30 @@ func (s *Service) ensureDefaultPaymentMethod(ctx context.Context, l lease, c Con
 	if _, err := s.client.V1Customers.Update(ctx, *c.StripeCustomerID, params); err != nil {
 		return false, err
 	}
-	return true, s.mark(ctx, l, ReviewUnsupportedPaymentMethod, false)
+	return true, s.mark(ctx, l, reviewUnsupportedPaymentMethod, false)
 }
 
 // ---- contract reconciliation
 
-// syncContract reconciles one claimed contract, then releases it with its next due time.
-func (s *Service) syncContract(ctx context.Context, c Contract, token string) {
-	l := lease{id: c.ID, token: token}
-	// Contracts later in a batch may have waited long; renew before the provider calls.
-	renewed := s.db.WithContext(ctx).Model(&Contract{}).Where("id = ? AND lease_token = ?", c.ID, token).
-		Update("lease_expires_at", gorm.Expr(leaseSQL))
-	if renewed.Error != nil {
-		s.logFailure(ctx, "contract_lease", c.Reference, renewed.Error)
-		return
-	}
-	if renewed.RowsAffected == 0 {
-		return
-	}
-	err := s.reconcileContract(ctx, l)
-
-	saveCtx, cancel := persistCtx(ctx)
-	defer cancel()
-	now := time.Now().UTC()
-	updates := map[string]any{"lease_token": nil, "lease_expires_at": nil}
-	if err == nil {
-		var next time.Time
-		if next, err = s.nextSync(saveCtx, c.ID, now); err == nil {
-			updates["last_synced_at"], updates["next_sync_at"] = now, next
+// syncContract reconciles one due contract under its workflow lease.
+func (s *Service) syncContract(ctx context.Context, c Contract) {
+	err := s.withContract(ctx, c.ID, func(l lease) error {
+		err := s.reconcileContract(ctx, l)
+		if err == nil {
+			err = s.markSynced(ctx, l)
 		}
-	}
-	if err != nil && ctx.Err() == nil {
-		updates["next_sync_at"] = now.Add(contractRetry)
+		if err != nil && ctx.Err() == nil { // retry later; token-guarded so a lost lease writes nothing
+			saveCtx, cancel := persistCtx(ctx)
+			defer cancel()
+			if res := s.db.WithContext(saveCtx).Model(&Contract{}).Where("id = ? AND lease_token = ?", l.id, l.token).
+				Update("next_sync_at", time.Now().UTC().Add(contractRetry)); res.Error != nil {
+				s.logFailure(ctx, "contract_retry", c.Reference, res.Error)
+			}
+		}
+		return err
+	})
+	if err != nil && !errors.Is(err, errContractBusy) && ctx.Err() == nil {
 		s.logFailure(ctx, "contract_sync", c.Reference, err)
-	}
-	err = s.db.WithContext(saveCtx).Model(&Contract{}).Where("id = ? AND lease_token = ?", c.ID, token).Updates(updates).Error
-	if err != nil {
-		s.logFailure(ctx, "contract_finish", c.Reference, err)
 	}
 }
 
@@ -1438,6 +1367,9 @@ func (s *Service) reconcileContract(ctx context.Context, l lease) error {
 	if err := require(firstRow(db, &c, "id = ?", l.id)); err != nil {
 		return err
 	}
+	if err := s.syncCustomerContact(ctx, l, c); err != nil {
+		return err
+	}
 	if c.FundedAt == nil {
 		return nil
 	}
@@ -1465,6 +1397,36 @@ func (s *Service) reconcileContract(ctx context.Context, l lease) error {
 	return s.evaluateReactivation(ctx, l)
 }
 
+// syncCustomerContact updates Stripe's customer name and email when they differ from the last synced stamp.
+func (s *Service) syncCustomerContact(ctx context.Context, l lease, c Contract) error {
+	if c.StripeCustomerID == nil {
+		return nil
+	}
+	var student students.Student
+	if err := require(firstRow(s.db.WithContext(ctx), &student, "id = ?", c.StudentID)); err != nil {
+		return err
+	}
+	if student.Name == c.SyncedCustomerName && student.Email == c.SyncedCustomerEmail {
+		return nil
+	}
+	if err := s.renew(ctx, l); err != nil {
+		return err
+	}
+	_, err := s.client.V1Customers.Update(ctx, *c.StripeCustomerID, &stripe.CustomerUpdateParams{
+		Name:  stripe.String(student.Name),
+		Email: stripe.String(student.Email),
+	})
+	if err != nil {
+		return err
+	}
+	return s.leased(ctx, l, func(tx *gorm.DB, cur *Contract) error {
+		return tx.Model(&Contract{}).Where("id = ?", cur.ID).Updates(map[string]any{
+			"synced_customer_name":  student.Name,
+			"synced_customer_email": student.Email,
+		}).Error
+	})
+}
+
 // nextSync loads what nextSyncAt needs.
 func (s *Service) nextSync(ctx context.Context, id uint64, now time.Time) (time.Time, error) {
 	db := s.db.WithContext(ctx)
@@ -1484,9 +1446,10 @@ func (s *Service) nextSync(ctx context.Context, id uint64, now time.Time) (time.
 	return nextSyncAt(now, c, obligations, pays, inFlight > 0), nil
 }
 
-// nextSyncAt picks the earliest of: the daily audit, a quarter-hour recheck while a
-// Checkout is in flight, tuition is overdue or a payment still lacks fee/net data, the
-// nearest unsettled installment date, and its not-yet-handled 14-day deadline.
+// nextSyncAt picks the earliest of: the daily audit; a quarter-hour recheck while a Checkout
+// is in flight, tuition is overdue, an open fee (no DueAt, amount remaining) awaits payment,
+// or a payment still lacks fee/net data; the nearest unsettled installment date; and its
+// not-yet-handled 14-day deadline.
 func nextSyncAt(now time.Time, c Contract, obligations []Obligation, pays []Payment, inFlight bool) time.Time {
 	next := now.Add(auditEvery)
 	soonest := func(t time.Time) {
@@ -1583,9 +1546,6 @@ func correctEpisode(tx *gorm.DB, id uint64, now time.Time) error {
 func (s *Service) evaluateDeadlines(ctx context.Context, l lease) error {
 	var changed bool
 	err := s.leasedStudent(ctx, l, func(tx *gorm.DB, c *Contract, student *students.Student) error {
-		if c.FundedAt == nil {
-			return nil
-		}
 		now := time.Now().UTC()
 		var tuition []Obligation
 		if err := tx.Where("contract_id = ? AND kind = 'tuition' AND due_at IS NOT NULL", c.ID).
@@ -1627,9 +1587,7 @@ func (s *Service) evaluateDeadlines(ctx context.Context, l lease) error {
 				fresh := Suspension{
 					ContractID:                         c.ID,
 					TriggeringTuitionInstallmentNumber: o.Number,
-					TuitionDeadline:                    *o.DueAt,
 					StartedAt:                          deadline,
-					DetectedAt:                         now,
 				}
 				if err := tx.Create(&fresh).Error; err != nil {
 					return err
@@ -1642,8 +1600,8 @@ func (s *Service) evaluateDeadlines(ctx context.Context, l lease) error {
 			}
 		}
 
-		// Only this decision flips the flag: a corrected open episode reactivates unless another
-		// valid one remains; a new episode deactivates. Unrelated inactive students are untouched.
+		// A corrected open episode reactivates unless another valid one remains; a new episode
+		// deactivates; evaluateReactivation flips it back after an approved reinstatement.
 		open := slices.ContainsFunc(live, func(e Suspension) bool { return e.ClosedAt == nil })
 		if (created || correctedOpen) && student.IsActive == open {
 			if err := tx.Model(&students.Student{}).Where("id = ?", student.ID).Update("is_active", !open).Error; err != nil {

@@ -22,16 +22,20 @@ import (
 	"paymentwebsite/internal/students"
 )
 
-// checkoutBudget bounds one request's synchronous provider work; slower outcomes are
-// recorded on the attempt and resumed rather than holding the browser.
-const checkoutBudget = 8 * time.Second
+// integrationIdentifier is Stripe's non-unique grouping label for this integration's Checkout
+// Sessions; a constant keeps idempotent create replays byte-identical.
+const integrationIdentifier = "tuition_checkout"
 
 // activeAttemptStates are the nonterminal states guarded by idx_active_checkout_attempt.
 var activeAttemptStates = []string{"creating", "open", "processing", "expiring", "uncertain"}
 
+// inFlightAttemptStates are the active states where money may be in transit, blocking contact edits.
+var inFlightAttemptStates = []string{"processing", "uncertain", "expiring"}
+
 var (
 	forUpdate = clause.Locking{Strength: clause.LockingStrengthUpdate}
 
+	ErrContactLocked    = errors.New("billing: contact is locked")
 	errCheckoutMismatch = errors.New("billing: checkout session does not match its attempt")
 )
 
@@ -39,7 +43,7 @@ var (
 type checkoutStep struct {
 	done     *CheckoutResult  // set when no provider call remains
 	expire   *CheckoutAttempt // another plan's open attempt, claimed as "expiring"
-	changed  bool             // the link's plan preference changed
+	changed  bool             // the contract's visible quote changed
 	contract Contract
 	first    Obligation
 	attempt  CheckoutAttempt // new "creating" attempt
@@ -56,7 +60,7 @@ func (s *Service) StartCheckout(ctx context.Context, sourceLinkHash []byte, plan
 	if !ok {
 		return CheckoutResult{}, payments.ErrUnknownPlan
 	}
-	callCtx, cancel := context.WithTimeout(ctx, checkoutBudget)
+	callCtx, cancel := context.WithTimeout(ctx, providerBudget)
 	defer cancel()
 
 	// Each pass claims at most one stale open attempt; a competing start can only
@@ -70,12 +74,12 @@ func (s *Service) StartCheckout(ctx context.Context, sourceLinkHash []byte, plan
 			s.changed()
 		}
 		if step.expire != nil {
-			res, expired, err := s.expireAttempt(callCtx, step.expire)
+			expired, err := s.expireAttempt(callCtx, step.expire)
 			if err != nil {
 				return CheckoutResult{}, err
 			}
 			if !expired {
-				return res, nil
+				return CheckoutResult{Pending: true}, nil
 			}
 			continue
 		}
@@ -86,13 +90,65 @@ func (s *Service) StartCheckout(ctx context.Context, sourceLinkHash []byte, plan
 	}
 }
 
+// UpdateContact updates only the canonical student row for an enrollment, guarded against
+// concurrent checkouts and blocked once funded or while payment is in flight.
+func (s *Service) UpdateContact(ctx context.Context, sourceLinkHash []byte, details students.Details) error {
+	if len(sourceLinkHash) != sha256.Size {
+		return ErrUnavailable
+	}
+	contact := map[string]any{
+		"name": details.Name, "email": details.Email, "phone": details.Phone,
+		"municipality": details.Municipality, "date_of_birth": details.DateOfBirth,
+	}
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var link links.Link
+		if err := require(firstRow(tx.Clauses(forUpdate).Scopes(links.Usable), &link,
+			"token_hash = ? AND submitted_at IS NOT NULL", sourceLinkHash)); err != nil {
+			return err
+		}
+		var student students.Student
+		if err := require(firstRow(tx, &student, "source_link_hash = ?", sourceLinkHash)); err != nil {
+			return err
+		}
+		var contract Contract
+		exists, err := firstRow(tx.Clauses(forUpdate), &contract, "student_id = ?", student.ID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			if contract.FundedAt != nil {
+				return ErrContactLocked
+			}
+			var attempt CheckoutAttempt
+			inFlight, err := firstRow(tx.Clauses(forUpdate), &attempt,
+				"contract_id = ? AND state IN ?", contract.ID, inFlightAttemptStates)
+			if err != nil {
+				return err
+			}
+			if inFlight {
+				return ErrContactLocked
+			}
+		}
+		if err := touch(tx, student.ID); err != nil {
+			return err
+		}
+		return tx.Model(&students.Student{}).Where("id = ?", student.ID).Updates(contact).Error
+	})
+	if err != nil {
+		return err
+	}
+	s.changed()
+	s.wakeWorker()
+	return nil
+}
+
 // beginCheckout runs the locked decision transaction: Link, then Contract, then attempt.
 // It persists the new attempt's identity before any Checkout call is made.
 func (s *Service) beginCheckout(ctx context.Context, hash []byte, plan payments.Plan) (step checkoutStep, err error) {
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var link links.Link
-		if err := require(firstRow(tx.Clauses(forUpdate), &link,
-			"token_hash = ? AND canceled_at IS NULL AND expires_at > now() AND submitted_at IS NOT NULL AND terms_accepted_at IS NOT NULL", hash)); err != nil {
+		if err := require(firstRow(tx.Clauses(forUpdate).Scopes(links.Usable), &link,
+			"token_hash = ? AND submitted_at IS NOT NULL AND terms_accepted_at IS NOT NULL", hash)); err != nil {
 			return err
 		}
 		var student students.Student
@@ -113,8 +169,7 @@ func (s *Service) beginCheckout(ctx context.Context, hash []byte, plan payments.
 				PlanID:           plan.ID,
 				PlanName:         plan.Name,
 				InstallmentCount: len(plan.Amounts),
-				Currency:         "usd",
-				TotalCents:       int64(plan.TotalCents()),
+				TotalCents:       plan.TotalCents(),
 				NextSyncAt:       &syncGrace,
 			}
 			if err := tx.Create(&contract).Error; err != nil {
@@ -123,6 +178,7 @@ func (s *Service) beginCheckout(ctx context.Context, hash []byte, plan payments.
 			if err := s.createObligations(tx, contract.ID, plan); err != nil {
 				return err
 			}
+			step.changed = true
 		} else if contract.FundedAt != nil {
 			if contract.PlanID != plan.ID {
 				return ErrPlanLocked
@@ -161,23 +217,17 @@ func (s *Service) beginCheckout(ctx context.Context, hash []byte, plan payments.
 					"plan_id":           plan.ID,
 					"plan_name":         plan.Name,
 					"installment_count": len(plan.Amounts),
-					"total_cents":       int64(plan.TotalCents()),
+					"total_cents":       plan.TotalCents(),
 				}).Error; err != nil {
 					return err
 				}
 				contract.PlanID, contract.PlanName = plan.ID, plan.Name
-				contract.InstallmentCount, contract.TotalCents = len(plan.Amounts), int64(plan.TotalCents())
+				contract.InstallmentCount, contract.TotalCents = len(plan.Amounts), plan.TotalCents()
 				if err := s.createObligations(tx, contract.ID, plan); err != nil {
 					return err
 				}
+				step.changed = true
 			}
-		}
-
-		if link.PaymentPlan != plan.ID {
-			if err := tx.Model(&links.Link{}).Where("token_hash = ?", hash).Update("payment_plan", plan.ID).Error; err != nil {
-				return err
-			}
-			step.changed = true
 		}
 
 		var first Obligation
@@ -202,25 +252,29 @@ func (s *Service) beginCheckout(ctx context.Context, hash []byte, plan payments.
 				return fmt.Errorf("billing: create stripe customer: %w", err)
 			}
 			contract.StripeCustomerID = &customer.ID
+			contract.SyncedCustomerName = student.Name
+			contract.SyncedCustomerEmail = student.Email
 			contractUpdates["stripe_customer_id"] = customer.ID
+			contractUpdates["synced_customer_name"] = student.Name
+			contractUpdates["synced_customer_email"] = student.Email
 		}
 
 		attempt := CheckoutAttempt{
-			ContractID:            contract.ID,
-			Reference:             rand.Text(),
-			PlanID:                plan.ID,
-			FirstAmountCents:      first.AmountCents,
-			StripePriceID:         first.StripePriceID,
-			IntegrationIdentifier: integrationIdentifier(),
-			CreationStartedAt:     time.Now().UTC(),
-			State:                 "creating",
+			ContractID:        contract.ID,
+			Reference:         rand.Text(),
+			PlanID:            plan.ID,
+			FirstAmountCents:  first.AmountCents,
+			StripePriceID:     first.StripePriceID,
+			CreationStartedAt: time.Now().UTC(),
+			State:             "creating",
 		}
 		if err := tx.Create(&attempt).Error; err != nil {
 			return err
 		}
-		contractUpdates["current_checkout_attempt_reference"] = attempt.Reference
-		if err := tx.Model(&Contract{}).Where("id = ?", contract.ID).Updates(contractUpdates).Error; err != nil {
-			return err
+		if len(contractUpdates) > 0 {
+			if err := tx.Model(&Contract{}).Where("id = ?", contract.ID).Updates(contractUpdates).Error; err != nil {
+				return err
+			}
 		}
 		step.contract, step.first, step.attempt = contract, first, attempt
 		return nil
@@ -229,9 +283,9 @@ func (s *Service) beginCheckout(ctx context.Context, hash []byte, plan payments.
 }
 
 // expireAttempt expires the claimed open Session of an abandoned plan. expired is true only
-// once the Session is terminally unpaid; otherwise res is what the caller should report.
+// once the Session is terminally unpaid; otherwise the caller reports the checkout as pending.
 // Unresolved outcomes stay "expiring" for the worker, never unlocking a possibly paid quote.
-func (s *Service) expireAttempt(ctx context.Context, attempt *CheckoutAttempt) (res CheckoutResult, expired bool, err error) {
+func (s *Service) expireAttempt(ctx context.Context, attempt *CheckoutAttempt) (expired bool, err error) {
 	session, err := s.client.V1CheckoutSessions.Expire(ctx, *attempt.StripeSessionID, nil)
 	if err != nil {
 		// Sessions that already ended reject Expire; their current state decides.
@@ -242,14 +296,14 @@ func (s *Service) expireAttempt(ctx context.Context, attempt *CheckoutAttempt) (
 		defer cancel()
 		switch {
 		case session.PaymentStatus == stripe.CheckoutSessionPaymentStatusPaid || session.Status == stripe.CheckoutSessionStatusComplete:
-			return CheckoutResult{Pending: true}, false, s.setAttempt(saveCtx, attempt.ID, "expiring", "processing", nil)
+			return false, s.setAttempt(saveCtx, attempt.ID, "expiring", "processing", nil)
 		case session.Status == stripe.CheckoutSessionStatusExpired:
-			return CheckoutResult{}, true, s.setAttempt(saveCtx, attempt.ID, "expiring", "expired", nil)
+			return true, s.setAttempt(saveCtx, attempt.ID, "expiring", "expired", nil)
 		}
 	}
 	s.log.LogAttrs(ctx, slog.LevelWarn, "checkout_expire_unresolved",
 		append(logging.ErrorAttrs(err), slog.String("attempt", attempt.Reference))...)
-	return CheckoutResult{Pending: true}, false, nil
+	return false, nil
 }
 
 // createSession calls Stripe for the already persisted attempt and records the outcome.
@@ -272,11 +326,7 @@ func (s *Service) createSession(ctx context.Context, contract Contract, first Ob
 			s.setAttempt(saveCtx, attempt.ID, attempt.State, "failed", nil))
 	}
 
-	if session.Currency != stripe.CurrencyUSD ||
-		session.Mode != stripe.CheckoutSessionModePayment ||
-		session.Customer == nil || session.Customer.ID != *contract.StripeCustomerID ||
-		session.AmountTotal != attempt.FirstAmountCents ||
-		session.URL == "" {
+	if !sessionMatches(contract, attempt, session) || session.URL == "" {
 		// The URL is never exposed, so nobody can pay this Session; keep its ID for staff and webhooks.
 		return CheckoutResult{}, errors.Join(errCheckoutMismatch,
 			s.setAttempt(saveCtx, attempt.ID, attempt.State, "failed", map[string]any{"stripe_session_id": session.ID}))
@@ -285,7 +335,6 @@ func (s *Service) createSession(ctx context.Context, contract Contract, first Ob
 	if err := s.setAttempt(saveCtx, attempt.ID, attempt.State, "open", map[string]any{
 		"stripe_session_id": session.ID,
 		"checkout_url":      session.URL,
-		"expires_at":        time.Unix(session.ExpiresAt, 0).UTC(),
 	}); err != nil {
 		return CheckoutResult{}, err
 	}
@@ -305,7 +354,7 @@ func (s *Service) sessionParams(contract Contract, first Obligation, attempt Che
 		Currency:                   stripe.String("usd"),
 		Customer:                   stripe.String(*contract.StripeCustomerID),
 		ClientReferenceID:          stripe.String(attempt.Reference),
-		IntegrationIdentifier:      stripe.String(attempt.IntegrationIdentifier),
+		IntegrationIdentifier:      stripe.String(integrationIdentifier),
 		Locale:                     stripe.String("es"),
 		PaymentMethodConfiguration: stripe.String(s.cfg.PaymentMethodConfigurationID),
 		LineItems: []*stripe.CheckoutSessionCreateLineItemParams{{
@@ -331,6 +380,11 @@ func (s *Service) sessionParams(contract Contract, first Obligation, attempt Che
 				Message: stripe.String("Primer pago de matrícula. Los pagos restantes se procesarán automáticamente en las fechas acordadas."),
 			},
 		}
+		params.WalletOptions = &stripe.CheckoutSessionCreateWalletOptionsParams{
+			Link: &stripe.CheckoutSessionCreateWalletOptionsLinkParams{
+				Display: stripe.String(string(stripe.CheckoutSessionWalletOptionsLinkDisplayNever)),
+			},
+		}
 	}
 	params.SetIdempotencyKey(fmt.Sprintf("tuition:%s:checkout", attempt.Reference))
 	return params
@@ -338,21 +392,9 @@ func (s *Service) sessionParams(contract Contract, first Obligation, attempt Che
 
 // createObligations quotes one tuition obligation per installment with its catalog price.
 func (s *Service) createObligations(tx *gorm.DB, contractID uint64, plan payments.Plan) error {
-	var first, later string
-	switch plan.ID {
-	case "full":
-		first = s.catalog.Full
-	case "three":
-		first, later = s.catalog.ThreeFirst, s.catalog.ThreeLater
-	case "six":
-		first, later = s.catalog.SixFirst, s.catalog.SixLater
-	}
 	obligations := make([]Obligation, len(plan.Amounts))
 	for i, amount := range plan.Amounts {
-		price := later
-		if i == 0 {
-			price = first
-		}
+		price := s.catalog[priceKey(plan.ID, i)]
 		if price == "" {
 			return fmt.Errorf("billing: catalog has no price for plan %q installment %d", plan.ID, i+1)
 		}
@@ -361,8 +403,8 @@ func (s *Service) createObligations(tx *gorm.DB, contractID uint64, plan payment
 			Reference:             rand.Text(),
 			Kind:                  "tuition",
 			Number:                i + 1,
-			AmountCents:           int64(amount),
-			AmountRemainingCents:  int64(amount),
+			AmountCents:           amount,
+			AmountRemainingCents:  amount,
 			StripePriceID:         price,
 			CollectionDisposition: "collect",
 		}
@@ -407,14 +449,4 @@ func require(found bool, err error) error {
 		return ErrUnavailable
 	}
 	return err
-}
-
-// integrationIdentifier labels an attempt's Checkout integration: tuition_ plus eight letters.
-func integrationIdentifier() string {
-	letters := make([]byte, 8)
-	rand.Read(letters)
-	for i, b := range letters {
-		letters[i] = 'a' + b%26
-	}
-	return "tuition_" + string(letters)
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"unicode/utf8"
 
 	"golang.org/x/term"
@@ -26,7 +27,7 @@ Usernames are 1-64 ASCII letters, digits, ".", "_" or "-" and are case-insensiti
 Passwords: at least 4 characters, at most 1024 bytes; entered twice at a hidden terminal prompt.
 `
 
-var errUsage = errors.New("invalid command\n\n" + Usage)
+var errUsage = errors.New("invalid command\n\n" + strings.TrimSuffix(Usage, "\n"))
 
 // RunCLI runs the account command in args, the arguments after "user".
 func RunCLI(ctx context.Context, db *gorm.DB, args []string) error {

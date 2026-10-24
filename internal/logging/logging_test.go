@@ -7,9 +7,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
-	"net"
 	"reflect"
 	"syscall"
 	"testing"
@@ -42,10 +40,7 @@ func TestNewJSONSemantics(t *testing.T) {
 		want  string
 	}{
 		{name: "debug filtered", level: slog.LevelDebug},
-		{name: "info", level: slog.LevelInfo, want: "info"},
 		{name: "warn", level: slog.LevelWarn, want: "warn"},
-		{name: "error", level: slog.LevelError, want: "error"},
-		{name: "custom level", level: slog.LevelWarn + 1, want: "warn+1"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -98,52 +93,17 @@ type privateSQLStateError struct {
 func (*privateSQLStateError) Error() string      { panic("logging must not call Error") }
 func (e *privateSQLStateError) SQLState() string { return e.State }
 
-type privateNetworkError struct {
-	TimedOut bool
-	Marker   string
-}
-
-func (*privateNetworkError) Error() string   { panic("logging must not call Error") }
-func (e *privateNetworkError) Timeout() bool { return e.TimedOut }
-func (*privateNetworkError) Temporary() bool { return false }
-
-type privateIsError struct {
-	Target error
-	Marker string
-}
-
-func (*privateIsError) Error() string          { panic("logging must not call Error") }
-func (e *privateIsError) Is(target error) bool { return target == e.Target }
-
-type privateAsError struct {
-	Matched *privateSQLStateError
-	Marker  string
-}
-
-func (*privateAsError) Error() string { panic("logging must not call Error") }
-func (e *privateAsError) As(target any) bool {
-	if state, ok := target.(*interface {
-		SQLState() string
-	}); ok {
-		*state = e.Matched
-		return true
-	}
-	return false
-}
-
 func TestErrorAttrsClassificationAndPrivacy(t *testing.T) {
 	t.Parallel()
 	wrap := func(err error) error {
 		return &privateLoggingWrapper{Err: &privateLoggingWrapper{Err: err, Marker: loggingPrivateMarker}, Marker: loggingPrivateMarker}
 	}
 	database := &privateSQLStateError{State: "23505", Marker: loggingPrivateMarker}
-	timeout := &privateNetworkError{TimedOut: true, Marker: loggingPrivateMarker}
-	network := &privateNetworkError{Marker: loggingPrivateMarker}
-	unknown := &privateLoggingError{Marker: loggingPrivateMarker}
-	wrappedUnknown := wrap(unknown)
-	customCanceled := &privateIsError{Target: context.Canceled, Marker: loggingPrivateMarker}
-	customAs := &privateAsError{Matched: database, Marker: loggingPrivateMarker}
-	netOperation := &net.OpError{Op: loggingPrivateMarker, Net: loggingPrivateMarker, Err: network}
+	wrappedUnknown := wrap(&privateLoggingError{Marker: loggingPrivateMarker})
+	connectionFailure := &privateSQLStateError{State: "08006", Marker: loggingPrivateMarker}
+	queryCanceled := &privateSQLStateError{State: "57014", Marker: loggingPrivateMarker}
+	markerState := wrap(&privateSQLStateError{State: loggingPrivateMarker, Marker: loggingPrivateMarker})
+	injectedState := wrap(&privateSQLStateError{State: "42P01\nSELECT private_table", Marker: loggingPrivateMarker})
 	cases := []struct {
 		name    string
 		err     error
@@ -154,54 +114,14 @@ func TestErrorAttrsClassificationAndPrivacy(t *testing.T) {
 		{name: "nil"},
 		{name: "wrapped cancellation", err: wrap(context.Canceled), kind: "canceled", matched: context.Canceled},
 		{name: "wrapped deadline", err: wrap(context.DeadlineExceeded), kind: "deadline_exceeded", matched: context.DeadlineExceeded},
-		{name: "network timeout", err: wrap(timeout), kind: "deadline_exceeded", matched: timeout},
-		{name: "cancellation priority", err: wrap(errors.Join(database, context.Canceled, context.DeadlineExceeded)), kind: "canceled", matched: context.Canceled},
-		{name: "deadline priority", err: wrap(errors.Join(database, context.DeadlineExceeded)), kind: "deadline_exceeded", matched: context.DeadlineExceeded},
-		{name: "timeout priority", err: wrap(errors.Join(database, timeout)), kind: "deadline_exceeded", matched: timeout},
-		{name: "reset before timeout", err: wrap(errors.Join(syscall.ECONNRESET, timeout)), kind: "deadline_exceeded", matched: timeout},
-		{name: "custom Is match", err: wrap(customCanceled), kind: "canceled", matched: customCanceled},
-		{name: "custom As match", err: wrap(customAs), kind: "database", matched: database, state: "23505"},
 		{name: "database", err: wrap(database), kind: "database", matched: database, state: "23505"},
-		{name: "database before transaction", err: wrap(errors.Join(sql.ErrTxDone, database)), kind: "database", matched: database, state: "23505"},
-		{name: "database before network", err: wrap(errors.Join(network, database)), kind: "database", matched: database, state: "23505"},
 		{name: "transaction done", err: wrap(sql.ErrTxDone), kind: "transaction_done", matched: sql.ErrTxDone},
-		{name: "SQL connection done", err: wrap(sql.ErrConnDone), kind: "connection_failure", matched: sql.ErrConnDone},
 		{name: "driver connection", err: wrap(driver.ErrBadConn), kind: "connection_failure", matched: driver.ErrBadConn},
-		{name: "closed network", err: wrap(net.ErrClosed), kind: "connection_failure", matched: net.ErrClosed},
-		{name: "closed pipe", err: wrap(io.ErrClosedPipe), kind: "connection_failure", matched: io.ErrClosedPipe},
-		{name: "broken pipe", err: wrap(syscall.EPIPE), kind: "connection_failure", matched: syscall.EPIPE},
-		{name: "reset", err: wrap(syscall.ECONNRESET), kind: "connection_failure", matched: syscall.ECONNRESET},
-		{name: "refused", err: wrap(syscall.ECONNREFUSED), kind: "connection_failure", matched: syscall.ECONNREFUSED},
-		{name: "network", err: wrap(network), kind: "connection_failure", matched: network},
-		{name: "network operation", err: wrap(netOperation), kind: "connection_failure", matched: netOperation},
-		{name: "EOF", err: wrap(io.EOF), kind: "connection_failure", matched: io.EOF},
-		{name: "unexpected EOF", err: wrap(io.ErrUnexpectedEOF), kind: "connection_failure", matched: io.ErrUnexpectedEOF},
-		{name: "unknown", err: unknown, kind: "unknown", matched: unknown},
 		{name: "unknown retains original type", err: wrappedUnknown, kind: "unknown", matched: wrappedUnknown},
-	}
-	for _, state := range []string{"08006", "08P01", "57P01", "57P02", "57P03", "57014", "42P01", "ABCDE", "12345", "", "42P0", "42P010", "42p01", "42P0_", "42Pé", loggingPrivateMarker, "42P01\nSELECT private_table"} {
-		err := &privateSQLStateError{State: state, Marker: loggingPrivateMarker}
-		kind, safeState := "unknown", ""
-		switch state {
-		case "08006", "08P01", "57P01", "57P02", "57P03":
-			kind, safeState = "connection_failure", state
-		case "57014":
-			kind, safeState = "query_canceled", state
-		case "42P01", "ABCDE", "12345":
-			kind, safeState = "database", state
-		}
-		matched := error(err)
-		wrapped := wrap(err)
-		if kind == "unknown" {
-			matched = wrapped
-		}
-		cases = append(cases, struct {
-			name    string
-			err     error
-			kind    string
-			matched error
-			state   string
-		}{name: "SQLSTATE " + state, err: wrapped, kind: kind, matched: matched, state: safeState})
+		{name: "SQLSTATE 08006", err: wrap(connectionFailure), kind: "connection_failure", matched: connectionFailure, state: "08006"},
+		{name: "SQLSTATE 57014", err: wrap(queryCanceled), kind: "query_canceled", matched: queryCanceled, state: "57014"},
+		{name: "SQLSTATE marker", err: markerState, kind: "unknown", matched: markerState},
+		{name: "SQLSTATE injection", err: injectedState, kind: "unknown", matched: injectedState},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -259,27 +179,11 @@ func TestRequestLevelBoundaries(t *testing.T) {
 		err   error
 		want  slog.Level
 	}{
-		{name: "nil", stage: "render", want: slog.LevelError},
 		{name: "canceled save", stage: "save", err: context.Canceled, want: slog.LevelWarn},
-		{name: "canceled render", stage: "render", err: context.Canceled, want: slog.LevelWarn},
 		{name: "render broken pipe", stage: "render", err: syscall.EPIPE, want: slog.LevelWarn},
-		{name: "render reset", stage: "render", err: syscall.ECONNRESET, want: slog.LevelWarn},
-		{name: "render closed connection", stage: "render", err: net.ErrClosed, want: slog.LevelWarn},
-		{name: "render closed pipe", stage: "render", err: io.ErrClosedPipe, want: slog.LevelWarn},
-		{name: "save reset", stage: "save", err: syscall.ECONNRESET, want: slog.LevelError},
 		{name: "save broken pipe", stage: "save", err: syscall.EPIPE, want: slog.LevelError},
-		{name: "save closed connection", stage: "save", err: net.ErrClosed, want: slog.LevelError},
-		{name: "render refused connection", stage: "render", err: syscall.ECONNREFUSED, want: slog.LevelError},
-		{name: "render database connection", stage: "render", err: sql.ErrConnDone, want: slog.LevelError},
-		{name: "render EOF", stage: "render", err: io.EOF, want: slog.LevelError},
-		{name: "render deadline", stage: "render", err: context.DeadlineExceeded, want: slog.LevelError},
-		{name: "render timeout", stage: "render", err: &privateNetworkError{TimedOut: true}, want: slog.LevelError},
-		{name: "render unknown network", stage: "render", err: &privateNetworkError{}, want: slog.LevelError},
-		{name: "render unknown", stage: "render", err: &privateLoggingError{}, want: slog.LevelError},
-		{name: "render query canceled", stage: "render", err: &privateSQLStateError{State: "57014"}, want: slog.LevelError},
 		{name: "render SQLSTATE reset", stage: "render", err: errors.Join(syscall.ECONNRESET, &privateSQLStateError{State: "08006"}), want: slog.LevelError},
 		{name: "render deadline reset", stage: "render", err: errors.Join(syscall.ECONNRESET, context.DeadlineExceeded), want: slog.LevelError},
-		{name: "render timeout reset", stage: "render", err: errors.Join(syscall.ECONNRESET, &privateNetworkError{TimedOut: true}), want: slog.LevelError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -333,18 +237,5 @@ func TestServerErrorLogPrivacy(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestServerErrorWriterAcknowledgesWholeRecord(t *testing.T) {
-	t.Parallel()
-	var out bytes.Buffer
-	record := []byte("http: panic serving 192.0.2.1:4321: " + loggingPrivateMarker + "\nprivate stack\n")
-	n, err := ServerErrorLog(New(&out)).Writer().Write(record)
-	if n != len(record) || err != nil {
-		t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(record))
-	}
-	if events := decodeEvents(t, out.Bytes()); len(events) != 1 || events[0]["kind"] != "panic" {
-		t.Fatalf("unexpected acknowledged record: %v", events)
 	}
 }

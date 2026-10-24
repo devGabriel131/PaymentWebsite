@@ -11,9 +11,9 @@
   {{with $.Error}}<p id="payment-error" class="customer-callout" role="alert">{{template "icon-alert"}}<span>{{.}}</span></p>{{end}}
   <div class="payment-progress customer-card" role="status">
     <p class="payment-progress-plan">{{.PlanName}}</p>
-    <p class="payment-progress-paid"><strong>{{money64 .TuitionPaidCents}}</strong> pagados de {{money64 .TotalCents}}</p>
-    <progress max="{{.TotalCents}}" value="{{.TuitionPaidCents}}">{{money64 .TuitionPaidCents}} de {{money64 .TotalCents}}</progress>
-    <p class="payment-progress-left">Pendiente: <strong>{{money64 .RemainingTuitionCents}}</strong></p>
+    <p class="payment-progress-paid"><strong>{{money .TuitionPaidCents}}</strong> pagados de {{money .TotalCents}}</p>
+    <progress max="{{.TotalCents}}" value="{{.TuitionPaidCents}}">{{money .TuitionPaidCents}} de {{money .TotalCents}}</progress>
+    <p class="payment-progress-left">Pendiente: <strong>{{money .RemainingTuitionCents}}</strong></p>
   </div>
   <section class="customer-card" aria-labelledby="payment-schedule-title">
     <h2 id="payment-schedule-title" class="payment-schedule-heading">Fechas y estado</h2>
@@ -24,7 +24,7 @@
           <strong>{{if .DueAt}}{{billingDate .DueAt}}{{else}}Fecha por confirmar{{end}}</strong>
           <span class="payment-installment-state">{{if eq .Status "paid"}}Pagado{{if .PaidAt}} el {{billingDate .PaidAt}}{{end}}{{else if eq .Status "overdue"}}Vencido{{else if eq .Status "action_required"}}Requiere atención{{else}}Programado{{end}}</span>
         </span>
-        <strong class="payment-installment-amount">{{money64 .AmountCents}}</strong>
+        <strong class="payment-installment-amount">{{money .AmountCents}}</strong>
       </li>
       {{end}}
     </ol>

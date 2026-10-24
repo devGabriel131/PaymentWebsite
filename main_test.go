@@ -19,9 +19,10 @@ func TestServeLifecycle(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		force bool
+		drain time.Duration
 	}{
-		{name: "in_flight_request_drains"},
-		{name: "blocked_request_is_force_closed", force: true},
+		{name: "in_flight_request_drains", drain: 10 * time.Second},
+		{name: "blocked_request_is_force_closed", force: true, drain: 100 * time.Millisecond},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			const waitTimeout = 20 * time.Second
@@ -89,7 +90,7 @@ func TestServeLifecycle(t *testing.T) {
 			})
 			go func() {
 				defer close(serveDone)
-				serveErr = serve(signalContext, server, listener, log, logging.NewDBLogger(log))
+				serveErr = serve(signalContext, server, listener, log, logging.NewDBLogger(log), test.drain)
 			}()
 			go func() {
 				defer close(clientDone)
@@ -137,8 +138,8 @@ func TestServeLifecycle(t *testing.T) {
 				}
 				if requestCanceledAt.IsZero() {
 					t.Error("force close did not cancel the blocked request context")
-				} else if elapsed := requestCanceledAt.Sub(signaledAt); elapsed < 10*time.Second {
-					t.Errorf("request context canceled after %s, before the real 10-second drain", elapsed)
+				} else if elapsed := requestCanceledAt.Sub(signaledAt); elapsed < test.drain {
+					t.Errorf("request context canceled after %s, before the %s drain", elapsed, test.drain)
 				}
 			} else {
 				if serveErr != nil {
@@ -155,7 +156,7 @@ func TestServeLifecycle(t *testing.T) {
 			if len(events) != 2 {
 				t.Fatalf("lifecycle events = %+v, want exactly shutdown_requested and one terminal outcome", events)
 			}
-			if event := events[0]; event.Message != "shutdown_requested" || event.Level != "info" || event.DrainTimeoutMS != 10000 {
+			if event := events[0]; event.Message != "shutdown_requested" || event.Level != "info" || event.DrainTimeoutMS != test.drain.Milliseconds() {
 				t.Errorf("shutdown request event = %+v", event)
 			}
 			wantMessage, wantLevel := "shutdown_completed", "info"
@@ -169,8 +170,8 @@ func TestServeLifecycle(t *testing.T) {
 			if outcome.DurationMS == nil || *outcome.DurationMS < 0 {
 				t.Errorf("terminal event lacks a nonnegative numeric duration_ms: %+v", outcome)
 			}
-			if test.force && (outcome.ErrorKind != "deadline_exceeded" || outcome.DurationMS == nil || *outcome.DurationMS < 10000) {
-				t.Errorf("forced outcome must classify the real 10-second timeout: %+v", outcome)
+			if test.force && (outcome.ErrorKind != "deadline_exceeded" || outcome.DurationMS == nil || *outcome.DurationMS < float64(test.drain.Milliseconds())) {
+				t.Errorf("forced outcome must classify the real %s timeout: %+v", test.drain, outcome)
 			}
 		})
 	}

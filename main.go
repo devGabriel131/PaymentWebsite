@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,8 +33,25 @@ import (
 var assets embed.FS
 
 func main() {
+	args := os.Args[1:]
+	if len(args) > 0 {
+		switch args[0] {
+		case "--help", "-h":
+			fmt.Print(auth.Usage)
+			return
+		case "user":
+			if len(args) == 1 || len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
+				fmt.Print(auth.Usage)
+				return
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "unknown command %q; use --help\n", args[0])
+			os.Exit(1)
+		}
+	}
+
 	out := os.Stdout
-	if len(os.Args) > 1 {
+	if len(args) > 0 {
 		out = os.Stderr
 	}
 	service := os.Getenv("RAILWAY_SERVICE_NAME")
@@ -55,38 +73,36 @@ func main() {
 	if id := os.Getenv("RAILWAY_REPLICA_ID"); id != "" {
 		log = log.With("replica_id", id)
 	}
-	if err := run(log); err != nil {
+	err := run(log, args)
+	var failed startupError
+	if errors.As(err, &failed) {
+		log.LogAttrs(context.Background(), slog.LevelError, "startup_failed",
+			append(logging.ErrorAttrs(failed.err), slog.String("stage", failed.stage))...)
+	}
+	if err != nil {
 		os.Exit(1)
 	}
 }
 
-func run(log *slog.Logger) (err error) {
-	args := os.Args[1:]
-	if len(args) > 0 {
-		switch args[0] {
-		case "--help", "-h":
-			fmt.Print(auth.Usage)
-			return nil
-		case "user":
-			if len(args) == 1 || len(args) == 2 && (args[1] == "--help" || args[1] == "-h") {
-				fmt.Print(auth.Usage)
-				return nil
-			}
-		default:
-			err = fmt.Errorf("unknown command %q; use --help", args[0])
-			fmt.Fprintln(os.Stderr, err)
-			return err
-		}
-	}
+// startupError marks a failure that main logs as startup_failed.
+type startupError struct {
+	stage string
+	err   error
+}
 
-	stage := "configuration"
-	setupOwned := true
-	defer func() {
-		if err != nil && setupOwned {
-			log.LogAttrs(context.Background(), slog.LevelError, "startup_failed",
-				append(logging.ErrorAttrs(err), slog.String("stage", stage))...)
-		}
-	}()
+func (e startupError) Error() string { return e.stage + ": " + e.err.Error() }
+
+func models() []any {
+	return append([]any{
+		&auth.User{},
+		&auth.Session{},
+		&settings.Settings{},
+		&links.Link{},
+		&students.Student{},
+	}, billing.Models()...)
+}
+
+func run(log *slog.Logger, args []string) error {
 	if len(args) == 0 {
 		log.Info("startup_started")
 	}
@@ -98,21 +114,19 @@ func run(log *slog.Logger) (err error) {
 
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		return errors.New("DATABASE_URL is required")
+		return startupError{"configuration", errors.New("DATABASE_URL is required")}
 	}
-	stage = "database_open"
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		DisableAutomaticPing:   true,
 		SkipDefaultTransaction: true,
 		Logger:                 slow,
 	})
 	if err != nil {
-		return fmt.Errorf("open PostgreSQL: %w", err)
+		return startupError{"database_open", err}
 	}
-	stage = "database_pool"
 	sqlDB, err := db.DB()
 	if err != nil {
-		return err
+		return startupError{"database_pool", err}
 	}
 	defer sqlDB.Close()
 	sqlDB.SetMaxOpenConns(10)
@@ -120,70 +134,85 @@ func run(log *slog.Logger) (err error) {
 
 	ctx, cancel := context.WithTimeout(signalContext, 10*time.Second)
 	defer cancel()
-	stage = "database_connect"
 	if err := sqlDB.PingContext(ctx); err != nil {
-		return fmt.Errorf("connect to PostgreSQL: %w", err)
+		return startupError{"database_connect", err}
 	}
-	stage = "database_migrate"
-	migrateModels := append([]any{
-		&auth.User{},
-		&auth.Session{},
-		&settings.Settings{},
-		&links.Link{},
-		&students.Student{},
-	}, billing.Models()...)
-	err = db.WithContext(logging.WithOperation(ctx, "startup_migrate")).AutoMigrate(migrateModels...)
+	err = db.WithContext(logging.WithOperation(ctx, "startup_migrate")).AutoMigrate(models()...)
 	slow.Flush()
 	if err != nil {
-		return fmt.Errorf("migrate database: %w", err)
+		return startupError{"database_migrate", err}
 	}
 
 	if len(args) > 0 {
-		setupOwned = false
-		err = auth.RunCLI(logging.WithOperation(signalContext, "cli_user"), db, args[1:])
+		err := auth.RunCLI(logging.WithOperation(signalContext, "cli_user"), db, args[1:])
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 		}
 		return err
 	}
 
-	stage = "configuration"
 	secureCookies := true
 	if value, ok := os.LookupEnv("SESSION_COOKIE_SECURE"); ok {
 		secureCookies, err = strconv.ParseBool(value)
 		if err != nil {
-			return fmt.Errorf("SESSION_COOKIE_SECURE must be true or false: %w", err)
+			return startupError{"configuration", err}
 		}
 	}
 	// Committed writes tell open management pages to refresh themselves.
 	feed := live.New()
-	store := links.New(db, feed.Changed)
 
-	stage = "billing_configuration"
 	billingCfg, stripeAPIKey, err := billing.LoadConfigFromEnv()
 	if err != nil {
-		return fmt.Errorf("configure stripe: %w", err)
+		return startupError{"billing_configuration", err}
 	}
 	stripeClient := billing.NewStripeClient(stripeAPIKey)
 	catalogCtx, cancelCatalog := context.WithTimeout(signalContext, 15*time.Second)
 	defer cancelCatalog()
-	stage = "billing_catalog"
 	catalog, err := billing.LoadCatalog(catalogCtx, stripeClient, billingCfg.Live)
 	if err != nil {
-		return fmt.Errorf("load stripe catalog: %w", err)
+		return startupError{"billing_catalog", err}
 	}
-	stage = "billing_initialize"
 	biller, err := billing.New(db, stripeClient, billingCfg, catalog, feed.Changed, log)
 	if err != nil {
-		return fmt.Errorf("initialize billing: %w", err)
+		return startupError{"billing_initialize", err}
 	}
 
-	stage = "auth_initialize"
 	authentication, err := auth.New(db, secureCookies, log)
 	if err != nil {
-		return fmt.Errorf("initialize authentication: %w", err)
+		return startupError{"auth_initialize", err}
 	}
 	defer authentication.Close()
+
+	addr := "127.0.0.1:3000"
+	if port := os.Getenv("PORT"); port != "" {
+		addr = ":" + port
+	}
+	server, err := newServer(addr, db, feed, authentication, biller, log)
+	if err != nil {
+		return err
+	}
+
+	workerCtx, cancelWorker := context.WithCancel(signalContext)
+	var worker sync.WaitGroup
+	worker.Go(func() { biller.Run(workerCtx) })
+	defer func() {
+		cancelWorker()
+		worker.Wait()
+	}()
+
+	listener, err := net.Listen("tcp", server.Addr)
+	if err != nil {
+		return startupError{"listen", err}
+	}
+	log.Info("server_listening", "addr", listener.Addr().String())
+	return serve(signalContext, server, listener, log, slow, 10*time.Second)
+}
+
+func newServer(addr string, db *gorm.DB, feed *live.Feed, authentication *auth.Manager, biller *billing.Service, log *slog.Logger) (*http.Server, error) {
+	store := links.New(db, feed.Changed)
+	roster := students.New(db, feed.Changed)
+	config := settings.New(db)
+
 	mux := http.NewServeMux()
 	mux.Handle("GET /static/", http.FileServerFS(assets))
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
@@ -194,36 +223,19 @@ func run(log *slog.Logger) (err error) {
 	})
 	authentication.RegisterRoutes(mux)
 	managementMux := http.NewServeMux()
-	managementMux.Handle("GET /management/events", logging.Operation("live_updates", feed))
-	stage = "management_routes"
-	if err := management.RegisterRoutes(managementMux, store, students.New(db, feed.Changed), settings.New(db), auth.Staff, biller); err != nil {
-		return fmt.Errorf("register management routes: %w", err)
+	managementMux.Handle("GET /management/events", feed)
+	if err := management.RegisterRoutes(managementMux, store, roster, config, auth.Staff, biller); err != nil {
+		return nil, startupError{"management_routes", err}
 	}
-	mux.Handle("/management/", authentication.Require(managementMux))
-	stage = "customer_routes"
-	if err := customer.RegisterRoutes(mux, store, settings.New(db), biller); err != nil {
-		return fmt.Errorf("register customer routes: %w", err)
+	mux.Handle("/management/", authentication.Require(logging.Routes(managementMux)))
+	if err := customer.RegisterRoutes(mux, store, roster, config, biller); err != nil {
+		return nil, startupError{"customer_routes", err}
 	}
-	mux.Handle("POST /webhooks/stripe", logging.Operation("stripe_webhook", http.HandlerFunc(biller.Webhook)))
-
-	workerCtx, cancelWorker := context.WithCancel(signalContext)
-	workerDone := make(chan struct{})
-	go func() {
-		defer close(workerDone)
-		biller.Run(workerCtx)
-	}()
-	defer func() {
-		cancelWorker()
-		<-workerDone
-	}()
-	addr := "127.0.0.1:3000"
-	if port := os.Getenv("PORT"); port != "" {
-		addr = ":" + port
-	}
+	mux.Handle("POST /webhooks/stripe", http.HandlerFunc(biller.Webhook))
 
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           logging.Requests(log, http.NewCrossOriginProtection().Handler(mux)),
+		Handler:           logging.Requests(log, http.NewCrossOriginProtection().Handler(logging.Routes(mux))),
 		ErrorLog:          logging.ServerErrorLog(log),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -231,18 +243,10 @@ func run(log *slog.Logger) (err error) {
 	}
 	// Event streams never finish on their own; end them once shutdown starts.
 	server.RegisterOnShutdown(feed.Close)
-
-	stage = "listen"
-	listener, err := net.Listen("tcp", server.Addr)
-	if err != nil {
-		return err
-	}
-	log.Info("server_listening", "addr", listener.Addr().String())
-	setupOwned = false
-	return serve(signalContext, server, listener, log, slow)
+	return server, nil
 }
 
-func serve(ctx context.Context, server *http.Server, listener net.Listener, log *slog.Logger, slow *logging.DBLogger) error {
+func serve(ctx context.Context, server *http.Server, listener net.Listener, log *slog.Logger, slow *logging.DBLogger, drain time.Duration) error {
 	result := make(chan error, 1)
 	go func() { result <- server.Serve(listener) }()
 	ticker := time.NewTicker(30 * time.Second)
@@ -261,8 +265,8 @@ func serve(ctx context.Context, server *http.Server, listener net.Listener, log 
 			slow.Flush()
 		case <-ctx.Done():
 			started := time.Now()
-			log.Info("shutdown_requested", "drain_timeout_ms", 10000)
-			shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			log.Info("shutdown_requested", "drain_timeout_ms", drain.Milliseconds())
+			shutdownContext, cancel := context.WithTimeout(context.Background(), drain)
 			defer cancel()
 			err := server.Shutdown(shutdownContext)
 			if err != nil {

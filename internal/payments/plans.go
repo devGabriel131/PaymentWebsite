@@ -9,20 +9,20 @@ import (
 // Plan describes an available payment option. Amounts is read-only.
 type Plan struct {
 	ID, Name string
-	Amounts  []int
+	Amounts  []int64
 }
 
 type Installment struct {
 	Date        time.Time
-	AmountCents int
+	AmountCents int64
 }
 
 var ErrUnknownPlan = errors.New("unknown payment plan")
 
 var plans = []Plan{
-	{ID: "full", Name: "Pago Único", Amounts: []int{60000}},
-	{ID: "three", Name: "Plan de 3 Pagos Mensuales", Amounts: []int{20834, 20833, 20833}},
-	{ID: "six", Name: "Plan de 6 Pagos Mensuales", Amounts: []int{10835, 10833, 10833, 10833, 10833, 10833}},
+	{ID: "full", Name: "Pago Único", Amounts: []int64{60000}},
+	{ID: "three", Name: "Plan de 3 Pagos Mensuales", Amounts: []int64{20834, 20833, 20833}},
+	{ID: "six", Name: "Plan de 6 Pagos Mensuales", Amounts: []int64{10835, 10833, 10833, 10833, 10833, 10833}},
 }
 
 // PuertoRico uses UTC-4 without modern daylight saving time.
@@ -43,8 +43,8 @@ func Find(id string) (Plan, bool) {
 	return Plan{}, false
 }
 
-func (p Plan) TotalCents() int {
-	total := 0
+func (p Plan) TotalCents() int64 {
+	var total int64
 	for _, amount := range p.Amounts {
 		total += amount
 	}
@@ -64,16 +64,11 @@ func (p Plan) Schedule(now time.Time) []Installment {
 	return schedule
 }
 
-func Money(cents int) string {
+func Money(cents int64) string {
 	if cents < 0 {
 		return fmt.Sprintf("-$%d.%02d", -(cents / 100), -(cents % 100))
 	}
 	return fmt.Sprintf("$%d.%02d", cents/100, cents%100)
-}
-
-// Money64 formats an int64 cents value as US currency.
-func Money64(cents int64) string {
-	return Money(int(cents))
 }
 
 var spanishMonths = [...]string{

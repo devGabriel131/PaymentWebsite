@@ -7,7 +7,6 @@ import (
 	"slices"
 	"time"
 
-	"github.com/stripe/stripe-go/v87"
 
 	"paymentwebsite/internal/students"
 )
@@ -28,34 +27,6 @@ func (s *Service) ForLink(ctx context.Context, sourceLinkHash []byte) (*Summary,
 	return s.forStudent(ctx, student)
 }
 
-// UpdateCustomerContact updates the Stripe Customer's name and email for the student
-// enrolled from sourceLinkHash, if the contract already has a StripeCustomerID.
-// It runs on its own 5s context: the caller has already committed the edit, so a
-// disconnected client must not drop the sync.
-// ponytail: best-effort, a failed update is logged by the caller and never retried; stamp
-// the contract and let the billing worker retry if Stripe drift ever matters.
-func (s *Service) UpdateCustomerContact(ctx context.Context, sourceLinkHash []byte, name, email string) error {
-	if len(sourceLinkHash) != sha256.Size {
-		return nil
-	}
-	ctx, cancel := persistCtx(ctx)
-	defer cancel()
-	var student students.Student
-	found, err := firstRow(s.db.WithContext(ctx), &student, "source_link_hash = ?", sourceLinkHash)
-	if err != nil || !found {
-		return err
-	}
-	var contract Contract
-	found, err = firstRow(s.db.WithContext(ctx), &contract, "student_id = ?", student.ID)
-	if err != nil || !found || contract.StripeCustomerID == nil || *contract.StripeCustomerID == "" {
-		return err
-	}
-	_, err = s.client.V1Customers.Update(ctx, *contract.StripeCustomerID, &stripe.CustomerUpdateParams{
-		Name:  stripe.String(name),
-		Email: stripe.String(email),
-	})
-	return err
-}
 
 // ForStudent returns the financial summary, or nil when the student or contract does not exist.
 func (s *Service) ForStudent(ctx context.Context, studentID uint64) (*Summary, error) {
@@ -93,18 +64,21 @@ func (s *Service) FundedTimes(ctx context.Context, sourceHashes [][]byte) (map[s
 	return times, nil
 }
 
-// IsFunded reports whether the enrollment from sourceLinkHash has a confirmed first payment.
-// A link without a student or contract has paid nothing.
-func (s *Service) IsFunded(ctx context.Context, sourceLinkHash []byte) (bool, error) {
+// ContactEditable reports whether student contact details can still be edited.
+// Once funded or while a payment is in flight (processing, uncertain, expiring), edits are locked.
+func (s *Service) ContactEditable(ctx context.Context, sourceLinkHash []byte) (bool, error) {
 	if len(sourceLinkHash) != sha256.Size {
 		return false, nil
 	}
 	var count int64
 	err := s.db.WithContext(ctx).Model(&Contract{}).
 		Joins("JOIN students ON students.id = billing_contracts.student_id").
-		Where("students.source_link_hash = ? AND billing_contracts.funded_at IS NOT NULL", sourceLinkHash).
+		Where("students.source_link_hash = ? AND (billing_contracts.funded_at IS NOT NULL OR EXISTS (SELECT 1 FROM billing_checkout_attempts a WHERE a.contract_id = billing_contracts.id AND a.state IN ?))", sourceLinkHash, inFlightAttemptStates).
 		Count(&count).Error
-	return count > 0, err
+	if err != nil {
+		return false, err
+	}
+	return count == 0, nil
 }
 
 func (s *Service) forStudent(ctx context.Context, student students.Student) (*Summary, error) {

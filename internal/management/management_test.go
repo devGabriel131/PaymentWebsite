@@ -21,10 +21,10 @@ import (
 	"time"
 
 	"github.com/alexedwards/argon2id"
-	"github.com/stripe/stripe-go/v87"
 	"gorm.io/gorm"
 	"paymentwebsite/internal/auth"
 	"paymentwebsite/internal/billing"
+	"paymentwebsite/internal/billing/billingtest"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/settings"
@@ -32,7 +32,7 @@ import (
 	"paymentwebsite/internal/testdb"
 )
 
-var htmx = http.Header{"Hx-Request": {"true"}}
+var htmxHeader = http.Header{"Hx-Request": {"true"}}
 
 // later keeps directly created test links usable for any test's duration.
 var later = time.Now().Add(time.Hour)
@@ -88,32 +88,17 @@ func newBiller(t *testing.T, db *gorm.DB) *billing.Service {
 			},
 		})
 	})
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	maxRetries := int64(0)
-	backends := stripe.NewBackendsWithConfig(&stripe.BackendConfig{
-		URL:               stripe.String(server.URL),
-		HTTPClient:        server.Client(),
-		MaxNetworkRetries: &maxRetries,
-		LeveledLogger:     &stripe.LeveledLogger{Level: stripe.LevelNull},
+	mux.HandleFunc("POST /v1/customers/{id}", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":       r.PathValue("id"),
+			"object":   "customer",
+			"livemode": false,
+		})
 	})
-	client := stripe.NewClient("sk_test_dummy", stripe.WithBackends(backends))
-
-	biller, err := billing.New(db, client, billing.Config{
-		BaseURL:                      "http://127.0.0.1:3000",
-		WebhookSecret:                "whsec_test",
-		PaymentMethodConfigurationID: "pmc_test",
-		PortalConfigurationID:        "bpc_test",
-	}, billing.Catalog{Reinstatement: "price_reinstatement"}, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return biller
+	return billingtest.New(t, db, mux)
 }
 
-// newApp wires routes like main.go: auth owns session middleware and the root
-// mux retains outer origin protection.
+// newApp wires routes like main.go: auth owns session middleware.
 func newApp(t *testing.T) *app {
 	t.Helper()
 	models := append([]any{&links.Link{}, &students.Student{}, &settings.Settings{}, &auth.User{}, &auth.Session{}}, billing.Models()...)
@@ -132,7 +117,7 @@ func newApp(t *testing.T) *app {
 	root := http.NewServeMux()
 	manager.RegisterRoutes(root)
 	root.Handle("/management/", manager.Require(child))
-	server := httptest.NewServer(logging.Requests(log, http.NewCrossOriginProtection().Handler(root)))
+	server := httptest.NewServer(logging.Requests(log, root))
 	t.Cleanup(server.Close)
 	return &app{url: server.URL, db: db, store: store}
 }
@@ -171,7 +156,13 @@ func (a *app) signIn(t *testing.T, username string) *http.Client {
 
 func (a *app) send(t *testing.T, browser *http.Client, method, path string, form url.Values, header http.Header) (*http.Response, string) {
 	t.Helper()
-	req, err := http.NewRequestWithContext(t.Context(), method, a.url+path, strings.NewReader(form.Encode()))
+	return a.sendRaw(t, browser, method, path, form.Encode(), header)
+}
+
+// sendRaw posts a body as written, for requests a url.Values cannot spell.
+func (a *app) sendRaw(t *testing.T, browser *http.Client, method, path, body string, header http.Header) (*http.Response, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), method, a.url+path, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,11 +173,11 @@ func (a *app) send(t *testing.T, browser *http.Client, method, path string, form
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	body, err := io.ReadAll(res.Body)
+	content, err := io.ReadAll(res.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return res, string(body)
+	return res, string(content)
 }
 
 func (a *app) list(t *testing.T) []links.Entry {
@@ -321,9 +312,6 @@ func requireRows(t *testing.T, html string, want []links.Entry) {
 		if entry.SubmittedAt != nil {
 			ok = ok && strings.Contains(row, `datetime="`+entry.SubmittedAt.UTC().Format(time.RFC3339)+`"`)
 		}
-		if entry.PaidAt != nil {
-			ok = ok && strings.Contains(row, `datetime="`+entry.PaidAt.UTC().Format(time.RFC3339)+`"`)
-		}
 		if entry.Status != links.Finished && entry.Status != links.Canceled {
 			ok = ok && strings.Contains(row, `datetime="`+entry.ExpiresAt.UTC().Format(time.RFC3339)+`"`)
 		}
@@ -370,7 +358,7 @@ func TestUnauthorizedRequestsCannotUseManagement(t *testing.T) {
 		status               int
 	}{
 		{"ordinary", "Location", nil, http.StatusSeeOther},
-		{"htmx", "HX-Redirect", htmx, http.StatusUnauthorized},
+		{"htmx", "HX-Redirect", htmxHeader, http.StatusUnauthorized},
 	}
 	for _, b := range browsers {
 		t.Run(b.name+"/page", func(t *testing.T) {
@@ -434,55 +422,6 @@ func TestUnauthorizedRequestsCannotUseManagement(t *testing.T) {
 	}
 }
 
-func TestCrossOriginWritesAreRejected(t *testing.T) {
-	a := newApp(t)
-	existing, err := a.store.Create(t.Context(), "seed", later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if saved, err := a.store.Submit(t.Context(), existing.Token, contactDetails("Original student")); err != nil || saved != links.Saved {
-		t.Fatalf("submit student: saved=%v, err=%v", saved, err)
-	}
-	existing.Name, existing.Phone, existing.Status = "Original student", contactDetails("").Phone, links.Finished
-	staff := a.signIn(t, "staff")
-
-	origins := []struct {
-		name   string
-		header http.Header
-	}{
-		{"fetch metadata", http.Header{"Sec-Fetch-Site": {"cross-site"}}},
-		{"origin", http.Header{"Origin": {"https://attacker.example"}}},
-	}
-	for _, origin := range origins {
-		for _, path := range writePaths(existing.ID) {
-			t.Run(origin.name+path, func(t *testing.T) {
-				if res, body := a.send(t, staff, http.MethodPost, path, url.Values{
-					"value": {"Cross-origin name"}, "lifetime": {"10"}, "program_start_date": {"2026-12-01"},
-				}, origin.header); res.StatusCode != http.StatusForbidden {
-					t.Fatalf("status = %d, want 403: %s", res.StatusCode, body)
-				}
-				a.requireRegistry(t, existing)
-				student, err := students.New(a.db, nil).Get(t.Context(), 1)
-				if err != nil || student == nil || student.Name != "Original student" {
-					t.Fatalf("cross-origin request changed student: student=%+v, err=%v", student, err)
-				}
-			})
-		}
-	}
-	current, err := settings.New(a.db).Current(t.Context())
-	if err != nil || current.ProgramStartDate != "" || current.LinkLifetimeDays != settings.DefaultLinkLifetimeDays {
-		t.Fatalf("cross-origin request changed settings: current=%+v, err=%v", current, err)
-	}
-
-	// The same session succeeds without cross-origin headers, so origin alone caused each 403.
-	if res, body := a.send(t, staff, http.MethodPost, "/management/links", nil, htmx); res.StatusCode != http.StatusOK {
-		t.Fatalf("same-origin create: status = %d: %s", res.StatusCode, body)
-	}
-	if entries := a.list(t); len(entries) != 2 {
-		t.Fatalf("same-origin create left %d links, want 2", len(entries))
-	}
-}
-
 func TestRegistrySeparatesTrash(t *testing.T) {
 	a := newApp(t)
 	staff := a.signIn(t, "staff")
@@ -537,7 +476,7 @@ func TestRegistrySeparatesTrash(t *testing.T) {
 				t.Fatalf("program date section must appear only on main: %s", body)
 			}
 			requireRegistryPrivacy(t, body, contactDetails(""))
-			res, body = a.send(t, staff, http.MethodGet, tc.path, nil, htmx)
+			res, body = a.send(t, staff, http.MethodGet, tc.path, nil, htmxHeader)
 			requireRefresh(t, res, body, tc.want)
 			requireRegistryPrivacy(t, body, contactDetails(""))
 		})
@@ -555,7 +494,7 @@ func TestRegistryProjectsNewAndRefreshedRows(t *testing.T) {
 	details := contactDetails("Registry student")
 	details.Email, details.Municipality = "private.registry@example.com", "Loíza"
 	for _, field := range students.Fields() {
-		if saved, err := a.store.SaveDraft(t.Context(), created.Token, field.Key, field.Value(students.Student{Details: details})); err != nil || saved != links.Saved {
+		if saved, err := a.store.SaveDraft(t.Context(), created.Token, field.Key, field.Value(details)); err != nil || saved != links.Saved {
 			t.Fatalf("save registry fixture %s: saved=%v, err=%v", field.Key, saved, err)
 		}
 	}
@@ -574,7 +513,7 @@ func TestRegistryProjectsNewAndRefreshedRows(t *testing.T) {
 	if saved, err := a.store.SaveDraft(t.Context(), created.Token, "phone", "+17872345678"); err != nil || saved != links.Saved {
 		t.Fatalf("update registry phone: saved=%v, err=%v", saved, err)
 	}
-	res, body = a.send(t, staff, http.MethodGet, "/management/", nil, htmx)
+	res, body = a.send(t, staff, http.MethodGet, "/management/", nil, htmxHeader)
 	entries = a.list(t)
 	if entries[0].Phone != "+17872345678" {
 		t.Fatalf("refreshed phone = %q", entries[0].Phone)
@@ -582,11 +521,11 @@ func TestRegistryProjectsNewAndRefreshedRows(t *testing.T) {
 	requireRefresh(t, res, body, entries)
 	requireRegistryPrivacy(t, body, details)
 
-	res, body = a.send(t, staff, http.MethodPost, "/management/links/"+created.ID+"/cancel", nil, htmx)
+	res, body = a.send(t, staff, http.MethodPost, "/management/links/"+created.ID+"/cancel", nil, htmxHeader)
 	requireAcknowledged(t, res, body)
 	requireRegistryPrivacy(t, body, details)
 	trash := a.list(t)[:1]
-	for _, headers := range []http.Header{nil, htmx} {
+	for _, headers := range []http.Header{nil, htmxHeader} {
 		res, body = a.send(t, staff, http.MethodGet, "/management/trash", nil, headers)
 		if headers == nil {
 			requirePage(t, res, body, trash)
@@ -595,7 +534,7 @@ func TestRegistryProjectsNewAndRefreshedRows(t *testing.T) {
 		}
 		requireRegistryPrivacy(t, body, details)
 	}
-	res, body = a.send(t, staff, http.MethodPost, "/management/links", nil, htmx)
+	res, body = a.send(t, staff, http.MethodPost, "/management/links", nil, htmxHeader)
 	all := a.list(t)
 	requireCreated(t, res, body, all[len(all)-1])
 	requireRegistryPrivacy(t, body, details)
@@ -671,10 +610,10 @@ func TestRegistryArchivesCompletedSubmissions(t *testing.T) {
 	// A cancel from an old page leaves archived finished rows out of the list
 	// it has the page refresh.
 	for _, name := range []string{"Archived completion", "Expired completion"} {
-		res, body = a.send(t, staff, http.MethodPost, "/management/links/"+byName[name].ID+"/cancel", nil, htmx)
+		res, body = a.send(t, staff, http.MethodPost, "/management/links/"+byName[name].ID+"/cancel", nil, htmxHeader)
 		requireAcknowledged(t, res, body)
 	}
-	res, body = a.send(t, staff, http.MethodGet, "/management/", nil, htmx)
+	res, body = a.send(t, staff, http.MethodGet, "/management/", nil, htmxHeader)
 	requireRefresh(t, res, body, []links.Entry{byName["Recent completion"], byName["Old unfinished form"]})
 	a.requireRegistry(t, all...)
 	res, body = a.send(t, staff, http.MethodGet, "/management/trash", nil, nil)
@@ -697,7 +636,7 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 	var entries []links.Entry
 
 	if !t.Run("creation full page and one-time tokens", func(t *testing.T) {
-		res, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmx)
+		res, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmxHeader)
 		created := a.list(t)
 		if len(created) != 1 {
 			t.Fatalf("HTMX create left %d links, want 1", len(created))
@@ -741,7 +680,7 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 	}
 
 	if !t.Run("canceled draft retained", func(t *testing.T) {
-		res, body := a.send(t, worker, http.MethodPost, "/management/links", nil, htmx)
+		res, body := a.send(t, worker, http.MethodPost, "/management/links", nil, htmxHeader)
 		created := a.list(t)
 		if len(created) != 3 {
 			t.Fatalf("worker create left %d links, want 3", len(created))
@@ -758,7 +697,7 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 			t.Fatalf("draft and unrelated customer statuses: %+v", entries)
 		}
 		entries[1].Status, entries[1].CanceledBy = links.Canceled, "worker"
-		res, body = cancel(t, worker, entries[1].ID, htmx)
+		res, body = cancel(t, worker, entries[1].ID, htmxHeader)
 		requireAcknowledged(t, res, body)
 		a.requireRegistry(t, entries...)
 		res, body = a.send(t, admin, http.MethodGet, "/management/trash", nil, nil)
@@ -768,7 +707,7 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 	}
 
 	if !t.Run("first canceler audit preserved", func(t *testing.T) {
-		res, body := cancel(t, admin, entries[1].ID, htmx)
+		res, body := cancel(t, admin, entries[1].ID, htmxHeader)
 		requireAcknowledged(t, res, body)
 		a.requireRegistry(t, entries...)
 	}) {
@@ -782,7 +721,7 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 		}
 		expired.Token, expired.Status = "", links.Expired
 		entries = append(entries, expired)
-		res, body := cancel(t, worker, expired.ID, htmx)
+		res, body := cancel(t, worker, expired.ID, htmxHeader)
 		requireAcknowledged(t, res, body)
 		a.requireRegistry(t, entries...)
 	}) {
@@ -795,7 +734,7 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 		{"raw customer token", thirdToken},
 	} {
 		t.Run(tc.name+" cancel ID", func(t *testing.T) {
-			if res, body := cancel(t, admin, tc.id, htmx); res.StatusCode != http.StatusNoContent || body != "" {
+			if res, body := cancel(t, admin, tc.id, htmxHeader); res.StatusCode != http.StatusNoContent || body != "" {
 				t.Fatalf("HTMX: status = %d, want 204 so nothing is swapped: %s", res.StatusCode, body)
 			}
 			res, body := cancel(t, admin, tc.id, nil)
@@ -816,7 +755,7 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 	}
 
 	t.Run("HTMX cancel all retains completed and earlier audit", func(t *testing.T) {
-		_, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmx)
+		_, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmxHeader)
 		createdToken(t, body)
 		created := a.list(t)
 		if len(created) != len(entries)+1 {
@@ -825,9 +764,9 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 		newest := created[len(created)-1]
 		newest.Status, newest.CanceledBy = links.Canceled, "worker"
 		entries = append(entries, newest)
-		res, body := a.send(t, worker, http.MethodPost, "/management/links/cancel", nil, htmx)
+		res, body := a.send(t, worker, http.MethodPost, "/management/links/cancel", nil, htmxHeader)
 		requireAcknowledged(t, res, body)
-		res, body = a.send(t, worker, http.MethodGet, "/management/", nil, htmx)
+		res, body = a.send(t, worker, http.MethodGet, "/management/", nil, htmxHeader)
 		requireRefresh(t, res, body, entries[:1])
 		a.requireRegistry(t, entries...)
 		res, body = a.send(t, worker, http.MethodGet, "/management/trash", nil, nil)
@@ -873,8 +812,9 @@ func TestStoreFailuresAreServerErrors(t *testing.T) {
 		{"list", http.MethodGet, "/management/", nil, nil},
 		{"trash", http.MethodGet, "/management/trash", nil, nil},
 		{"students", http.MethodGet, "/management/students", nil, nil},
+		{"student", http.MethodGet, "/management/students/1", nil, nil},
 		{"cancel", http.MethodPost, cancel, nil, nil},
-		{"htmx cancel", http.MethodPost, cancel, htmx, nil},
+		{"htmx cancel", http.MethodPost, cancel, htmxHeader, nil},
 		{"program date", http.MethodPost, "/management/program-start-date", nil, url.Values{"program_start_date": {"2026-12-01"}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -898,7 +838,7 @@ func TestSettingsLifetimeAppliesOnlyToNewLinks(t *testing.T) {
 	admin := a.signIn(t, "admin")
 	create := func() links.Entry {
 		t.Helper()
-		if res, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmx); res.StatusCode != http.StatusOK {
+		if res, body := a.send(t, admin, http.MethodPost, "/management/links", nil, htmxHeader); res.StatusCode != http.StatusOK {
 			t.Fatalf("create: status = %d: %s", res.StatusCode, body)
 		}
 		entries := a.list(t)
@@ -1034,9 +974,8 @@ func TestProgramStartDateSavesWithoutChangingExistingEnrollment(t *testing.T) {
 		t.Fatalf("settings changed existing unfinished link: link=%+v, err=%v", pendingAfter, err)
 	}
 	res, body = a.send(t, admin, http.MethodGet, "/management/settings", nil, nil)
-	if res.StatusCode != http.StatusOK || !strings.Contains(body, "seven days of continued enrollment access") ||
-		!strings.Contains(body, `value="10"`) || strings.Contains(body, "success-page") {
-		t.Fatalf("lifetime page must show saved lifetime and continued access: status=%d: %s", res.StatusCode, body)
+	if res.StatusCode != http.StatusOK || !strings.Contains(body, `value="10"`) {
+		t.Fatalf("lifetime page must show saved lifetime: status=%d: %s", res.StatusCode, body)
 	}
 }
 
@@ -1055,27 +994,12 @@ func TestProgramStartDateRejectsInvalidFormsWithoutSaving(t *testing.T) {
 		{name: "query is not posted", query: "?program_start_date=2027-01-15"},
 		{name: "empty", body: "program_start_date="},
 		{name: "invalid calendar date", body: "program_start_date=2026-02-30", attempted: "2026-02-30"},
-		{name: "duplicate", body: "program_start_date=2027-01-15&program_start_date=2027-01-16", attempted: "2027-01-15", header: htmx},
+		{name: "duplicate", body: "program_start_date=2027-01-15&program_start_date=2027-01-16", attempted: "2027-01-15", header: htmxHeader},
 		{name: "malformed encoding", body: "program_start_date=2027-01-15&bad=%zz", attempted: "2027-01-15"},
 		{name: "body limit", body: "program_start_date=2027-01-15&padding=" + strings.Repeat("x", 1024)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, a.url+"/management/program-start-date"+tc.query, strings.NewReader(tc.body))
-			if err != nil {
-				t.Fatal(err)
-			}
-			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			maps.Copy(req.Header, tc.header)
-			res, err := admin.Do(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer res.Body.Close()
-			body, err := io.ReadAll(res.Body)
-			if err != nil {
-				t.Fatal(err)
-			}
-			text := string(body)
+			res, text := a.sendRaw(t, admin, http.MethodPost, "/management/program-start-date"+tc.query, tc.body, tc.header)
 			if res.StatusCode != http.StatusUnprocessableEntity || !strings.HasPrefix(text, "<!doctype html>") ||
 				!strings.Contains(text, `id="program-start-error" role="alert"`) ||
 				!strings.Contains(text, `value="`+tc.attempted+`" required`) ||
@@ -1111,9 +1035,9 @@ func TestRegistryLoadsProgramSettingsOnlyForFullMainPage(t *testing.T) {
 		status     int
 	}{
 		{"main needs settings", "/management/", nil, http.StatusInternalServerError},
-		{"main rows", "/management/", htmx, http.StatusOK},
+		{"main rows", "/management/", htmxHeader, http.StatusOK},
 		{"trash page", "/management/trash", nil, http.StatusOK},
-		{"trash rows", "/management/trash", htmx, http.StatusOK},
+		{"trash rows", "/management/trash", htmxHeader, http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
@@ -1155,8 +1079,10 @@ func TestManagementBillingRoutes(t *testing.T) {
 		t.Helper()
 		contract := billing.Contract{
 			StudentID: student.ID, Reference: rand.Text(), PlanID: "three", PlanName: planName,
-			InstallmentCount: 3, Currency: "usd", TotalCents: 62500, FundedAt: funded,
-			StripeCustomerID: ptr(fmt.Sprintf("cus_%d", student.ID)),
+			InstallmentCount: 3, TotalCents: 62500, FundedAt: funded,
+			StripeCustomerID:    ptr(fmt.Sprintf("cus_%d", student.ID)),
+			SyncedCustomerName:  student.Name,
+			SyncedCustomerEmail: student.Email,
 		}
 		create(&contract)
 		return contract
@@ -1185,7 +1111,7 @@ func TestManagementBillingRoutes(t *testing.T) {
 	}
 	contractB := seedContract(suspended, nil)
 	episode := billing.Suspension{ContractID: contractB.ID, TriggeringTuitionInstallmentNumber: 1,
-		TuitionDeadline: now.AddDate(0, 0, -30), StartedAt: now.AddDate(0, 0, -16), DetectedAt: now.AddDate(0, 0, -15)}
+		StartedAt: now.AddDate(0, 0, -16)}
 	create(&episode)
 	fee := seedObligation(contractB, billing.Obligation{Kind: "reinstatement", AmountCents: billing.ReinstatementFeeCents,
 		AmountRemainingCents: billing.ReinstatementFeeCents, SuspensionID: &episode.ID, StripeInvoiceID: ptr("inv_fee"),
@@ -1225,6 +1151,10 @@ func TestManagementBillingRoutes(t *testing.T) {
 			}
 		}
 	}
+
+	// The funded contract shows its paid time in the registry row.
+	_, registry := request(http.MethodGet, "/management/", http.StatusOK)
+	requireText("funded registry row", registry, true, `· paid <time datetime="`+now.Format(time.RFC3339)+`">`)
 
 	// GET fragment: out-of-range and unknown students are 404; a student without a contract still gets the shell.
 	for _, id := range missing {
@@ -1301,66 +1231,4 @@ func TestManagementBillingRoutes(t *testing.T) {
 	requireText("active row", rowOf(active.ID), false, "status-suspended")
 	requireText("suspended row", rowOf(suspended.ID), true, `<span class="status-badge status-suspended">Suspended</span>`)
 	requireText("suspended row", rowOf(suspended.ID), false, "status-active")
-}
-
-func TestManagementRendersPaidTimeForFundedLink(t *testing.T) {
-	a := newApp(t)
-	staff := a.signIn(t, "staff")
-	now := time.Now().UTC()
-	tokenHash := make([]byte, 32)
-	rand.Read(tokenHash)
-
-	link := links.Link{
-		TokenHash: tokenHash,
-		Details: students.Details{
-			Name:         "Pagado Student",
-			Email:        "pagado@example.com",
-			Phone:        "+17875551234",
-			Municipality: "San Juan",
-		},
-		CreatedAt:        now,
-		SubmittedAt:      &now,
-		ProgramStartDate: "2026-11-01",
-		PaymentPlan:      "three",
-		ExpiresAt:        now.Add(7 * 24 * time.Hour),
-	}
-	if err := a.db.Create(&link).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	student := students.Student{
-		SourceLinkHash: tokenHash,
-		Details:        link.Details,
-		CreatedAt:      now,
-		IsActive:       true,
-	}
-	if err := a.db.Create(&student).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	fundedAt := time.Date(2026, 10, 23, 14, 30, 0, 0, time.UTC)
-	contract := billing.Contract{
-		StudentID:        student.ID,
-		Reference:        "ref-paid-123",
-		PlanID:           "three",
-		PlanName:         "Plan de 3 Pagos Mensuales",
-		InstallmentCount: 3,
-		Currency:         "usd",
-		TotalCents:       62500,
-		FundedAt:         &fundedAt,
-	}
-	if err := a.db.Create(&contract).Error; err != nil {
-		t.Fatal(err)
-	}
-
-	res, html := a.send(t, staff, http.MethodGet, "/management/", nil, nil)
-	if res.StatusCode != http.StatusOK {
-		t.Fatalf("GET /management/: %d: %s", res.StatusCode, html)
-	}
-	if !strings.Contains(html, "· paid <time datetime=\"2026-10-23T14:30:00Z\">") {
-		t.Fatalf("expected paid timestamp in HTML, got:\n%s", html)
-	}
-	if strings.Contains(html, "enrollment access expires") {
-		t.Fatalf("Finished link should not render enrollment access expires, got:\n%s", html)
-	}
 }

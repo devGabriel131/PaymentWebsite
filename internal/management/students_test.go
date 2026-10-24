@@ -5,7 +5,6 @@ package management
 import (
 	"encoding/hex"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -66,26 +65,6 @@ func requireStudentState(t *testing.T, a *app, original students.Student, source
 	}
 }
 
-func sendStudentBody(t *testing.T, a *app, browser *http.Client, path, body string) (*http.Response, string) {
-	t.Helper()
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, a.url+path, strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("HX-Request", "true")
-	res, err := browser.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
-	content, err := io.ReadAll(res.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return res, string(content)
-}
-
 func requireStudentRow(t *testing.T, body string, record students.Student) {
 	t.Helper()
 	_, row, found := strings.Cut(body, fmt.Sprintf(`<tr id="student-row-%d"`, record.ID))
@@ -95,7 +74,7 @@ func requireStudentRow(t *testing.T, body string, record students.Student) {
 	}
 	previous := -1
 	for i, field := range students.Fields() {
-		cell := "<td>" + escapedHTML(field.Value(record)) + "</td>"
+		cell := "<td>" + escapedHTML(field.Value(record.Details)) + "</td>"
 		if i == 0 {
 			cell = ">" + escapedHTML(record.Name) + "</a>"
 		}
@@ -112,7 +91,7 @@ func requireStudentDetails(t *testing.T, body string, details students.Details) 
 	for _, field := range students.Fields() {
 		_, section, found := strings.Cut(body, "<h2>"+field.Label+"</h2>")
 		section, _, _ = strings.Cut(section, `<div class="student-field"`)
-		if !found || !strings.Contains(section, `<p class="student-field-value">`+escapedHTML(field.Value(students.Student{Details: details}))+`</p>`) {
+		if !found || !strings.Contains(section, `<p class="student-field-value">`+escapedHTML(field.Value(details))+`</p>`) {
 			t.Fatalf("details omitted or misplaced canonical %s: %s", field.Key, body)
 		}
 	}
@@ -218,7 +197,7 @@ func TestStudentReadValidateSaveReload(t *testing.T) {
 				!strings.Contains(body, `hx-target="closest .student-field" hx-swap="outerHTML"`) {
 				t.Fatalf("standalone editor: status = %d: %s", res.StatusCode, body)
 			}
-			requireStudentEditor(t, body, original.ID, edit.key, field.Value(students.Student{Details: expected}))
+			requireStudentEditor(t, body, original.ID, edit.key, field.Value(expected))
 			requireStudentState(t, a, original, source, other, expected)
 			res, body = a.send(t, staff, http.MethodGet, fieldPath, nil, nil)
 			if res.StatusCode != http.StatusOK || !strings.HasPrefix(body, "<!doctype html>") ||
@@ -276,7 +255,7 @@ func TestStudentValidationPreservesAttemptedValues(t *testing.T) {
 			t.Run(fmt.Sprintf("%s/htmx=%t", tc.name, partial), func(t *testing.T) {
 				var headers http.Header
 				if partial {
-					headers = htmx
+					headers = htmxHeader
 				}
 				res, body := a.send(t, staff, http.MethodPost, path+"/fields/"+tc.key, url.Values{"value": {tc.value}, "modal": {"1"}}, headers)
 				errorID := fmt.Sprintf("student-error-%d-%s", original.ID, tc.key)
@@ -299,7 +278,7 @@ func TestStudentValidationPreservesAttemptedValues(t *testing.T) {
 				}
 				if !partial {
 					for _, field := range students.Fields() {
-						if field.Key != tc.key && !strings.Contains(body, `<p class="student-field-value">`+escapedHTML(field.Value(original))+`</p>`) {
+						if field.Key != tc.key && !strings.Contains(body, `<p class="student-field-value">`+escapedHTML(field.Value(original.Details))+`</p>`) {
 							t.Fatalf("invalid %s lost canonical %s: %s", tc.key, field.Key, body)
 						}
 					}
@@ -317,7 +296,7 @@ func TestStudentHTMXFragmentsModalAndEscaping(t *testing.T) {
 	other, _ := enrollStudent(t, a, "Unrelated student")
 	path := fmt.Sprintf("/management/students/%d", original.ID)
 
-	res, body := a.send(t, staff, http.MethodGet, path, nil, htmx)
+	res, body := a.send(t, staff, http.MethodGet, path, nil, htmxHeader)
 	if res.StatusCode != http.StatusOK || strings.Contains(body, "<!doctype html>") ||
 		!strings.Contains(body, `class="student-details" hx-sync="closest .student-details:queue all"`) ||
 		!strings.Contains(body, `id="student-heading"`) || !strings.Contains(body, `method="dialog"`) ||
@@ -338,17 +317,17 @@ func TestStudentHTMXFragmentsModalAndEscaping(t *testing.T) {
 					query += "&modal=1"
 					cancel += "?modal=1"
 				}
-				res, body := a.send(t, staff, http.MethodGet, fieldPath+query, nil, htmx)
+				res, body := a.send(t, staff, http.MethodGet, fieldPath+query, nil, htmxHeader)
 				if res.StatusCode != http.StatusOK || !strings.Contains(body, fieldID) ||
 					strings.Contains(body, "student-heading") || strings.Contains(body, `method="dialog"`) ||
 					strings.Contains(body, `name="modal" value="1"`) != modal ||
 					!strings.Contains(body, `href="`+cancel+`"`) || !strings.Contains(body, `hx-get="`+cancel+`"`) {
 					t.Fatalf("single editor modal=%t: status = %d: %s", modal, res.StatusCode, body)
 				}
-				requireStudentEditor(t, body, original.ID, edit.key, field.Value(students.Student{Details: expected}))
-				res, body = a.send(t, staff, http.MethodGet, cancel, nil, htmx)
+				requireStudentEditor(t, body, original.ID, edit.key, field.Value(expected))
+				res, body = a.send(t, staff, http.MethodGet, cancel, nil, htmxHeader)
 				if res.StatusCode != http.StatusOK || !strings.Contains(body, fieldID) ||
-					!strings.Contains(body, `<p class="student-field-value">`+escapedHTML(field.Value(students.Student{Details: expected}))+`</p>`) ||
+					!strings.Contains(body, `<p class="student-field-value">`+escapedHTML(field.Value(expected))+`</p>`) ||
 					strings.Contains(body, "student-field-editor") || strings.Contains(body, "hx-swap-oob") || strings.Contains(body, "student-heading") {
 					t.Fatalf("cancel field modal=%t: status = %d: %s", modal, res.StatusCode, body)
 				}
@@ -360,9 +339,9 @@ func TestStudentHTMXFragmentsModalAndEscaping(t *testing.T) {
 					form.Set("modal", "1")
 					query = "?modal=0"
 				}
-				res, body = a.send(t, staff, http.MethodPost, fieldPath+query, form, htmx)
+				res, body = a.send(t, staff, http.MethodPost, fieldPath+query, form, htmxHeader)
 				if res.StatusCode != http.StatusOK || !strings.Contains(body, fieldID) ||
-					!strings.Contains(body, `<p class="student-field-value">`+escapedHTML(field.Value(students.Student{Details: edit.want}))+`</p>`) ||
+					!strings.Contains(body, `<p class="student-field-value">`+escapedHTML(field.Value(edit.want))+`</p>`) ||
 					!strings.Contains(body, `role="status">Saved.`) || strings.Contains(body, "<!doctype html>") ||
 					strings.Contains(body, "student-heading") || strings.Contains(body, "student-field-editor") {
 					t.Fatalf("HTMX save modal=%t: status = %d: %s", modal, res.StatusCode, body)
@@ -387,7 +366,7 @@ func TestStudentHTMXFragmentsModalAndEscaping(t *testing.T) {
 				!strings.Contains(body, "Back to students") {
 				t.Fatalf("presentation flag must not turn fallback into dialog: status = %d: %s", res.StatusCode, body)
 			}
-			requireStudentEditor(t, body, original.ID, edit.key, field.Value(students.Student{Details: expected}))
+			requireStudentEditor(t, body, original.ID, edit.key, field.Value(expected))
 		})
 	}
 	res, body = a.send(t, staff, http.MethodGet, path, nil, nil)
@@ -396,7 +375,7 @@ func TestStudentHTMXFragmentsModalAndEscaping(t *testing.T) {
 	}
 	requireStudentDetails(t, body, expected)
 	// Live refresh returns canonical records, never a nested page or source snapshot.
-	res, body = a.send(t, staff, http.MethodGet, "/management/students", nil, htmx)
+	res, body = a.send(t, staff, http.MethodGet, "/management/students", nil, htmxHeader)
 	if res.StatusCode != http.StatusOK || strings.Contains(body, "<!doctype html>") || strings.Contains(body, "<dialog") {
 		t.Fatalf("live records refresh: status = %d: %s", res.StatusCode, body)
 	}
@@ -404,7 +383,7 @@ func TestStudentHTMXFragmentsModalAndEscaping(t *testing.T) {
 	canonical.Details = expected
 	requireStudentRow(t, body, canonical)
 	requireStudentRow(t, body, other)
-	res, body = a.send(t, staff, http.MethodGet, "/management/", nil, htmx)
+	res, body = a.send(t, staff, http.MethodGet, "/management/", nil, htmxHeader)
 	requireRefresh(t, res, body, a.list(t))
 	if strings.Contains(body, escapedHTML(expected.Name)) || strings.Contains(body, escapedHTML(expected.Phone)) ||
 		!strings.Contains(body, escapedHTML(source.Name)) || !strings.Contains(body, escapedHTML(source.Phone)) {
@@ -446,7 +425,7 @@ func TestStudentRejectedRequestsCannotMutate(t *testing.T) {
 	for _, key := range []string{"id", "source_link_hash", "created_at", "missing", "name = 'changed'; DROP TABLE students;--"} {
 		t.Run("unknown field "+key, func(t *testing.T) {
 			for _, method := range []string{http.MethodGet, http.MethodPost} {
-				res, body := a.send(t, staff, method, path+"/fields/"+url.PathEscape(key), url.Values{"value": {"Changed student"}}, htmx)
+				res, body := a.send(t, staff, method, path+"/fields/"+url.PathEscape(key), url.Values{"value": {"Changed student"}}, htmxHeader)
 				if res.StatusCode != http.StatusNotFound || strings.Contains(body, "student-field-editor") || strings.Contains(body, "hx-swap-oob") {
 					t.Fatalf("unknown field: status = %d: %s", res.StatusCode, body)
 				}
@@ -458,13 +437,13 @@ func TestStudentRejectedRequestsCannotMutate(t *testing.T) {
 		t.Run("invalid student "+id, func(t *testing.T) {
 			missing := "/management/students/" + url.PathEscape(id)
 			for _, suffix := range []string{"", "/fields/name?edit=1"} {
-				res, body := a.send(t, staff, http.MethodGet, missing+suffix, nil, htmx)
+				res, body := a.send(t, staff, http.MethodGet, missing+suffix, nil, htmxHeader)
 				if res.StatusCode != http.StatusNotFound || strings.Contains(body, "student-details") || strings.Contains(body, "student-field-editor") {
 					t.Fatalf("invalid student GET: status = %d: %s", res.StatusCode, body)
 				}
 			}
 			for _, raw := range []string{"value=", "value=%zz", "value=" + strings.Repeat("x", 4096)} {
-				res, body := sendStudentBody(t, a, staff, missing+"/fields/name", raw)
+				res, body := a.sendRaw(t, staff, http.MethodPost, missing+"/fields/name", raw, htmxHeader)
 				if res.StatusCode != http.StatusNotFound || strings.Contains(body, "student-field-editor") || strings.Contains(body, "hx-swap-oob") {
 					t.Fatalf("missing student must precede body validation: status = %d: %s", res.StatusCode, body)
 				}
@@ -481,7 +460,7 @@ func TestStudentRejectedRequestsCannotMutate(t *testing.T) {
 		{"oversized", "value=" + strings.Repeat("x", 4096), http.StatusRequestEntityTooLarge},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			res, body := sendStudentBody(t, a, staff, fieldPath, tc.raw)
+			res, body := a.sendRaw(t, staff, http.MethodPost, fieldPath, tc.raw, htmxHeader)
 			if res.StatusCode != tc.status || strings.Contains(body, "student-field-editor") || strings.Contains(body, "Saved.") || strings.Contains(body, "hx-swap-oob") {
 				t.Fatalf("rejected body: status = %d, want %d: %s", res.StatusCode, tc.status, body)
 			}
@@ -496,7 +475,7 @@ func TestStudentRejectedRequestsCannotMutate(t *testing.T) {
 	if err := a.db.WithContext(t.Context()).Exec(`CREATE TRIGGER suppress_student_update BEFORE UPDATE ON students FOR EACH ROW EXECUTE FUNCTION suppress_student_update()`).Error; err != nil {
 		t.Fatal(err)
 	}
-	res, body := a.send(t, staff, http.MethodPost, fieldPath, url.Values{"value": {"Changed student"}, "modal": {"1"}}, htmx)
+	res, body := a.send(t, staff, http.MethodPost, fieldPath, url.Values{"value": {"Changed student"}, "modal": {"1"}}, htmxHeader)
 	if res.StatusCode != http.StatusNotFound || strings.Contains(body, "Saved.") || strings.Contains(body, "hx-swap-oob") {
 		t.Fatalf("zero-row save: status = %d: %s", res.StatusCode, body)
 	}
@@ -517,7 +496,7 @@ func TestStudentEmptyAndDatabaseFailures(t *testing.T) {
 	if err := a.db.WithContext(t.Context()).Exec(`ALTER TABLE students ADD CONSTRAINT reject_test_student_name CHECK (name <> 'Rejected by database')`).Error; err != nil {
 		t.Fatal(err)
 	}
-	for _, headers := range []http.Header{nil, htmx} {
+	for _, headers := range []http.Header{nil, htmxHeader} {
 		res, body = a.send(t, staff, http.MethodPost, fieldPath, url.Values{"value": {"Rejected by database"}, "modal": {"1"}}, headers)
 		if res.StatusCode != http.StatusInternalServerError || strings.Contains(body, "student-field-editor") ||
 			strings.Contains(body, "Saved.") || strings.Contains(body, "hx-swap-oob") || strings.Contains(body, "Rejected by database") {
@@ -536,7 +515,7 @@ func TestStudentEmptyAndDatabaseFailures(t *testing.T) {
 		{http.MethodGet, fieldPath + "?edit=1"},
 		{http.MethodPost, fieldPath},
 	} {
-		for _, headers := range []http.Header{nil, htmx} {
+		for _, headers := range []http.Header{nil, htmxHeader} {
 			res, body = a.send(t, staff, tc.method, tc.path, url.Values{"value": {"Changed student"}, "modal": {"1"}}, headers)
 			if res.StatusCode != http.StatusInternalServerError || strings.Contains(body, "student-empty") ||
 				strings.Contains(body, "Saved.") || strings.Contains(body, "hx-swap-oob") || strings.Contains(body, "Original submission") {

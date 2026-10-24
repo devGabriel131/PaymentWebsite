@@ -2,6 +2,7 @@ package students
 
 import "strings"
 
+// Source: https://pr.gov/gobierno-2/directorio-municipios
 var municipalities = []string{
 	"Adjuntas",
 	"Aguada",

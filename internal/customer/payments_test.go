@@ -4,42 +4,28 @@ package customer
 
 import (
 	"crypto/rand"
-	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/links"
-	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/students"
 )
 
 func TestPaymentReturnRoute(t *testing.T) {
 	db := customerDatabase(t)
-	store := links.New(db, nil)
-	biller := testCustomerBiller(t, db)
-
-	mux := http.NewServeMux()
-	if err := RegisterRoutes(mux, store, nil, biller); err != nil {
-		t.Fatal(err)
-	}
-	handler := logging.Requests(logging.New(io.Discard), mux)
+	handler := newMux(t, db)
 
 	// 1. Missing query params returns 404
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/payments/return", nil)
-	handler.ServeHTTP(rec, req)
+	rec := customerRequest(t, handler, http.MethodGet, "/payments/return", "", false)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for empty query, got %d", rec.Code)
 	}
 
 	// 2. Cancelled return returns 200 with "No completado"
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/payments/return?cancelled=1", nil)
-	handler.ServeHTTP(rec, req)
+	rec = customerRequest(t, handler, http.MethodGet, "/payments/return?cancelled=1", "", false)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for cancelled=1, got %d", rec.Code)
 	}
@@ -49,9 +35,7 @@ func TestPaymentReturnRoute(t *testing.T) {
 	}
 
 	// 3. Unknown session_id returns 404
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/payments/return?session_id=cs_unknown_999", nil)
-	handler.ServeHTTP(rec, req)
+	rec = customerRequest(t, handler, http.MethodGet, "/payments/return?session_id=cs_unknown_999", "", false)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for unknown session_id, got %d", rec.Code)
 	}
@@ -89,7 +73,6 @@ func TestPaymentReturnRoute(t *testing.T) {
 		PlanID:           "full",
 		PlanName:         "Pago Único",
 		InstallmentCount: 1,
-		Currency:         "usd",
 		TotalCents:       60000,
 	}
 	if err := db.Create(&contract).Error; err != nil {
@@ -97,22 +80,19 @@ func TestPaymentReturnRoute(t *testing.T) {
 	}
 	sessID := "cs_return_test_123"
 	attempt := billing.CheckoutAttempt{
-		ContractID:            contract.ID,
-		Reference:             rand.Text(),
-		PlanID:                "full",
-		FirstAmountCents:      60000,
-		StripePriceID:         "pr_full",
-		IntegrationIdentifier: "tuition_ret123",
-		CreationStartedAt:     now,
-		StripeSessionID:       &sessID,
-		State:                 "paid",
+		ContractID:        contract.ID,
+		Reference:         rand.Text(),
+		PlanID:            "full",
+		FirstAmountCents:  60000,
+		StripePriceID:     "pr_full",
+		CreationStartedAt: now,
+		StripeSessionID:   &sessID,
+		State:             "paid",
 	}
 	if err := db.Create(&attempt).Error; err != nil {
 		t.Fatalf("create attempt: %v", err)
 	}
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/payments/return?session_id="+sessID, nil)
-	handler.ServeHTTP(rec, req)
+	rec = customerRequest(t, handler, http.MethodGet, "/payments/return?session_id="+sessID, "", false)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for valid session_id, got %d: %s", rec.Code, rec.Body.String())
 	}
@@ -128,23 +108,20 @@ func TestPaymentReturnRoute(t *testing.T) {
 	// 5. Pending attempt renders polling trigger, spinner, and meta refresh
 	pendingSessID := "cs_return_pending_456"
 	pendingAttempt := billing.CheckoutAttempt{
-		ContractID:            contract.ID,
-		Reference:             rand.Text(),
-		PlanID:                "full",
-		FirstAmountCents:      60000,
-		StripePriceID:         "pr_full",
-		IntegrationIdentifier: "tuition_ret456",
-		CreationStartedAt:     now,
-		StripeSessionID:       &pendingSessID,
-		State:                 "processing",
+		ContractID:        contract.ID,
+		Reference:         rand.Text(),
+		PlanID:            "full",
+		FirstAmountCents:  60000,
+		StripePriceID:     "pr_full",
+		CreationStartedAt: now,
+		StripeSessionID:   &pendingSessID,
+		State:             "processing",
 	}
 	if err := db.Create(&pendingAttempt).Error; err != nil {
 		t.Fatalf("create pending attempt: %v", err)
 	}
 
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/payments/return?session_id="+pendingSessID, nil)
-	handler.ServeHTTP(rec, req)
+	rec = customerRequest(t, handler, http.MethodGet, "/payments/return?session_id="+pendingSessID, "", false)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for pending session_id, got %d", rec.Code)
 	}
@@ -160,10 +137,7 @@ func TestPaymentReturnRoute(t *testing.T) {
 	}
 
 	// 6. HX-Request returns only the partial
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/payments/return?session_id="+pendingSessID+"&polls=1", nil)
-	req.Header.Set("HX-Request", "true")
-	handler.ServeHTTP(rec, req)
+	rec = customerRequest(t, handler, http.MethodGet, "/payments/return?session_id="+pendingSessID+"&polls=1", "", true)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for HX-Request, got %d", rec.Code)
 	}
@@ -176,9 +150,7 @@ func TestPaymentReturnRoute(t *testing.T) {
 	}
 
 	// 7. Cap at polls >= 80 stops polling
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/payments/return?session_id="+pendingSessID+"&polls=80", nil)
-	handler.ServeHTTP(rec, req)
+	rec = customerRequest(t, handler, http.MethodGet, "/payments/return?session_id="+pendingSessID+"&polls=80", "", false)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 for polls=80, got %d", rec.Code)
 	}
@@ -188,5 +160,46 @@ func TestPaymentReturnRoute(t *testing.T) {
 	}
 	if strings.Contains(body, `<meta http-equiv="refresh"`) {
 		t.Fatalf("polls=80 should not have meta refresh: %s", body)
+	}
+
+	// 8. Failing DB with HX-Request returns 500 + retry fragment with polls+1
+	failingHandler := newMux(t, failingDB(t, db))
+
+	rec = customerRequest(t, failingHandler, http.MethodGet, "/payments/return?session_id=cs_failing_1&polls=1", "", true)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for failing DB HX-Request, got %d", rec.Code)
+	}
+	body = rec.Body.String()
+	if strings.Contains(body, "<!doctype") || strings.Contains(body, "<html") {
+		t.Fatalf("HX-Request should return only partial, got full page: %s", body)
+	}
+	if !strings.Contains(body, `hx-trigger="every 1.5s"`) {
+		t.Fatalf("expected hx-trigger in retry fragment: %s", body)
+	}
+	if !strings.Contains(body, `polls=2`) {
+		t.Fatalf("expected polls=2 in retry fragment: %s", body)
+	}
+
+	// 9. Failing DB with HX-Request at polls=80 returns 500 without hx-trigger
+	rec = customerRequest(t, failingHandler, http.MethodGet, "/payments/return?session_id=cs_failing_1&polls=80", "", true)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for failing DB HX-Request at cap, got %d", rec.Code)
+	}
+	body = rec.Body.String()
+	if strings.Contains(body, "hx-trigger") {
+		t.Fatalf("polls=80 error fragment should not have hx-trigger: %s", body)
+	}
+	if !strings.Contains(body, "Actualiza esta página") {
+		t.Fatalf("expected refresh copy in capped error fragment: %s", body)
+	}
+
+	// 10. Failing DB with non-HX request returns 500 full page
+	rec = customerRequest(t, failingHandler, http.MethodGet, "/payments/return?session_id=cs_failing_1&polls=1", "", false)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 for failing DB non-HX request, got %d", rec.Code)
+	}
+	body = rec.Body.String()
+	if !strings.Contains(body, `id="payment-error"`) {
+		t.Fatalf("expected full-page payment-error callout in non-HX error: %s", body)
 	}
 }

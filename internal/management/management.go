@@ -40,33 +40,36 @@ type settingsData struct {
 	Staff         string
 }
 
+// render writes the named template with status. Responses are never cached,
+// and vary on HX-Request because htmx gets fragments where browsers get pages.
+func render(w http.ResponseWriter, r *http.Request, page *template.Template, status int, name string, data any) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Vary", "HX-Request")
+	w.WriteHeader(status)
+	if err := page.ExecuteTemplate(w, name, data); err != nil {
+		logging.RecordError(r, "render", err)
+	}
+}
+
+// htmx reports whether r comes from htmx, which never gets a full page:
+// live list refreshes get rows, and actions get their notice.
+func htmx(r *http.Request) bool {
+	return r.Header.Get("HX-Request") == "true"
+}
+
 // RegisterRoutes serves customer links, Students, Trash, and settings; staff
 // returns the verified username of the signed-in account for the audit trail.
 // biller supplies each student's billing summary and the staff billing actions.
 func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Store, config *settings.Store, staff func(context.Context) string, biller *billing.Service) error {
 	page, err := template.New("management").Funcs(template.FuncMap{
-		"money64": payments.Money64,
+		"money": payments.Money,
 	}).ParseFS(templates, "templates/*.html")
 	if err != nil {
 		return err
 	}
-	execute := func(w http.ResponseWriter, r *http.Request, status int, name string, data any) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Vary", "HX-Request")
-		w.WriteHeader(status)
-		if err := page.ExecuteTemplate(w, name, data); err != nil {
-			logging.RecordError(r, "render", err)
-		}
-	}
-	registerStudentRoutes(mux, roster, biller, staff, execute)
-
-	// htmx reports whether r comes from htmx, which never gets a full page:
-	// live list refreshes get rows, and actions get their notice.
-	htmx := func(r *http.Request) bool {
-		return r.Header.Get("HX-Request") == "true"
-	}
+	registerStudentRoutes(mux, roster, biller, staff, page)
 
 	// list renders a tab's registry as a full page, or as just its rows for an
 	// htmx refresh. created shows its one-time URL on its row after an
@@ -125,7 +128,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 				}
 			}
 		}
-		execute(w, r, status, name, data)
+		render(w, r, page, status, name, data)
 	}
 
 	// acknowledge answers an htmx action with its notice, plus any created
@@ -133,10 +136,10 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 	// write rows, so a slower, older render never overwrites a newer one.
 	acknowledge := func(w http.ResponseWriter, r *http.Request, data pageData) {
 		w.Header().Set("HX-Trigger", "management-changed")
-		execute(w, r, http.StatusOK, "result", data)
+		render(w, r, page, http.StatusOK, "result", data)
 	}
 
-	mux.Handle("GET /management/{$}", logging.Operation("link_list", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /management/{$}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		var data pageData
@@ -144,13 +147,13 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			data.ProgramStartNotice = "Fecha de comienzo guardada."
 		}
 		list(ctx, w, r, http.StatusOK, data, nil)
-	})))
-	mux.Handle("GET /management/trash", logging.Operation("trash_list", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.Handle("GET /management/trash", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		list(ctx, w, r, http.StatusOK, pageData{Trash: true}, nil)
-	})))
-	mux.Handle("POST /management/program-start-date", logging.Operation("settings_update", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.Handle("POST /management/program-start-date", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
@@ -174,8 +177,8 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			logging.RecordError(r, "save", err)
 			http.Error(w, "Could not save the program start date. Please try again.", http.StatusInternalServerError)
 		}
-	})))
-	mux.Handle("POST /management/links", logging.Operation("link_create", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.Handle("POST /management/links", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		current, err := config.Current(ctx)
@@ -196,8 +199,8 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			return
 		}
 		list(ctx, w, r, http.StatusOK, data, &created)
-	})))
-	mux.Handle("POST /management/links/{id}/cancel", logging.Operation("link_cancel", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.Handle("POST /management/links/{id}/cancel", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		canceled, err := store.Cancel(ctx, r.PathValue("id"), staff(r.Context()))
@@ -220,8 +223,8 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 		default:
 			acknowledge(w, r, data)
 		}
-	})))
-	mux.Handle("POST /management/links/cancel", logging.Operation("link_cancel_all", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.Handle("POST /management/links/cancel", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		if err := store.CancelAll(ctx, staff(r.Context())); err != nil {
@@ -236,7 +239,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			return
 		}
 		list(ctx, w, r, http.StatusOK, data, nil)
-	})))
+	}))
 
 	// showSettings renders the settings page with the saved values.
 	showSettings := func(ctx context.Context, w http.ResponseWriter, r *http.Request, status int, data settingsData) {
@@ -248,9 +251,9 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 		}
 		data.Min, data.Max = settings.MinLinkLifetimeDays, settings.MaxLinkLifetimeDays
 		data.Staff = staff(r.Context())
-		execute(w, r, status, "settings.html", data)
+		render(w, r, page, status, "settings.html", data)
 	}
-	mux.Handle("GET /management/settings", logging.Operation("settings_load", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /management/settings", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		var data settingsData
@@ -258,8 +261,8 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			data.Notice = "Saved."
 		}
 		showSettings(ctx, w, r, http.StatusOK, data)
-	})))
-	mux.Handle("POST /management/settings", logging.Operation("settings_update", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	}))
+	mux.Handle("POST /management/settings", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<10)
@@ -280,6 +283,6 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 			logging.RecordError(r, "save", err)
 			http.Error(w, "Could not save settings. Please try again.", http.StatusInternalServerError)
 		}
-	})))
+	}))
 	return nil
 }

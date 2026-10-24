@@ -4,6 +4,7 @@ package customer
 
 import (
 	"context"
+	"crypto/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,11 +14,11 @@ import (
 	"testing"
 	"time"
 
-	"gorm.io/gorm"
-
+	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/payments"
 	"paymentwebsite/internal/settings"
+	"paymentwebsite/internal/testdb"
 )
 
 const agreementDate = "2027-02-28"
@@ -90,10 +91,7 @@ func TestAgreementAcceptanceCancellationKeepsRetryForm(t *testing.T) {
 			}
 		}
 	}()
-	var blockerPID, settingsID int
-	if err := blocker.Raw("SELECT pg_backend_pid()").Scan(&blockerPID).Error; err != nil {
-		t.Fatal(err)
-	}
+	var settingsID int
 	if err := blocker.Raw("SELECT id FROM settings WHERE id = 1 FOR UPDATE").Scan(&settingsID).Error; err != nil || settingsID != 1 {
 		t.Fatalf("lock agreement settings: id=%d, err=%v", settingsID, err)
 	}
@@ -106,27 +104,7 @@ func TestAgreementAcceptanceCancellationKeepsRetryForm(t *testing.T) {
 		fixture.mux.ServeHTTP(w, r)
 		results <- w
 	}()
-	poll := time.NewTicker(10 * time.Millisecond)
-	defer poll.Stop()
-	for {
-		var waiting bool
-		if err := fixture.db.WithContext(ctx).Raw(
-			"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE ? = ANY(pg_blocking_pids(pid)))",
-			blockerPID,
-		).Scan(&waiting).Error; err != nil {
-			t.Fatalf("observe acceptance lock wait: %v", err)
-		}
-		if waiting {
-			break
-		}
-		select {
-		case w := <-results:
-			t.Fatalf("acceptance did not wait on settings: status %d, %s", w.Code, w.Body.String())
-		case <-ctx.Done():
-			t.Fatalf("acceptance did not wait on settings: %v", ctx.Err())
-		case <-poll.C:
-		}
-	}
+	testdb.AwaitBlocked(t, ctx, fixture.db, blocker, results)
 	cancelAccept()
 	var w *httptest.ResponseRecorder
 	select {
@@ -185,7 +163,7 @@ func TestAgreementDateChangeRequiresFreshConsentAndReplaysKeepSnapshot(t *testin
 	w = customerRequest(t, fixture.mux, http.MethodPost, fixture.path+"/agreement", agreementForm(changedDate).Encode(), false)
 	requireAdvance(t, w, fixture.path+"/payments", false, privateFormValues(contactForm("Agreement private student"))...)
 	before, studentsBefore := stored(t, fixture.db), studentRecords(t, fixture.db)
-	if before[0].TermsAcceptedAt == nil || before[0].ProgramStartDate != changedDate || before[0].PaymentPlan != "" {
+	if before[0].TermsAcceptedAt == nil || before[0].ProgramStartDate != changedDate {
 		t.Fatalf("acceptance snapshot missing: %+v", before[0])
 	}
 	if err := fixture.configuration.SetProgramStartDate(t.Context(), "2028-04-01", "other staff"); err != nil {
@@ -286,10 +264,9 @@ func TestPaymentChoiceValidatesPersistsAndRemainsIsolated(t *testing.T) {
 			t.Fatalf("expected redirect to Stripe Checkout, got code=%d, loc=%q, body=%s", w.Code, w.Header().Get("Location"), w.Body.String())
 		}
 		selected, err := fixture.store.Lookup(t.Context(), fixture.entry.Token)
-		if err != nil || selected == nil || selected.PaymentPlan != plan.ID {
-			t.Fatalf("choice not persisted: %+v, %v", selected, err)
+		if err != nil || selected == nil {
+			t.Fatalf("lookup after choice: %+v, %v", selected, err)
 		}
-		selected.PaymentPlan = ""
 		if !reflect.DeepEqual(selected, original) {
 			t.Fatal("choice changed contact data or agreement snapshot")
 		}
@@ -344,8 +321,9 @@ func TestPaymentChoiceFailurePreservesSavedAndAttemptedState(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newAgreementFixture(t)
 			fixture.accept(t)
-			current, _ := fixture.store.Lookup(t.Context(), fixture.entry.Token)
-			if err := fixture.db.Model(&links.Link{}).Where("token_hash = ?", current.TokenHash).Update("payment_plan", full.ID).Error; err != nil {
+			student := studentRecords(t, fixture.db)[0]
+			contract := billing.Contract{StudentID: student.ID, Reference: rand.Text(), PlanID: full.ID, PlanName: full.Name, InstallmentCount: len(full.Amounts), TotalCents: full.TotalCents()}
+			if err := fixture.db.Create(&contract).Error; err != nil {
 				t.Fatalf("save original plan: %v", err)
 			}
 			before, studentsBefore := stored(t, fixture.db), studentRecords(t, fixture.db)
@@ -392,14 +370,8 @@ func TestPaymentChoiceFailurePreservesSavedAndAttemptedState(t *testing.T) {
 }
 
 func TestAgreementPaymentStageAndUsabilityCannotBeBypassed(t *testing.T) {
-	db := customerDatabase(t)
-	store := links.New(db, nil)
-	entry, err := store.Create(t.Context(), "staff", later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	mux := newMux(t, db, store)
-	path := "/customer/" + entry.Token
+	fixture := newFixture(t)
+	db, store, entry, path, mux := fixture.db, fixture.store, fixture.entry, fixture.path, fixture.mux
 	for _, stage := range []string{"before contact", "before agreement"} {
 		if stage == "before agreement" {
 			if result, err := store.Submit(t.Context(), entry.Token, contactDetails("Stage private student")); err != nil || result != links.Saved {
@@ -462,16 +434,12 @@ func TestAgreementPaymentStageAndUsabilityCannotBeBypassed(t *testing.T) {
 
 func TestAgreementAndPaymentHeadRemainReadOnly(t *testing.T) {
 	fixture := newAgreementFixture(t)
-	server := serve(t, fixture.db, fixture.store)
+	server := serve(t, fixture.db)
 	headKeeps(t, fixture.db, server, fixture.path+"/agreement", http.StatusOK)
 	headKeeps(t, fixture.db, server, fixture.path+"/payments", http.StatusSeeOther)
 	fixture.accept(t)
 	for _, suffix := range []string{"", "/forms", "/agreement", "/payments"} {
 		headKeeps(t, fixture.db, server, fixture.path+suffix, http.StatusOK)
-	}
-	current, _ := fixture.store.Lookup(t.Context(), fixture.entry.Token)
-	if err := fixture.db.Model(&links.Link{}).Where("token_hash = ?", current.TokenHash).Update("payment_plan", "six").Error; err != nil {
-		t.Fatalf("update plan: %v", err)
 	}
 }
 
@@ -491,7 +459,7 @@ func TestAgreementAndPaymentFailuresNeverClaimSuccess(t *testing.T) {
 	}
 	fixture.accept(t)
 	before = stored(t, fixture.db)
-	if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE links ADD CONSTRAINT reject_choice CHECK (payment_plan = '')").Error; err != nil {
+	if err := fixture.db.WithContext(t.Context()).Exec("ALTER TABLE billing_checkout_attempts ADD CONSTRAINT reject_attempt CHECK (false)").Error; err != nil {
 		t.Fatal(err)
 	}
 	w = customerRequest(t, fixture.mux, http.MethodPost, fixture.path+"/payments", "payment_plan=full", false)
@@ -502,7 +470,7 @@ func TestAgreementAndPaymentFailuresNeverClaimSuccess(t *testing.T) {
 	if after := stored(t, fixture.db); !reflect.DeepEqual(after, before) {
 		t.Fatal("failed payment choice changed link")
 	}
-	failing := newMux(t, fixture.db, failingStore(t, fixture.db))
+	failing := newMux(t, failingDB(t, fixture.db))
 	for _, view := range []string{"agreement", "payments"} {
 		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodHead} {
 			w = customerRequest(t, failing, method, fixture.path+"/"+view, "payment_plan=full", false)
@@ -532,29 +500,21 @@ func TestAgreementSettingsFailureIsServerError(t *testing.T) {
 }
 
 type agreementFixture struct {
-	db            *gorm.DB
-	store         *links.Store
+	fixture
 	configuration *settings.Store
-	entry         links.Entry
-	path          string
-	mux           http.Handler
 }
 
 func newAgreementFixture(t *testing.T) agreementFixture {
 	t.Helper()
-	db := customerDatabase(t)
-	store, configuration := links.New(db, nil), settings.New(db)
+	f := newFixture(t)
+	configuration := settings.New(f.db)
 	if err := configuration.SetProgramStartDate(t.Context(), agreementDate, "staff"); err != nil {
 		t.Fatal(err)
 	}
-	entry, err := store.Create(t.Context(), "staff", later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result, err := store.Submit(t.Context(), entry.Token, contactDetails("Agreement private student")); err != nil || result != links.Saved {
+	if result, err := f.store.Submit(t.Context(), f.entry.Token, contactDetails("Agreement private student")); err != nil || result != links.Saved {
 		t.Fatalf("submit fixture: %v, %v", result, err)
 	}
-	return agreementFixture{db: db, store: store, configuration: configuration, entry: entry, path: "/customer/" + entry.Token, mux: newMux(t, db, store)}
+	return agreementFixture{fixture: f, configuration: configuration}
 }
 
 func (fixture agreementFixture) accept(t *testing.T) {

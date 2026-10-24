@@ -148,7 +148,7 @@ func TestStreamIdleLifetimeAndHeartbeatsHTTP2(t *testing.T) {
 	t.Parallel()
 	synctest.Test(t, func(t *testing.T) {
 		feed := New()
-		server := httptest.NewTestServer(t, logging.Requests(logging.New(io.Discard), logging.Operation("live_updates", feed)))
+		server := httptest.NewTestServer(t, logging.Requests(logging.New(io.Discard), feed))
 		server.EnableHTTP2 = true
 		server.Config.WriteTimeout = 10 * time.Second
 		t.Cleanup(feed.Close)
@@ -246,7 +246,7 @@ func startPipeServer(t *testing.T, feed *Feed) (*http.Server, net.Conn, *http.Re
 		feed.ServeHTTP(w, r)
 	})
 	server := &http.Server{
-		Handler:      logging.Requests(logging.New(io.Discard), logging.Operation("live_updates", handler)),
+		Handler:      logging.Requests(logging.New(io.Discard), handler),
 		WriteTimeout: 10 * time.Second,
 	}
 	server.RegisterOnShutdown(feed.Close)

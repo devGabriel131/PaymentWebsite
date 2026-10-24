@@ -5,7 +5,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/stripe/stripe-go/v87/webhook"
 	"gorm.io/gorm/clause"
@@ -46,11 +45,6 @@ var webhookEvents = map[string]struct{}{
 // worker. It returns 200 only after insertion or a confirmed duplicate, so Stripe retries
 // anything that might have been lost. Body, signature and secret are never logged.
 func (s *Service) Webhook(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -90,9 +84,6 @@ func (s *Service) Webhook(w http.ResponseWriter, r *http.Request) {
 		ID:         event.ID,
 		EventType:  string(event.Type),
 		ResourceID: resourceID,
-		APIVersion: event.APIVersion,
-		Livemode:   event.Livemode,
-		ReceivedAt: time.Now().UTC(),
 	}
 	// A redelivery conflicts on the event ID and inserts nothing; that is confirmed durability.
 	err = s.db.WithContext(r.Context()).
@@ -104,9 +95,6 @@ func (s *Service) Webhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	select {
-	case s.wake <- struct{}{}:
-	default:
-	}
+	s.wakeWorker()
 	w.WriteHeader(http.StatusOK)
 }

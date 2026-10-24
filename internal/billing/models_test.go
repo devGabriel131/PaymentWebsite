@@ -41,7 +41,6 @@ func TestBillingModelsMigration(t *testing.T) {
 		PlanID:           "three",
 		PlanName:         "Plan de 3 Pagos Mensuales",
 		InstallmentCount: 3,
-		Currency:         "usd",
 		TotalCents:       62500,
 	}
 	if err := db.Create(&contract).Error; err != nil {
@@ -63,14 +62,13 @@ func TestBillingModelsMigration(t *testing.T) {
 
 	// Verify checkout attempt creation with nonterminal state
 	attempt := billing.CheckoutAttempt{
-		ContractID:            contract.ID,
-		Reference:             rand.Text(),
-		PlanID:                "three",
-		FirstAmountCents:      20834,
-		StripePriceID:         "price_test_three_first",
-		IntegrationIdentifier: "tuition_abc12345",
-		CreationStartedAt:     time.Now().UTC(),
-		State:                 "creating",
+		ContractID:        contract.ID,
+		Reference:         rand.Text(),
+		PlanID:            "three",
+		FirstAmountCents:  20834,
+		StripePriceID:     "price_test_three_first",
+		CreationStartedAt: time.Now().UTC(),
+		State:             "creating",
 	}
 	if err := db.Create(&attempt).Error; err != nil {
 		t.Fatalf("create checkout attempt: %v", err)
@@ -78,14 +76,13 @@ func TestBillingModelsMigration(t *testing.T) {
 
 	// Verify partial unique index prevents second active attempt for same contract
 	competingAttempt := billing.CheckoutAttempt{
-		ContractID:            contract.ID,
-		Reference:             rand.Text(),
-		PlanID:                "three",
-		FirstAmountCents:      20834,
-		StripePriceID:         "price_test_three_first",
-		IntegrationIdentifier: "tuition_def67890",
-		CreationStartedAt:     time.Now().UTC(),
-		State:                 "open",
+		ContractID:        contract.ID,
+		Reference:         rand.Text(),
+		PlanID:            "three",
+		FirstAmountCents:  20834,
+		StripePriceID:     "price_test_three_first",
+		CreationStartedAt: time.Now().UTC(),
+		State:             "open",
 	}
 	if err := db.Create(&competingAttempt).Error; err == nil {
 		t.Fatalf("expected error creating second nonterminal attempt on same contract, got nil")
@@ -95,9 +92,7 @@ func TestBillingModelsMigration(t *testing.T) {
 	suspension := billing.Suspension{
 		ContractID:                         contract.ID,
 		TriggeringTuitionInstallmentNumber: 1,
-		TuitionDeadline:                    time.Now().UTC(),
 		StartedAt:                          time.Now().UTC(),
-		DetectedAt:                         time.Now().UTC(),
 	}
 	if err := db.Create(&suspension).Error; err != nil {
 		t.Fatalf("create suspension: %v", err)
@@ -105,9 +100,7 @@ func TestBillingModelsMigration(t *testing.T) {
 	secondActiveSuspension := billing.Suspension{
 		ContractID:                         contract.ID,
 		TriggeringTuitionInstallmentNumber: 2,
-		TuitionDeadline:                    time.Now().UTC(),
 		StartedAt:                          time.Now().UTC(),
-		DetectedAt:                         time.Now().UTC(),
 	}
 	if err := db.Create(&secondActiveSuspension).Error; err == nil {
 		t.Fatalf("expected error creating second open suspension on same contract, got nil")

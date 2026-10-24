@@ -14,26 +14,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stripe/stripe-go/v87"
 	"golang.org/x/time/rate"
 	"gorm.io/gorm"
 
-	"paymentwebsite/internal/billing"
-	"paymentwebsite/internal/customer"
-	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
-	"paymentwebsite/internal/management"
-	"paymentwebsite/internal/settings"
-	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
 )
 
-// later keeps the seeded link usable for any test's duration.
-var later = time.Now().Add(time.Hour)
-
 func TestSignIn(t *testing.T) {
 	t.Parallel()
-	db := newAuthDatabase(t)
+	db := testdb.Open(t, &User{}, &Session{})
 	if err := createUser(t.Context(), db, "alice", "first password"); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +79,7 @@ func TestSignIn(t *testing.T) {
 func TestCredentialChangesEndSessions(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
-	db := newAuthDatabase(t)
+	db := testdb.Open(t, &User{}, &Session{})
 	app, manager := newApp(t, db)
 	manager.limiter = rate.NewLimiter(rate.Inf, 0)
 	if err := createUser(ctx, db, "alice", "first password"); err != nil {
@@ -134,7 +124,7 @@ func TestCredentialChangesEndSessions(t *testing.T) {
 
 func TestSignOutEndsOnlyThisBrowser(t *testing.T) {
 	t.Parallel()
-	db := newAuthDatabase(t)
+	db := testdb.Open(t, &User{}, &Session{})
 	app, manager := newApp(t, db)
 	manager.limiter = rate.NewLimiter(rate.Inf, 0)
 	if err := createUser(t.Context(), db, "alice", "first password"); err != nil {
@@ -164,27 +154,6 @@ func TestSignOutEndsOnlyThisBrowser(t *testing.T) {
 		}
 	}
 	requireSignedIn(t, app, desktop)
-}
-
-func TestPublicCustomerIgnoresStaffSessions(t *testing.T) {
-	t.Parallel()
-	db := newAuthDatabase(t)
-	app, _ := newApp(t, db)
-	if err := db.WithContext(t.Context()).Exec("ALTER TABLE sessions RENAME TO unavailable_sessions").Error; err != nil {
-		t.Fatal(err)
-	}
-	cookie := &http.Cookie{Name: cookieName, Value: "forged-staff-session"}
-	request := newRequest(t, http.MethodHead, "/customer/"+strings.Repeat("A", 43))
-	rec := serve(app, request, cookie)
-	if rec.Code != http.StatusNotFound || rec.Body.Len() != 0 ||
-		rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Referrer-Policy") != "no-referrer" ||
-		strings.Contains(rec.Header().Get("Vary"), "Cookie") || len(rec.Result().Cookies()) != 0 {
-		t.Fatalf("public customer with unavailable staff sessions: status %d, headers %v, body %q",
-			rec.Code, rec.Header(), rec.Body.String())
-	}
-	if rec := serve(app, newRequest(t, http.MethodGet, "/management/"), cookie); rec.Code != http.StatusInternalServerError {
-		t.Fatalf("protected management with unavailable staff sessions: status %d, body %q", rec.Code, rec.Body.String())
-	}
 }
 
 func TestSessionCleanupDeletesOnlyExpired(t *testing.T) {
@@ -263,33 +232,7 @@ func TestSessionCleanupDeletesOnlyExpired(t *testing.T) {
 	}
 }
 
-func newAuthDatabase(t *testing.T) *gorm.DB {
-	t.Helper()
-	models := append([]any{&User{}, &Session{}, &links.Link{}, &students.Student{}, &settings.Settings{}}, billing.Models()...)
-	db := testdb.Open(t, models...)
-	if _, err := links.New(db, nil).Create(t.Context(), "seed", later); err != nil {
-		t.Fatal(err)
-	}
-	return db
-}
-
-func newTestBiller(t *testing.T, db *gorm.DB) *billing.Service {
-	t.Helper()
-	cfg := billing.Config{
-		BaseURL:                      "http://127.0.0.1:3000",
-		WebhookSecret:                "whsec_dummy",
-		PaymentMethodConfigurationID: "pmc_dummy",
-		PortalConfigurationID:        "bpc_dummy",
-		Live:                         false,
-	}
-	biller, err := billing.New(db, stripe.NewClient("sk_test_dummy"), cfg, billing.Catalog{}, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return biller
-}
-
-// newApp wires auth like main: staff-only sessions, origin protection, and public customer routes.
+// newApp wires auth like main, with a tiny staff-only handler standing in for the management pages.
 func newApp(t *testing.T, db *gorm.DB) (http.Handler, *Manager) {
 	t.Helper()
 	log := logging.New(io.Discard)
@@ -300,17 +243,10 @@ func newApp(t *testing.T, db *gorm.DB) (http.Handler, *Manager) {
 	t.Cleanup(manager.Close)
 	mux := http.NewServeMux()
 	manager.RegisterRoutes(mux)
-	store := links.New(db, nil)
-	biller := newTestBiller(t, db)
-	managementMux := http.NewServeMux()
-	if err := management.RegisterRoutes(managementMux, store, students.New(db, nil), settings.New(db), Staff, biller); err != nil {
-		t.Fatal(err)
-	}
-	mux.Handle("/management/", manager.Require(managementMux))
-	if err := customer.RegisterRoutes(mux, store, settings.New(db), biller); err != nil {
-		t.Fatal(err)
-	}
-	return logging.Requests(log, http.NewCrossOriginProtection().Handler(mux)), manager
+	mux.Handle("/management/", manager.Require(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "staff:"+Staff(r.Context()))
+	})))
+	return logging.Requests(log, mux), manager
 }
 
 func newRequest(t *testing.T, method, path string) *http.Request {
@@ -362,7 +298,7 @@ func requireRejected(t *testing.T, app http.Handler, username, password string) 
 func requireSignedIn(t *testing.T, app http.Handler, cookie *http.Cookie) {
 	t.Helper()
 	rec := serve(app, newRequest(t, http.MethodGet, "/management/"), cookie)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `<li class="management-link">`) {
+	if rec.Code != http.StatusOK || rec.Body.String() != "staff:alice" {
 		t.Fatalf("signed-in visit: status %d, body %q", rec.Code, rec.Body.String())
 	}
 	if issued := rec.Result().Cookies(); len(issued) != 0 {
@@ -375,7 +311,7 @@ func requireSignedOut(t *testing.T, app http.Handler, cookie *http.Cookie) {
 	rec := serve(app, newRequest(t, http.MethodGet, "/management/"), cookie)
 	body := rec.Body.String()
 	if rec.Code != http.StatusOK || !strings.Contains(body, `action="/management/login"`) ||
-		strings.Contains(body, `href="/customer/`) || rec.Header().Get("Cache-Control") != "no-store" {
+		strings.Contains(body, "staff:") || rec.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("signed-out visit: status %d, Cache-Control %q, body %q", rec.Code, rec.Header().Get("Cache-Control"), body)
 	}
 }

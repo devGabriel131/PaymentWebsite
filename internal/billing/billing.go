@@ -14,14 +14,18 @@ import (
 	"gorm.io/gorm"
 )
 
+// providerBudget bounds one call's synchronous provider work and stays under the server's
+// 10 s write timeout; slower outcomes are recorded and resumed rather than holding the browser.
+const providerBudget = 8 * time.Second
+
 // Bounded review reasons.
 const (
-	ReviewUnresolvedProviderCreate = "unresolved_provider_create"
-	ReviewInvoiceMismatch          = "invoice_mismatch"
-	ReviewMissingInvoice           = "missing_invoice"
-	ReviewPaymentReview            = "payment_review"
-	ReviewUnsupportedPaymentMethod = "unsupported_payment_method"
-	ReviewConfigurationMismatch    = "configuration_mismatch"
+	reviewUnresolvedProviderCreate = "unresolved_provider_create"
+	reviewInvoiceMismatch          = "invoice_mismatch"
+	reviewMissingInvoice           = "missing_invoice"
+	reviewPaymentReview            = "payment_review"
+	reviewUnsupportedPaymentMethod = "unsupported_payment_method"
+	reviewConfigurationMismatch    = "configuration_mismatch"
 )
 
 // Exported error values.
@@ -32,8 +36,9 @@ var (
 	ErrNotSuspended    = errors.New("student is not suspended")
 	ErrNeedsReview     = errors.New("financial state needs review")
 	ErrInvoiceNotReady = errors.New("invoice is not ready")
-	ErrStaffRequired   = errors.New("staff identity is required")
 )
+
+var errStaffRequired = errors.New("staff identity is required")
 
 // CheckoutResult returns the outcome of initiating or resuming a checkout attempt.
 type CheckoutResult struct {
@@ -96,12 +101,6 @@ type Service struct {
 
 // New creates a verified billing service.
 func New(db *gorm.DB, client *stripe.Client, cfg Config, catalog Catalog, changed func(), log *slog.Logger) (*Service, error) {
-	if db == nil {
-		return nil, errors.New("db is required")
-	}
-	if client == nil {
-		return nil, errors.New("stripe client is required")
-	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -120,6 +119,25 @@ func New(db *gorm.DB, client *stripe.Client, cfg Config, catalog Catalog, change
 		log:     log,
 		wake:    make(chan struct{}, 1),
 	}, nil
+}
+
+func (s *Service) wakeWorker() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// touch marks the student's Stripe-bound contract due for sync now.
+func touch(db *gorm.DB, studentID uint64) error {
+	return db.Model(&Contract{}).Where("student_id = ? AND stripe_customer_id IS NOT NULL", studentID).Update("next_sync_at", time.Now().UTC()).Error
+}
+
+// TouchContractForStudent marks the student's Stripe-bound contract due now and wakes the
+// billing worker so contact updates sync promptly.
+func (s *Service) TouchContractForStudent(ctx context.Context, studentID uint64) {
+	_ = touch(s.db.WithContext(ctx), studentID)
+	s.wakeWorker()
 }
 
 // contractFor finds the contract behind a student; unknown or out-of-range IDs are unavailable.
@@ -145,6 +163,8 @@ func (s *Service) withStaffContract(ctx context.Context, id uint64, fn func(leas
 // markSynced records a staff-triggered sync the way the worker does, so the next scheduled
 // sync accounts for whatever the action just created.
 func (s *Service) markSynced(ctx context.Context, l lease) error {
+	ctx, cancel := persistCtx(ctx)
+	defer cancel()
 	now := time.Now().UTC()
 	next, err := s.nextSync(ctx, l.id, now)
 	if err != nil {
@@ -182,8 +202,10 @@ func (s *Service) reinstatable(ctx context.Context, contractID uint64) (ep Suspe
 // staff. Original overdue invoices are refreshed first and are never duplicated onto the fee.
 func (s *Service) RequestReinstatement(ctx context.Context, studentID uint64, staff string) (*Summary, error) {
 	if strings.TrimSpace(staff) == "" {
-		return nil, ErrStaffRequired
+		return nil, errStaffRequired
 	}
+	ctx, cancel := context.WithTimeout(ctx, providerBudget)
+	defer cancel()
 	c, err := s.contractFor(ctx, studentID)
 	if err != nil {
 		return nil, err
@@ -224,7 +246,8 @@ func (s *Service) requestFee(ctx context.Context, l lease, staff string) error {
 	}); i >= 0 {
 		fee = obligations[i]
 	} else {
-		if s.catalog.Reinstatement == "" {
+		price := s.catalog[reinstatementKey]
+		if price == "" {
 			return errors.New("billing: catalog has no reinstatement price")
 		}
 		fee = Obligation{
@@ -232,7 +255,7 @@ func (s *Service) requestFee(ctx context.Context, l lease, staff string) error {
 			Reference:             rand.Text(),
 			Kind:                  "reinstatement",
 			AmountCents:           ReinstatementFeeCents,
-			StripePriceID:         s.catalog.Reinstatement,
+			StripePriceID:         price,
 			SuspensionID:          &ep.ID,
 			CollectionDisposition: "collect",
 			AmountRemainingCents:  ReinstatementFeeCents,
@@ -260,6 +283,8 @@ func (s *Service) requestFee(ctx context.Context, l lease, staff string) error {
 // InvoiceURL returns the current hosted URL of one of the student's invoices. Links expire,
 // so it is fetched on demand and never stored.
 func (s *Service) InvoiceURL(ctx context.Context, studentID, obligationID uint64) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, providerBudget)
+	defer cancel()
 	c, err := s.contractFor(ctx, studentID)
 	if err != nil {
 		return "", err
@@ -289,7 +314,9 @@ func (s *Service) InvoiceURL(ctx context.Context, studentID, obligationID uint64
 
 // PortalURL creates a short-lived Stripe customer-portal link for the contract's own Customer.
 // It never marks anything paid or reactivates.
-func (s *Service) PortalURL(ctx context.Context, studentID uint64, _ string) (string, error) {
+func (s *Service) PortalURL(ctx context.Context, studentID uint64) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, providerBudget)
+	defer cancel()
 	c, err := s.contractFor(ctx, studentID)
 	if err != nil {
 		return "", err
@@ -311,7 +338,9 @@ func (s *Service) PortalURL(ctx context.Context, studentID uint64, _ string) (st
 
 // ReconcileStudent refreshes the student's existing Stripe resources for staff: in-flight
 // Checkouts, invoices, then deadlines and reactivation. It never creates a fresh charge.
-func (s *Service) ReconcileStudent(ctx context.Context, studentID uint64, _ string) (*Summary, error) {
+func (s *Service) ReconcileStudent(ctx context.Context, studentID uint64) (*Summary, error) {
+	ctx, cancel := context.WithTimeout(ctx, providerBudget)
+	defer cancel()
 	c, err := s.contractFor(ctx, studentID)
 	if err != nil {
 		return nil, err

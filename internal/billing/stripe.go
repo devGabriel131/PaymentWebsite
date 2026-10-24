@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -16,14 +18,8 @@ import (
 )
 
 const (
-	LookupKeyFullInitial   = "asvab_full_initial_usd"
-	LookupKeyThreeInitial  = "asvab_three_initial_usd"
-	LookupKeyThreeLater    = "asvab_three_remaining_usd"
-	LookupKeySixInitial    = "asvab_six_initial_usd"
-	LookupKeySixLater      = "asvab_six_remaining_usd"
-	LookupKeyReinstatement = "asvab_reinstatement_usd"
-
 	ReinstatementFeeCents = 2500
+	reinstatementKey      = "asvab_reinstatement_usd"
 )
 
 // Config carries server-mode Stripe configuration.
@@ -106,14 +102,15 @@ func LoadConfigFromEnv() (Config, string, error) {
 	return cfg, apiKey, nil
 }
 
-// Catalog holds resolved Stripe Price IDs for finite tuition plans and reinstatement.
-type Catalog struct {
-	Full          string
-	ThreeFirst    string
-	ThreeLater    string
-	SixFirst      string
-	SixLater      string
-	Reinstatement string
+// Catalog maps price lookup keys to resolved Stripe Price IDs.
+type Catalog map[string]string
+
+// priceKey names the lookup key of a plan's i-th installment. Every later installment shares one price.
+func priceKey(planID string, i int) string {
+	if i == 0 {
+		return "asvab_" + planID + "_initial_usd"
+	}
+	return "asvab_" + planID + "_remaining_usd"
 }
 
 // NewStripeClient creates a client configured with 5-second timeouts, at most 2 retries,
@@ -131,90 +128,65 @@ func NewStripeClient(apiKey string) *stripe.Client {
 	return stripe.NewClient(apiKey, stripe.WithBackends(backends))
 }
 
-// LoadCatalog queries Stripe for all 6 catalog prices in a single batched lookup
-// and validates currency, unit amount, billing scheme, and livemode.
+// LoadCatalog queries Stripe for every plan installment price and the reinstatement fee in a
+// single batched lookup and validates currency, unit amount, billing scheme, and livemode.
 func LoadCatalog(ctx context.Context, client *stripe.Client, live bool) (Catalog, error) {
-	fullPlan, ok := payments.Find("full")
-	if !ok || len(fullPlan.Amounts) < 1 {
-		return Catalog{}, errors.New("payment plan 'full' not found in registry")
-	}
-	threePlan, ok := payments.Find("three")
-	if !ok || len(threePlan.Amounts) < 2 {
-		return Catalog{}, errors.New("payment plan 'three' not found in registry")
-	}
-	sixPlan, ok := payments.Find("six")
-	if !ok || len(sixPlan.Amounts) < 2 {
-		return Catalog{}, errors.New("payment plan 'six' not found in registry")
+	expected := map[string]int64{reinstatementKey: ReinstatementFeeCents}
+	for _, p := range payments.Plans() {
+		for i, amount := range p.Amounts {
+			key := priceKey(p.ID, i)
+			if prev, ok := expected[key]; ok && prev != amount {
+				return nil, fmt.Errorf("plan %q installments share price key %q but differ in amount", p.ID, key)
+			}
+			expected[key] = amount
+		}
 	}
 
-	expectedAmounts := map[string]int64{
-		LookupKeyFullInitial:   int64(fullPlan.Amounts[0]),
-		LookupKeyThreeInitial:  int64(threePlan.Amounts[0]),
-		LookupKeyThreeLater:    int64(threePlan.Amounts[1]),
-		LookupKeySixInitial:    int64(sixPlan.Amounts[0]),
-		LookupKeySixLater:      int64(sixPlan.Amounts[1]),
-		LookupKeyReinstatement: int64(ReinstatementFeeCents),
-	}
-
-	keys := []*string{
-		stripe.String(LookupKeyFullInitial),
-		stripe.String(LookupKeyThreeInitial),
-		stripe.String(LookupKeyThreeLater),
-		stripe.String(LookupKeySixInitial),
-		stripe.String(LookupKeySixLater),
-		stripe.String(LookupKeyReinstatement),
-	}
-
+	// ponytail: Stripe caps lookup_keys at 10
 	params := &stripe.PriceListParams{
-		LookupKeys: keys,
+		LookupKeys: stripe.StringSlice(slices.Sorted(maps.Keys(expected))),
 	}
 
 	iter := client.V1Prices.List(ctx, params)
 	resolved := make(map[string]*stripe.Price)
 	for price, err := range iter.All(ctx) {
 		if err != nil {
-			return Catalog{}, fmt.Errorf("list prices from stripe: %w", err)
+			return nil, fmt.Errorf("list prices from stripe: %w", err)
 		}
 		if price == nil || price.LookupKey == "" {
 			continue
 		}
 		if _, exists := resolved[price.LookupKey]; exists {
-			return Catalog{}, fmt.Errorf("conflicting duplicate price found for lookup key %q", price.LookupKey)
+			return nil, fmt.Errorf("conflicting duplicate price found for lookup key %q", price.LookupKey)
 		}
 		resolved[price.LookupKey] = price
 	}
 
-	for lookupKey, expectedCents := range expectedAmounts {
+	catalog := make(Catalog, len(expected))
+	for lookupKey, expectedCents := range expected {
 		price, found := resolved[lookupKey]
 		if !found {
-			return Catalog{}, fmt.Errorf("missing stripe price for lookup key %q", lookupKey)
+			return nil, fmt.Errorf("missing stripe price for lookup key %q", lookupKey)
 		}
 		if !price.Active {
-			return Catalog{}, fmt.Errorf("stripe price %q (%s) is not active", lookupKey, price.ID)
+			return nil, fmt.Errorf("stripe price %q (%s) is not active", lookupKey, price.ID)
 		}
 		if price.Livemode != live {
-			return Catalog{}, fmt.Errorf("stripe price %q livemode (%t) does not match configured live mode (%t)", lookupKey, price.Livemode, live)
+			return nil, fmt.Errorf("stripe price %q livemode (%t) does not match configured live mode (%t)", lookupKey, price.Livemode, live)
 		}
 		if price.Currency != stripe.CurrencyUSD {
-			return Catalog{}, fmt.Errorf("stripe price %q has currency %q, expected usd", lookupKey, price.Currency)
+			return nil, fmt.Errorf("stripe price %q has currency %q, expected usd", lookupKey, price.Currency)
 		}
 		if price.BillingScheme != stripe.PriceBillingSchemePerUnit {
-			return Catalog{}, fmt.Errorf("stripe price %q has billing scheme %q, expected per_unit", lookupKey, price.BillingScheme)
+			return nil, fmt.Errorf("stripe price %q has billing scheme %q, expected per_unit", lookupKey, price.BillingScheme)
 		}
 		if price.Type != stripe.PriceTypeOneTime {
-			return Catalog{}, fmt.Errorf("stripe price %q has type %q, expected one_time", lookupKey, price.Type)
+			return nil, fmt.Errorf("stripe price %q has type %q, expected one_time", lookupKey, price.Type)
 		}
 		if price.UnitAmount != expectedCents {
-			return Catalog{}, fmt.Errorf("stripe price %q has unit amount %d cents, expected %d cents", lookupKey, price.UnitAmount, expectedCents)
+			return nil, fmt.Errorf("stripe price %q has unit amount %d cents, expected %d cents", lookupKey, price.UnitAmount, expectedCents)
 		}
+		catalog[lookupKey] = price.ID
 	}
-
-	return Catalog{
-		Full:          resolved[LookupKeyFullInitial].ID,
-		ThreeFirst:    resolved[LookupKeyThreeInitial].ID,
-		ThreeLater:    resolved[LookupKeyThreeLater].ID,
-		SixFirst:      resolved[LookupKeySixInitial].ID,
-		SixLater:      resolved[LookupKeySixLater].ID,
-		Reinstatement: resolved[LookupKeyReinstatement].ID,
-	}, nil
+	return catalog, nil
 }

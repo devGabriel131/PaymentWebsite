@@ -99,13 +99,13 @@
     <label for="student-input-{{.StudentID}}-{{.Key}}">{{.Label}}</label>
     {{if .Options}}
     {{$value := .Value}}{{$selected := false}}{{range .Options}}{{if eq . $value}}{{$selected = true}}{{end}}{{end}}
-    <select id="student-input-{{.StudentID}}-{{.Key}}" name="value"{{if .Required}} required{{end}}{{if .Error}}
+    <select id="student-input-{{.StudentID}}-{{.Key}}" name="value" required{{if .Error}}
       aria-invalid="true" aria-describedby="student-error-{{.StudentID}}-{{.Key}}"{{end}}>
       <option value=""{{if not $selected}} selected{{end}}>Select a municipality</option>
       {{range .Options}}<option value="{{.}}"{{if eq . $value}} selected{{end}}>{{.}}</option>{{end}}
     </select>
     {{else}}
-    <input id="student-input-{{.StudentID}}-{{.Key}}" name="value" type="{{.InputType}}" value="{{.Value}}"{{if .Required}} required{{end}}{{if .Error}}
+    <input id="student-input-{{.StudentID}}-{{.Key}}" name="value" type="{{.InputType}}" value="{{.Value}}" required{{if .Error}}
       aria-invalid="true" aria-describedby="student-error-{{.StudentID}}-{{.Key}}"{{end}}>
     {{end}}
     {{if .Modal}}<input type="hidden" name="modal" value="1">{{end}}
@@ -148,13 +148,13 @@
   <dl class="student-billing-summary">
     <div><dt>Funding</dt><dd>{{if .Funded}}Funded{{with .FundedAt}} {{template "billing-time" .}}{{end}}{{else}}Not funded{{end}}</dd></div>
     <div><dt>Plan</dt><dd>{{.PlanName}}</dd></div>
-    <div><dt>Tuition total</dt><dd>{{money64 .TotalCents}}</dd></div>
-    <div><dt>Tuition paid</dt><dd>{{money64 .TuitionPaidCents}}</dd></div>
-    <div><dt>Stripe cash paid</dt><dd>{{money64 .CashPaidCents}}</dd></div>
-    <div><dt>Other settlement</dt><dd>{{money64 .OtherSettlementCents}}</dd></div>
-    <div><dt>Remaining tuition</dt><dd>{{money64 .RemainingTuitionCents}}</dd></div>
-    <div><dt>Overdue tuition</dt><dd>{{money64 .OverdueTuitionCents}}</dd></div>
-    <div><dt>Reinstatement fee remaining</dt><dd>{{money64 .ReinstatementFeeRemainingCents}}</dd></div>
+    <div><dt>Tuition total</dt><dd>{{money .TotalCents}}</dd></div>
+    <div><dt>Tuition paid</dt><dd>{{money .TuitionPaidCents}}</dd></div>
+    <div><dt>Stripe cash paid</dt><dd>{{money .CashPaidCents}}</dd></div>
+    <div><dt>Other settlement</dt><dd>{{money .OtherSettlementCents}}</dd></div>
+    <div><dt>Remaining tuition</dt><dd>{{money .RemainingTuitionCents}}</dd></div>
+    <div><dt>Overdue tuition</dt><dd>{{money .OverdueTuitionCents}}</dd></div>
+    <div><dt>Reinstatement fee remaining</dt><dd>{{money .ReinstatementFeeRemainingCents}}</dd></div>
     <div><dt>Status</dt><dd>{{if .IsSuspended}}Billing-suspended{{else if .IsActive}}Active{{else}}Suspended{{end}}</dd></div>
     <div><dt>Last synced</dt><dd>{{with .LastSyncedAt}}{{template "billing-time" .}}{{else}}Never{{end}}</dd></div>
   </dl>
@@ -172,7 +172,7 @@
       <tr>
         <td>{{.Number}}</td>
         <td>{{with .DueAt}}{{template "billing-time" .}}{{else}}Set when funded{{end}}</td>
-        <td>{{money64 .AmountCents}}</td>
+        <td>{{money .AmountCents}}</td>
         <td>{{if eq .Status "paid"}}Paid{{with .PaidAt}} {{template "billing-time" .}}{{end}}{{else if eq .Status "overdue"}}Overdue{{else if eq .Status "action_required"}}Action required{{else}}Scheduled{{end}}</td>
         <td>{{if .InvoiceReady}}<a href="/management/students/{{$.Student.ID}}/billing/invoices/{{.ID}}" target="_blank" rel="noopener noreferrer">View invoice</a>{{end}}</td>
       </tr>
@@ -181,7 +181,7 @@
   </table>
   {{end}}
   {{if .ReinstatementFeeID}}
-  <p class="student-billing-fee">Reinstatement fee: {{if gt .ReinstatementFeeRemainingCents 0}}{{money64 .ReinstatementFeeRemainingCents}} remaining{{else}}settled{{end}}.
+  <p class="student-billing-fee">Reinstatement fee: {{if gt .ReinstatementFeeRemainingCents 0}}{{money .ReinstatementFeeRemainingCents}} remaining{{else}}settled{{end}}.
     {{if .ReinstatementInvoiceReady}}<a href="/management/students/{{$.Student.ID}}/billing/invoices/{{.ReinstatementFeeID}}" target="_blank" rel="noopener noreferrer">View fee invoice</a>{{end}}</p>
   {{end}}
   <div class="student-billing-actions">

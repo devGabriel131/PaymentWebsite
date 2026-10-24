@@ -3,6 +3,7 @@ package management
 import (
 	"context"
 	"errors"
+	"html/template"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -46,7 +47,7 @@ func studentDisplay(record students.Student, modal bool) studentView {
 	view := studentView{Student: record, Fields: make([]studentFieldView, len(fields))}
 	for i, field := range fields {
 		view.Fields[i] = studentFieldView{
-			Field: field, StudentID: record.ID, Value: field.Value(record), Modal: modal,
+			Field: field, StudentID: record.ID, Value: field.Value(record.Details), Modal: modal,
 		}
 	}
 	return view
@@ -67,10 +68,6 @@ func pathID(r *http.Request, name string) (uint64, bool) {
 	return id, err == nil && id >= 1 && id <= 1<<63-1
 }
 
-// billingBudget stays under the server's ten-second write timeout, so a slow
-// provider call answers with an error instead of a cut connection.
-const billingBudget = 8 * time.Second
-
 // billingRefusals are the billing errors staff can act on. They keep their
 // status, so htmx leaves the page as it is; anything else is a logged 500.
 var billingRefusals = []struct {
@@ -78,12 +75,10 @@ var billingRefusals = []struct {
 	status  int
 	message string
 }{
-	{billing.ErrStaffRequired, http.StatusBadRequest, "Sign in as staff to do this."},
 	{billing.ErrUnavailable, http.StatusNotFound, "Student or billing record not found."},
 	{billing.ErrNotSuspended, http.StatusConflict, "This student is not suspended for billing."},
 	{billing.ErrNeedsReview, http.StatusConflict, "This student's billing needs review before this can continue."},
 	{billing.ErrPaymentPending, http.StatusConflict, "A payment is still pending. Try again shortly."},
-	{billing.ErrPlanLocked, http.StatusConflict, "This student's payment plan is locked."},
 	{billing.ErrInvoiceNotReady, http.StatusConflict, "This invoice is not ready yet."},
 }
 
@@ -98,7 +93,7 @@ func billingFailure(w http.ResponseWriter, r *http.Request, err error) {
 	http.Error(w, "Could not complete the billing request. Please try again.", http.StatusInternalServerError)
 }
 
-func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *billing.Service, staff func(context.Context) string, execute func(http.ResponseWriter, *http.Request, int, string, any)) {
+func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *billing.Service, staff func(context.Context) string, page *template.Template) {
 	notFound := func(w http.ResponseWriter) {
 		http.Error(w, "Student or field not found.", http.StatusNotFound)
 	}
@@ -131,7 +126,7 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 		return true
 	}
 
-	mux.Handle("GET /management/students", logging.Operation("student_list", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /management/students", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		records, err := roster.List(ctx)
@@ -145,20 +140,20 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 			data.Students[i] = studentDisplay(record, false)
 		}
 		name := "students.html"
-		if r.Header.Get("HX-Request") == "true" {
+		if htmx(r) {
 			name = "student-records" // A live refresh of just the records.
 		}
-		execute(w, r, http.StatusOK, name, data)
-	})))
+		render(w, r, page, http.StatusOK, name, data)
+	}))
 
-	mux.Handle("GET /management/students/{id}", logging.Operation("student_get", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /management/students/{id}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		record := load(ctx, w, r)
 		if record == nil {
 			return
 		}
-		modal := r.Header.Get("HX-Request") == "true"
+		modal := htmx(r)
 		data := studentPageData{Staff: staff(r.Context()), Student: studentDisplay(*record, modal), Modal: modal}
 		if field := data.Student.field(r.URL.Query().Get("saved")); field != nil {
 			field.Saved = true
@@ -170,8 +165,8 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 		if modal {
 			name = "student-detail"
 		}
-		execute(w, r, http.StatusOK, name, data)
-	})))
+		render(w, r, page, http.StatusOK, name, data)
+	}))
 
 	fieldHandler := func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -187,7 +182,7 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 			return
 		}
 
-		partial := r.Header.Get("HX-Request") == "true"
+		partial := htmx(r)
 		modal := r.URL.Query().Get("modal") == "1"
 		editing := r.URL.Query().Get("edit") == "1"
 		status := http.StatusOK
@@ -219,6 +214,7 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 				notFound(w)
 				return
 			default:
+				biller.TouchContractForStudent(ctx, record.ID)
 				if !partial {
 					path := "/management/students/" + strconv.FormatUint(record.ID, 10) + "?saved=" + url.QueryEscape(field.Key)
 					http.Redirect(w, r, path, http.StatusSeeOther)
@@ -239,21 +235,21 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 			if !withBilling(ctx, w, r, &data) {
 				return
 			}
-			execute(w, r, status, "students.html", data)
+			render(w, r, page, status, "students.html", data)
 			return
 		}
 		if saved {
 			data.Student.OOB = modal
-			execute(w, r, status, "student-save", data)
+			render(w, r, page, status, "student-save", data)
 			return
 		}
-		execute(w, r, status, "student-field", data.Field)
+		render(w, r, page, status, "student-field", data.Field)
 	}
-	mux.Handle("GET /management/students/{id}/fields/{field}", logging.Operation("student_field_get", http.HandlerFunc(fieldHandler)))
-	mux.Handle("POST /management/students/{id}/fields/{field}", logging.Operation("student_update", http.HandlerFunc(fieldHandler)))
+	mux.Handle("GET /management/students/{id}/fields/{field}", http.HandlerFunc(fieldHandler))
+	mux.Handle("POST /management/students/{id}/fields/{field}", http.HandlerFunc(fieldHandler))
 
 	// Billing fragment: read-only, so it never writes to the provider.
-	mux.Handle("GET /management/students/{id}/billing", logging.Operation("student_get", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /management/students/{id}/billing", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 		record := load(ctx, w, r)
@@ -264,65 +260,61 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 		if !withBilling(ctx, w, r, &data) {
 			return
 		}
-		execute(w, r, http.StatusOK, "student-billing", data)
-	})))
+		render(w, r, page, http.StatusOK, "student-billing", data)
+	}))
 
 	// act runs a staff-attributed billing action and answers with the fresh fragment.
-	act := func(operation string, do func(context.Context, uint64, string) (*billing.Summary, error)) http.Handler {
-		return logging.Operation(operation, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	act := func(do func(context.Context, uint64) (*billing.Summary, error)) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			id, ok := pathID(r, "id")
 			if !ok {
 				notFound(w)
 				return
 			}
-			ctx, cancel := context.WithTimeout(r.Context(), billingBudget)
-			defer cancel()
-			summary, err := do(ctx, id, staff(r.Context()))
+			summary, err := do(r.Context(), id)
 			if err != nil {
 				billingFailure(w, r, err)
 				return
 			}
-			execute(w, r, http.StatusOK, "student-billing", studentPageData{
+			render(w, r, page, http.StatusOK, "student-billing", studentPageData{
 				Student: studentView{Student: students.Student{ID: id}}, Billing: summary,
 			})
-		}))
+		})
 	}
-	mux.Handle("POST /management/students/{id}/billing/reconcile", act("billing_reconcile", biller.ReconcileStudent))
-	mux.Handle("POST /management/students/{id}/billing/reinstatement", act("billing_reinstatement", biller.RequestReinstatement))
+	mux.Handle("POST /management/students/{id}/billing/reconcile", act(biller.ReconcileStudent))
+	mux.Handle("POST /management/students/{id}/billing/reinstatement", act(func(ctx context.Context, id uint64) (*billing.Summary, error) {
+		return biller.RequestReinstatement(ctx, id, staff(ctx))
+	}))
 
 	// Hosted invoice links expire and are never stored: fetch one now and send staff there.
-	mux.Handle("GET /management/students/{id}/billing/invoices/{obligation}", logging.Operation("billing_invoice_read", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /management/students/{id}/billing/invoices/{obligation}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, studentOK := pathID(r, "id")
 		obligation, obligationOK := pathID(r, "obligation")
 		if !studentOK || !obligationOK {
 			notFound(w)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), billingBudget)
-		defer cancel()
-		invoice, err := biller.InvoiceURL(ctx, id, obligation)
+		invoice, err := biller.InvoiceURL(r.Context(), id, obligation)
 		if err != nil {
 			billingFailure(w, r, err)
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		http.Redirect(w, r, invoice, http.StatusSeeOther)
-	})))
+	}))
 
 	// The portal link is a bearer credential for the payer: shown once, never cached or referred.
-	mux.Handle("POST /management/students/{id}/billing/portal", logging.Operation("billing_portal", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("POST /management/students/{id}/billing/portal", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, ok := pathID(r, "id")
 		if !ok {
 			notFound(w)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), billingBudget)
-		defer cancel()
-		portal, err := biller.PortalURL(ctx, id, staff(r.Context()))
+		portal, err := biller.PortalURL(r.Context(), id)
 		if err != nil {
 			billingFailure(w, r, err)
 			return
 		}
-		execute(w, r, http.StatusOK, "student-billing-portal", portal)
-	})))
+		render(w, r, page, http.StatusOK, "student-billing-portal", portal)
+	}))
 }

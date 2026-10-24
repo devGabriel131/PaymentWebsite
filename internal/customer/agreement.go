@@ -3,180 +3,104 @@ package customer
 import (
 	"context"
 	"errors"
-	"html/template"
 	"net/http"
 	"net/url"
 	"time"
 
-	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/payments"
-	"paymentwebsite/internal/settings"
 )
 
-// customerCSP matches the page's external HTMX, Google Fonts stylesheet, and fonts; the
-// hosted Stripe Checkout redirect needs only form-action, never Stripe.js or framing.
-const customerCSP = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' https://fonts.googleapis.com; " +
-	"font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; " +
-	"base-uri 'self'; form-action 'self' https://checkout.stripe.com;"
-
-func customerHeaders(w http.ResponseWriter) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Security-Policy", customerCSP)
-	w.Header().Set("Referrer-Policy", "no-referrer")
-	w.Header().Set("Vary", "HX-Request")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-}
-
-func renderPage(w http.ResponseWriter, r *http.Request, page *template.Template, name string, data pageData, status int) {
-	w.WriteHeader(status)
-	if r.Method == http.MethodHead {
+// agreement shows the terms and records their acceptance against the program start date the
+// customer saw, then continues to payments.
+func (s *site) agreement(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	data := pageData{Path: "/customer/" + url.PathEscape(token), View: "agreement", FieldErrors: make(map[string]string)}
+	ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+	defer cancel()
+	link, err := s.links.Lookup(ctx, token)
+	if !s.found(w, r, "index.html", &data, link, err) {
 		return
 	}
-	if err := page.ExecuteTemplate(w, name, data); err != nil {
-		logging.RecordError(r, "render", err)
-	}
-}
-
-// renderCustomer renders the customer shell, or the branded 404 that makes HTMX reload.
-func renderCustomer(w http.ResponseWriter, r *http.Request, page *template.Template, data pageData, status int) {
-	name := "index.html"
-	if status == http.StatusNotFound {
-		name = "not-found.html"
-		if r.Header.Get("HX-Request") == "true" {
-			w.Header().Set("HX-Refresh", "true")
-		}
-	}
-	renderPage(w, r, page, name, data, status)
-}
-
-// Redirects carry no contact data, including the HTMX submission response.
-func redirectCustomer(w http.ResponseWriter, r *http.Request, target string, allowHTMX bool) {
-	if allowHTMX && r.Method == http.MethodPost && r.Header.Get("HX-Request") == "true" {
-		w.Header().Set("HX-Redirect", target)
-		w.WriteHeader(http.StatusOK)
+	if link.SubmittedAt == nil {
+		redirectCustomer(w, r, data.Path+"/forms")
 		return
 	}
-	w.Header().Set("Location", target)
-	w.WriteHeader(http.StatusSeeOther)
-}
-
-func parseCustomerForm(w http.ResponseWriter, r *http.Request) int {
-	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
-	if err := r.ParseForm(); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			return http.StatusRequestEntityTooLarge
-		}
-		return http.StatusBadRequest
+	if r.Method == http.MethodPost && link.TermsAcceptedAt != nil {
+		redirectCustomer(w, r, data.Path+"/payments")
+		return
 	}
-	return http.StatusOK
-}
+	editable, err := s.billing.ContactEditable(ctx, link.TokenHash)
+	if err != nil {
+		logging.RecordError(r, "load", err)
+		data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
+		s.render(w, r, "index.html", data, http.StatusInternalServerError)
+		return
+	}
+	data.ContactEditable = editable
 
-func registerAgreementRoutes(mux *http.ServeMux, store *links.Store, configuration *settings.Store, biller *billing.Service, page *template.Template) {
-	handle := func(w http.ResponseWriter, r *http.Request) {
-		customerHeaders(w)
-		token := r.PathValue("token")
-		data := pageData{Path: "/customer/" + url.PathEscape(token), View: "agreement", FieldErrors: make(map[string]string)}
-		show := func(status int) { renderCustomer(w, r, page, data, status) }
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		link, err := store.Lookup(ctx, token)
+	status := http.StatusOK
+	data.TermsAcceptedAt, data.ProgramStartDate = link.TermsAcceptedAt, link.ProgramStartDate
+	loadAgreementDate := func() bool {
+		current, err := s.settings.Current(ctx)
 		if err != nil {
-			logging.RecordError(r, "lookup", err)
-			data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
-			show(http.StatusInternalServerError)
-			return
-		}
-		if link == nil {
-			show(http.StatusNotFound)
-			return
-		}
-		if link.SubmittedAt == nil {
-			redirectCustomer(w, r, data.Path+"/forms", false)
-			return
-		}
-		if r.Method == http.MethodPost && link.TermsAcceptedAt != nil {
-			redirectCustomer(w, r, data.Path+"/payments", false)
-			return
-		}
-		funded, err := biller.IsFunded(ctx, link.TokenHash)
-		if err != nil {
+			data.ProgramStartDate = ""
 			logging.RecordError(r, "load", err)
-			data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
-			show(http.StatusInternalServerError)
-			return
+			data.Error = "No pudimos cargar el acuerdo. Intenta de nuevo."
+			s.render(w, r, "index.html", data, http.StatusInternalServerError)
+			return false
 		}
-		data.Funded = funded
-
-		status := http.StatusOK
-		data.TermsAcceptedAt, data.ProgramStartDate = link.TermsAcceptedAt, link.ProgramStartDate
-		loadAgreementDate := func() bool {
-			current, err := configuration.Current(ctx)
-			if err != nil {
-				data.ProgramStartDate, data.ProgramStartLabel = "", ""
-				logging.RecordError(r, "load", err)
-				data.Error = "No pudimos cargar el acuerdo. Intenta de nuevo."
-				show(http.StatusInternalServerError)
-				return false
-			}
-			data.ProgramStartDate = current.ProgramStartDate
-			return true
-		}
-		if data.TermsAcceptedAt == nil && !loadAgreementDate() {
-			return
-		}
-		if r.Method == http.MethodPost {
-			status = parseCustomerForm(w, r)
-			if status != http.StatusOK {
-				data.Error = "No pudimos leer tu selección. Intenta de nuevo."
-			} else {
+		data.ProgramStartDate = current.ProgramStartDate
+		return true
+	}
+	if data.TermsAcceptedAt == nil && !loadAgreementDate() {
+		return
+	}
+	if r.Method == http.MethodPost {
+		status = parseCustomerForm(w, r)
+		if status != http.StatusOK {
+			data.Error = "No pudimos leer tu selección. Intenta de nuevo."
+		} else {
+			switch {
+			case len(r.PostForm["accept_terms"]) > 1 || len(r.PostForm["program_start_date"]) != 1:
+				status = http.StatusBadRequest
+				data.Error = "No pudimos leer tu aceptación. Intenta de nuevo."
+			case r.PostForm.Get("accept_terms") != "yes":
+				status = http.StatusUnprocessableEntity
+				data.FieldErrors["accept_terms"] = "Debes aceptar los términos para continuar."
+			default:
+				accepted, err := s.links.AcceptTerms(ctx, token, r.PostForm.Get("program_start_date"))
 				switch {
-				case len(r.PostForm["accept_terms"]) > 1 || len(r.PostForm["program_start_date"]) != 1:
-					status = http.StatusBadRequest
-					data.Error = "No pudimos leer tu aceptación. Intenta de nuevo."
-				case r.PostForm.Get("accept_terms") != "yes":
-					status = http.StatusUnprocessableEntity
-					data.FieldErrors["accept_terms"] = "Debes aceptar los términos para continuar."
-				default:
-					accepted, err := store.AcceptTerms(ctx, token, r.PostForm.Get("program_start_date"))
-					switch {
-					case errors.Is(err, links.ErrProgramStartChanged):
-						if !loadAgreementDate() {
-							return
-						}
-						status = http.StatusUnprocessableEntity
-						data.Error = "La fecha de inicio cambió. Revisa el acuerdo y acepta los términos de nuevo."
-					case err != nil:
-						logging.RecordError(r, "save", err)
-						data.Error = "No pudimos guardar tu aceptación. Intenta de nuevo."
-						status = http.StatusInternalServerError
-					case accepted == nil:
-						show(http.StatusNotFound)
-						return
-					default:
-						redirectCustomer(w, r, data.Path+"/payments", false)
+				case errors.Is(err, links.ErrProgramStartChanged):
+					if !loadAgreementDate() {
 						return
 					}
+					status = http.StatusUnprocessableEntity
+					data.Error = "La fecha de inicio cambió. Revisa el acuerdo y acepta los términos de nuevo."
+				case err != nil:
+					logging.RecordError(r, "save", err)
+					data.Error = "No pudimos guardar tu aceptación. Intenta de nuevo."
+					status = http.StatusInternalServerError
+				case accepted == nil:
+					s.render(w, r, "index.html", data, http.StatusNotFound)
+					return
+				default:
+					redirectCustomer(w, r, data.Path+"/payments")
+					return
 				}
 			}
 		}
-
-		date, err := time.Parse(time.DateOnly, data.ProgramStartDate)
-		if err != nil || date.Year() == 0 {
-			data.ProgramStartDate = ""
-			if status != http.StatusInternalServerError {
-				data.Error = "El acuerdo no está disponible porque falta confirmar la fecha de inicio. Comunícate con el equipo."
-			}
-			if r.Method == http.MethodPost && status == http.StatusOK {
-				status = http.StatusUnprocessableEntity
-			}
-		} else {
-			data.ProgramStartLabel = payments.SpanishDate(date)
-		}
-		show(status)
 	}
-	mux.Handle("GET /customer/{token}/agreement", logging.Operation("link_read", http.HandlerFunc(handle)))
-	mux.Handle("POST /customer/{token}/agreement", logging.Operation("final_submit", http.HandlerFunc(handle)))
+
+	date, err := time.Parse(time.DateOnly, data.ProgramStartDate)
+	if err != nil || date.Year() == 0 {
+		data.ProgramStartDate = ""
+		if status != http.StatusInternalServerError {
+			data.Error = "El acuerdo no está disponible porque falta confirmar la fecha de inicio. Comunícate con el equipo."
+		}
+	} else {
+		data.ProgramStartLabel = payments.SpanishDate(date)
+	}
+	s.render(w, r, "index.html", data, status)
 }

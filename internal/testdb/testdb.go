@@ -65,3 +65,35 @@ func Open(t *testing.T, models ...any) *gorm.DB {
 	}
 	return db
 }
+
+// AwaitBlocked returns once a session on db waits for a lock held by blocker's open
+// transaction, so tests release the lock on database state instead of elapsed time.
+// It fails the test if results yields first (the call finished without waiting) or ctx ends.
+func AwaitBlocked[T any](t testing.TB, ctx context.Context, db, blocker *gorm.DB, results <-chan T) {
+	t.Helper()
+	var blockerPID int
+	if err := blocker.Raw("SELECT pg_backend_pid()").Scan(&blockerPID).Error; err != nil {
+		t.Fatal(err)
+	}
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		var waiting bool
+		if err := db.WithContext(ctx).Raw(
+			"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE ? = ANY(pg_blocking_pids(pid)))",
+			blockerPID,
+		).Scan(&waiting).Error; err != nil {
+			t.Fatalf("observe lock wait: %v", err)
+		}
+		if waiting {
+			return
+		}
+		select {
+		case got := <-results:
+			t.Fatalf("returned before blocking: %+v", got)
+		case <-ctx.Done():
+			t.Fatalf("never blocked: %v", ctx.Err())
+		case <-poll.C:
+		}
+	}
+}

@@ -18,8 +18,6 @@ import (
 // New writes one JSON object per event, with stable message and lowercase level fields.
 func New(out io.Writer) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{
-		Level:     slog.LevelInfo,
-		AddSource: false,
 		ReplaceAttr: func(groups []string, attr slog.Attr) slog.Attr {
 			if len(groups) != 0 {
 				return attr
@@ -28,20 +26,9 @@ func New(out io.Writer) *slog.Logger {
 			case slog.MessageKey:
 				attr.Key = "message"
 			case slog.LevelKey:
-				var level string
-				switch attr.Value.Any().(slog.Level) {
-				case slog.LevelDebug:
-					level = "debug"
-				case slog.LevelInfo:
-					level = "info"
-				case slog.LevelWarn:
-					level = "warn"
-				case slog.LevelError:
-					level = "error"
-				default:
-					level = strings.ToLower(attr.Value.String())
+				if level, ok := attr.Value.Any().(slog.Level); ok {
+					attr.Value = slog.StringValue(strings.ToLower(level.String()))
 				}
-				attr.Value = slog.StringValue(level)
 			}
 			return attr
 		},

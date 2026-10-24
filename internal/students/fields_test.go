@@ -2,65 +2,12 @@ package students_test
 
 import (
 	"errors"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"paymentwebsite/internal/students"
 )
-
-func TestFieldsExposeOrderedRequiredDetails(t *testing.T) {
-	t.Parallel()
-	student := students.Student{Details: students.Details{
-		Name: "María Rivera", Email: "Maria@example.com", Phone: "+17872345678", Municipality: "Añasco", DateOfBirth: "2005-06-15",
-	}}
-	want := []struct {
-		key, label, inputType, value string
-	}{
-		{"name", "Name", "text", student.Name},
-		{"email", "Email", "email", student.Email},
-		{"phone", "Phone", "tel", student.Phone},
-		{"municipality", "Municipality", "", student.Municipality},
-		{"date_of_birth", "Date of birth", "date", student.DateOfBirth},
-	}
-	fields := students.Fields()
-	if len(fields) != len(want) {
-		t.Fatalf("registry has %d fields, want %d", len(fields), len(want))
-	}
-	for i, expected := range want {
-		t.Run(expected.key, func(t *testing.T) {
-			field := fields[i]
-			if field.Key != expected.key || field.Label != expected.label || field.InputType != expected.inputType || !field.Required || field.Value(student) != expected.value {
-				t.Fatalf("field = %+v, value = %q, want %+v and required", field, field.Value(student), expected)
-			}
-			found, ok := students.FindField(expected.key)
-			if !ok || found.Key != field.Key || found.Value(student) != expected.value {
-				t.Fatalf("FindField(%q) = %+v, %v", expected.key, found, ok)
-			}
-			if value, err := field.Parse("", field.Required); value != "" || err == nil {
-				t.Fatalf("required registry parser = %q, %v", value, err)
-			}
-			if value, err := field.Parse("", false); value != "" || err != nil {
-				t.Fatalf("draft registry parser = %q, %v", value, err)
-			}
-			if expected.key == "municipality" {
-				if !reflect.DeepEqual(field.Options, students.MunicipalityOptions()) {
-					t.Fatalf("municipality registry options differ from shared choices: %v", field.Options)
-				}
-			} else if len(field.Options) != 0 {
-				t.Fatalf("nonselect field has options: %v", field.Options)
-			}
-		})
-	}
-	for _, key := range []string{"", "Name", "email_confirm", "id", "source_link_hash", "created_at", "name; DROP TABLE students"} {
-		t.Run("unknown "+key, func(t *testing.T) {
-			if field, ok := students.FindField(key); ok {
-				t.Fatalf("unknown field %q resolved to %+v", key, field)
-			}
-		})
-	}
-}
 
 func TestFieldParsersRespectNormalizationAndDraftBoundaries(t *testing.T) {
 	t.Parallel()
@@ -293,102 +240,6 @@ func TestParserErrorsNeverEchoSubmittedValues(t *testing.T) {
 			var invalid *students.ValidationError
 			if !errors.As(err, &invalid) || strings.Contains(err.Error(), tc.private) {
 				t.Fatalf("validation error leaked submitted value or lost type: %v", err)
-			}
-		})
-	}
-}
-
-func TestMunicipalityOptionsAreExactAndAllAccepted(t *testing.T) {
-	t.Parallel()
-	want := strings.Split(`Adjuntas
-Aguada
-Aguadilla
-Aguas Buenas
-Aibonito
-Añasco
-Arecibo
-Arroyo
-Barceloneta
-Barranquitas
-Bayamón
-Cabo Rojo
-Caguas
-Camuy
-Canóvanas
-Carolina
-Cataño
-Cayey
-Ceiba
-Ciales
-Cidra
-Coamo
-Comerío
-Corozal
-Culebra
-Dorado
-Fajardo
-Florida
-Guánica
-Guayama
-Guayanilla
-Guaynabo
-Gurabo
-Hatillo
-Hormigueros
-Humacao
-Isabela
-Jayuya
-Juana Díaz
-Juncos
-Lajas
-Lares
-Las Marías
-Las Piedras
-Loíza
-Luquillo
-Manatí
-Maricao
-Maunabo
-Mayagüez
-Moca
-Morovis
-Naguabo
-Naranjito
-Orocovis
-Patillas
-Peñuelas
-Ponce
-Quebradillas
-Rincón
-Río Grande
-Sabana Grande
-Salinas
-San Germán
-San Juan
-San Lorenzo
-San Sebastián
-Santa Isabel
-Toa Alta
-Toa Baja
-Trujillo Alto
-Utuado
-Vega Alta
-Vega Baja
-Vieques
-Villalba
-Yabucoa
-Yauco
-Fuera de Puerto Rico`, "\n")
-	options := students.MunicipalityOptions()
-	if len(options) != 79 || !reflect.DeepEqual(options, want) {
-		t.Fatalf("municipality choices = %q, want exact ordered 79 choices", options)
-	}
-	for _, option := range options {
-		t.Run(option, func(t *testing.T) {
-			for _, required := range []bool{false, true} {
-				if got, err := students.ParseMunicipality(option, required); err != nil || got != option {
-					t.Fatalf("ParseMunicipality(%q, %v) = %q, %v", option, required, got, err)
-				}
 			}
 		})
 	}

@@ -14,36 +14,35 @@ var puertoRico = time.FixedZone("America/Puerto_Rico", -4*60*60)
 
 type Field struct {
 	Key, Label, InputType string
-	Required              bool
-	Value                 func(Student) string
+	Value                 func(Details) string
 	Parse                 func(raw string, required bool) (string, error)
 	Options               []string
 }
 
 var fields = []Field{
 	{
-		Key: "name", Label: "Name", InputType: "text", Required: true,
-		Value: func(s Student) string { return s.Name },
+		Key: "name", Label: "Name", InputType: "text",
+		Value: func(d Details) string { return d.Name },
 		Parse: ParseName,
 	},
 	{
-		Key: "email", Label: "Email", InputType: "email", Required: true,
-		Value: func(s Student) string { return s.Email },
+		Key: "email", Label: "Email", InputType: "email",
+		Value: func(d Details) string { return d.Email },
 		Parse: ParseEmail,
 	},
 	{
-		Key: "phone", Label: "Phone", InputType: "tel", Required: true,
-		Value: func(s Student) string { return s.Phone },
+		Key: "phone", Label: "Phone", InputType: "tel",
+		Value: func(d Details) string { return d.Phone },
 		Parse: ParsePhone,
 	},
 	{
-		Key: "municipality", Label: "Municipality", Required: true,
-		Value: func(s Student) string { return s.Municipality },
+		Key: "municipality", Label: "Municipality",
+		Value: func(d Details) string { return d.Municipality },
 		Parse: ParseMunicipality, Options: MunicipalityOptions(),
 	},
 	{
-		Key: "date_of_birth", Label: "Date of birth", InputType: "date", Required: true,
-		Value: func(s Student) string { return s.DateOfBirth },
+		Key: "date_of_birth", Label: "Date of birth", InputType: "date",
+		Value: func(d Details) string { return d.DateOfBirth },
 		Parse: ParseDateOfBirth,
 	},
 }

@@ -16,7 +16,6 @@ import (
 
 func TestFundedTimes(t *testing.T) {
 	mock := newMockStripeServer()
-	defer mock.Close()
 	db, svc, fundedHash, fundedID := setupTestEnvironment(t, mock)
 	ctx := context.Background()
 
@@ -50,7 +49,7 @@ func TestFundedTimes(t *testing.T) {
 		{StudentID: unfunded.ID},
 	} {
 		c.Reference, c.PlanID, c.PlanName = rand.Text(), "three", "Plan de 3 Pagos Mensuales"
-		c.InstallmentCount, c.Currency, c.TotalCents = 3, "usd", 62500
+		c.InstallmentCount, c.TotalCents = 3, 62500
 		if err := db.Create(&c).Error; err != nil {
 			t.Fatalf("create contract: %v", err)
 		}
@@ -70,40 +69,3 @@ func TestFundedTimes(t *testing.T) {
 	}
 }
 
-func TestUpdateCustomerContactSurvivesCancelledRequest(t *testing.T) {
-	mock := newMockStripeServer()
-	defer mock.Close()
-	db, svc, tokenHash, studentID := setupTestEnvironment(t, mock)
-
-	cusID := "cus_edit_test"
-	contract := billing.Contract{
-		StudentID:        studentID,
-		Reference:        rand.Text(),
-		PlanID:           "three",
-		PlanName:         "Plan de 3 Pagos Mensuales",
-		InstallmentCount: 3,
-		Currency:         "usd",
-		TotalCents:       62500,
-		StripeCustomerID: &cusID,
-	}
-	if err := db.Create(&contract).Error; err != nil {
-		t.Fatalf("create contract: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	err := svc.UpdateCustomerContact(ctx, tokenHash, "Ana Rivera", "ana@example.com")
-	if err != nil {
-		t.Fatalf("UpdateCustomerContact: %v", err)
-	}
-
-	var updates []customerUpdate
-	mock.with(func() {
-		updates = append(updates, mock.customerUpdates...)
-	})
-	want := customerUpdate{ID: "cus_edit_test", Name: "Ana Rivera", Email: "ana@example.com"}
-	if len(updates) != 1 || updates[0] != want {
-		t.Fatalf("customerUpdates = %v; want [%v]", updates, want)
-	}
-}

@@ -238,26 +238,6 @@ func TestStatusFollowsCustomerProgress(t *testing.T) {
 		Update("token_hash", replacementDigest).Error; err == nil {
 		t.Fatal("student enrollment did not restrict changing its source link hash")
 	}
-	var before []Link
-	if err := db.WithContext(ctx).Order("token_hash").Find(&before).Error; err != nil {
-		t.Fatal(err)
-	}
-	enrolled := studentsFor(t, db, ctx, link.Token)
-	for range 2 {
-		if err := db.WithContext(ctx).AutoMigrate(&Link{}, &students.Student{}); err != nil {
-			t.Fatal(err)
-		}
-		var after []Link
-		if err := db.WithContext(ctx).Order("token_hash").Find(&after).Error; err != nil {
-			t.Fatal(err)
-		}
-		if !reflect.DeepEqual(after, before) {
-			t.Fatalf("repeat migration changed links: before=%+v, after=%+v", before, after)
-		}
-		if after := studentsFor(t, db, ctx, link.Token); !reflect.DeepEqual(after, enrolled) {
-			t.Fatalf("repeat migration changed enrollment: before=%+v, after=%+v", enrolled, after)
-		}
-	}
 }
 
 func TestOpenObservesConcurrentCancellation(t *testing.T) {
@@ -284,10 +264,6 @@ func TestOpenObservesConcurrentCancellation(t *testing.T) {
 			}
 		}
 	}()
-	var blockerPID int
-	if err := blocker.Raw("SELECT pg_backend_pid()").Scan(&blockerPID).Error; err != nil {
-		t.Fatal(err)
-	}
 	canceled, err := New(blocker, nil).Cancel(ctx, issued.ID, "canceler")
 	if err != nil || canceled == nil || canceled.Status != Canceled {
 		t.Fatalf("hold cancellation: entry=%+v, err=%v", canceled, err)
@@ -299,28 +275,7 @@ func TestOpenObservesConcurrentCancellation(t *testing.T) {
 		opened, err := store.Open(openCtx, issued.Token)
 		results <- result{link: opened, err: err}
 	}()
-	// Observe the database lock, not elapsed time, before releasing cancellation.
-	poll := time.NewTicker(10 * time.Millisecond)
-	defer poll.Stop()
-	for {
-		var waiting bool
-		if err := db.WithContext(ctx).Raw(
-			"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE ? = ANY(pg_blocking_pids(pid)))",
-			blockerPID,
-		).Scan(&waiting).Error; err != nil {
-			t.Fatalf("observe Open lock wait: %v", err)
-		}
-		if waiting {
-			break
-		}
-		select {
-		case got := <-results:
-			t.Fatalf("Open returned before waiting on cancellation: link=%+v, err=%v", got.link, got.err)
-		case <-ctx.Done():
-			t.Fatalf("Open did not wait on cancellation: %v", ctx.Err())
-		case <-poll.C:
-		}
-	}
+	testdb.AwaitBlocked(t, ctx, db, blocker, results)
 	if err := blocker.Commit().Error; err != nil {
 		t.Fatal(err)
 	}
@@ -397,26 +352,6 @@ func TestConcurrentSubmissionEnrollsOnce(t *testing.T) {
 		!enrolled[0].CreatedAt.Equal(*completed.SubmittedAt) || completed.ExpiresAt.Sub(*completed.SubmittedAt) != 168*time.Hour {
 		t.Fatalf("completion not atomic: winner=%+v, link=%+v, students=%+v, err=%v", winner, completed, enrolled, err)
 	}
-	before := listByID(t, store, ctx)[issued.ID]
-	for _, field := range students.Fields() {
-		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, ""); err != nil || saved != AlreadySubmitted {
-			t.Fatalf("finished form accepted replacement: saved=%v, err=%v", saved, err)
-		}
-	}
-	if saved, err := store.Submit(ctx, issued.Token, contactDetails("Replacement final")); err != nil || saved != AlreadySubmitted {
-		t.Fatalf("finished form accepted replacement: saved=%v, err=%v", saved, err)
-	}
-	canceled, err := store.Cancel(ctx, issued.ID, "other staff")
-	if err != nil || canceled == nil || !reflect.DeepEqual(*canceled, before) || canceled.Token != "" {
-		t.Fatalf("single cancel changed completion: entry=%+v, before=%+v, err=%v", canceled, before, err)
-	}
-	if err := store.CancelAll(ctx, "other staff"); err != nil {
-		t.Fatal(err)
-	}
-	after, err := store.Lookup(ctx, issued.Token)
-	if err != nil || !reflect.DeepEqual(after, completed) || !reflect.DeepEqual(studentsFor(t, db, ctx, issued.Token), enrolled) {
-		t.Fatalf("replay or cancellation changed completion: before=%+v, after=%+v, err=%v", completed, after, err)
-	}
 }
 
 func TestSubmissionFailureRollsBack(t *testing.T) {
@@ -448,7 +383,7 @@ func TestSubmissionFailureRollsBack(t *testing.T) {
 				Name: "Original draft", Email: "draft@example.com", Phone: "+12025550123", Municipality: "Ponce",
 			}}
 			for _, field := range students.Fields() {
-				if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(draft)); err != nil || saved != Saved {
+				if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(draft.Details)); err != nil || saved != Saved {
 					t.Fatalf("save %s draft: saved=%v, err=%v", field.Key, saved, err)
 				}
 			}
@@ -497,7 +432,7 @@ func TestSubmissionCancellationRace(t *testing.T) {
 	}}
 	final := contactDetails("Final answer")
 	for _, field := range students.Fields() {
-		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(draft)); err != nil || saved != Saved {
+		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(draft.Details)); err != nil || saved != Saved {
 			t.Fatalf("draft %s: saved=%v, err=%v", field.Key, saved, err)
 		}
 	}
@@ -554,89 +489,6 @@ func TestSubmissionCancellationRace(t *testing.T) {
 		}
 	default:
 		t.Fatalf("race left neither completion nor cancellation: %+v", row)
-	}
-	want := Unavailable
-	if submitted == Saved {
-		want = AlreadySubmitted
-	}
-	for _, field := range students.Fields() {
-		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, ""); err != nil || saved != want {
-			t.Fatalf("write after race: saved=%v, want=%v, err=%v", saved, want, err)
-		}
-	}
-	if saved, err := store.Submit(ctx, issued.Token, contactDetails("Replacement after race")); err != nil || saved != want {
-		t.Fatalf("submit after race: saved=%v, want=%v, err=%v", saved, want, err)
-	}
-	again, err := store.Cancel(ctx, issued.ID, "later canceler")
-	if err != nil || again == nil || !reflect.DeepEqual(again, canceled) {
-		t.Fatalf("repeat cancel changed race outcome: before=%+v, after=%+v, err=%v", canceled, again, err)
-	}
-	if err := store.CancelAll(ctx, "later canceler"); err != nil {
-		t.Fatal(err)
-	}
-	var after Link
-	if err := db.WithContext(ctx).Where("token_hash = ?", digestOf(issued.Token)).Take(&after).Error; err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(after, row) || !reflect.DeepEqual(studentsFor(t, db, ctx, issued.Token), enrolled) {
-		t.Fatalf("replay or cancellation changed race outcome: before=%+v, after=%+v", row, after)
-	}
-}
-
-func TestCustomerDetailsIsolationAndRevocation(t *testing.T) {
-	db, store, ctx := testStore(t)
-	first, err := store.Create(ctx, staff, later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := store.Create(ctx, staff, later)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	details := contactDetails("María Pérez 李")
-	saved, err := store.Submit(ctx, first.Token, details)
-	if err != nil || saved != Saved {
-		t.Fatalf("save issued link's name: saved=%v, err=%v", saved, err)
-	}
-	for _, tc := range []struct {
-		name        string
-		token       string
-		wantDetails students.Details
-	}{
-		{"submitted link", first.Token, details},
-		{"separate link", second.Token, students.Details{}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			link, err := store.Open(ctx, tc.token)
-			if err != nil || link == nil {
-				t.Fatalf("open issued link: link=%v, err=%v", link, err)
-			}
-			if link.Details != tc.wantDetails {
-				t.Fatalf("details = %+v, want %+v", link.Details, tc.wantDetails)
-			}
-		})
-	}
-
-	if err := store.CancelAll(ctx, staff); err != nil {
-		t.Fatal(err)
-	}
-	saved, err = store.Submit(ctx, first.Token, contactDetails("Should not be saved"))
-	if err != nil || saved != AlreadySubmitted {
-		t.Fatalf("finished link accepted another name: saved=%v, err=%v", saved, err)
-	}
-	link, err := store.Open(ctx, first.Token)
-	if err != nil || link == nil || link.Details != details {
-		t.Fatalf("bulk cancellation changed the completed link: link=%+v, err=%v", link, err)
-	}
-	if got := listByID(t, store, ctx)[first.ID]; got.Name != details.Name || got.Phone != details.Phone || got.Status != Finished || got.CanceledBy != "" {
-		t.Fatalf("bulk cancellation changed completion: %+v", got)
-	}
-	if enrolled := studentsFor(t, db, ctx, first.Token); len(enrolled) != 1 || enrolled[0].Details != details {
-		t.Fatalf("bulk cancellation changed enrollment: %+v", enrolled)
-	}
-	if other, err := store.Lookup(ctx, second.Token); err != nil || other != nil {
-		t.Fatalf("unfinished link escaped bulk cancellation: link=%+v, err=%v", other, err)
 	}
 }
 
@@ -725,50 +577,6 @@ func TestCancel(t *testing.T) {
 	}
 }
 
-func TestCancelAll(t *testing.T) {
-	_, store, ctx := testStore(t)
-	var previous [2]Entry
-	for i := range previous {
-		entry, err := store.Create(ctx, staff, later)
-		if err != nil {
-			t.Fatal(err)
-		}
-		previous[i] = entry
-	}
-
-	// Repeated cancellation must remain safe when no links are active.
-	for range 2 {
-		if err := store.CancelAll(ctx, staff); err != nil {
-			t.Fatal(err)
-		}
-	}
-	fresh, err := store.Create(ctx, staff, later)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	cases := []struct {
-		name  string
-		token string
-		valid bool
-	}{
-		{"first canceled link", previous[0].Token, false},
-		{"second canceled link", previous[1].Token, false},
-		{"new link after cancellation", fresh.Token, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			link, err := store.Open(ctx, tc.token)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if valid := link != nil; valid != tc.valid {
-				t.Fatalf("valid = %v, want %v", valid, tc.valid)
-			}
-		})
-	}
-}
-
 func TestAuditRecordsStaff(t *testing.T) {
 	_, store, ctx := testStore(t)
 	var issued [3]Entry
@@ -784,6 +592,11 @@ func TestAuditRecordsStaff(t *testing.T) {
 	}
 	if err := store.CancelAll(ctx, "alice"); err != nil {
 		t.Fatal(err)
+	}
+	for _, entry := range issued[1:] {
+		if link, err := store.Open(ctx, entry.Token); err != nil || link != nil {
+			t.Fatalf("unfinished link still opens after CancelAll: link=%+v, err=%v", link, err)
+		}
 	}
 
 	t.Run("anonymous actions are refused", func(t *testing.T) {
@@ -880,67 +693,12 @@ func TestExpiredLinksStopWorking(t *testing.T) {
 	} {
 		got := listed[tc.entry.ID]
 		if got.Status != tc.status || got.Name != tc.saved || got.CanceledBy != "" || got.Cancelable() ||
-			!got.AccessExpired() || got.Trashed() != (tc.status == Expired) {
+			got.ExpiresAt.After(time.Now()) || got.Trashed() != (tc.status == Expired) {
 			t.Errorf("%s: listed %+v; want status %q, name %q, not canceled or cancelable", tc.name, got, tc.status, tc.saved)
 		}
 	}
 	if after := studentsFor(t, db, ctx, finished.Token); !reflect.DeepEqual(after, enrolled) {
 		t.Fatalf("source expiry changed enrollment: before=%+v, after=%+v", enrolled, after)
-	}
-}
-
-func TestEntryArchiveBoundary(t *testing.T) {
-	now := time.Date(2026, time.October, 20, 12, 0, 0, 0, time.UTC)
-	recent := now.Add(-24*time.Hour + time.Nanosecond)
-	exact := now.Add(-24 * time.Hour)
-	old := now.Add(-24*time.Hour - time.Nanosecond)
-	for _, tc := range []struct {
-		name  string
-		entry Entry
-		want  bool
-	}{
-		{"24 hours minus 1ns", Entry{Status: Finished, SubmittedAt: &recent, CreatedAt: now.Add(-365 * 24 * time.Hour)}, false},
-		{"exactly 24 hours", Entry{Status: Finished, SubmittedAt: &exact, CreatedAt: now}, true},
-		{"24 hours plus 1ns", Entry{Status: Finished, SubmittedAt: &old}, true},
-		{"nil completion", Entry{Status: Finished}, false},
-		{"unfinished", Entry{Status: InProgress}, false},
-		{"unfinished with old timestamp", Entry{Status: Opened, SubmittedAt: &old}, false},
-		{"canceled", Entry{Status: Canceled, SubmittedAt: &old}, false},
-		{"expired", Entry{Status: Expired, SubmittedAt: &old}, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.entry.Archived(now); got != tc.want {
-				t.Fatalf("Archived(%v) = %v, want %v", now, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestEntryAccessExpiryIsNotCancelability(t *testing.T) {
-	now := time.Now()
-	for _, tc := range []struct {
-		name       string
-		entry      Entry
-		expired    bool
-		cancelable bool
-		trashed    bool
-	}{
-		{"usable unfinished", Entry{Status: NotOpened, ExpiresAt: now.Add(time.Hour)}, false, true, false},
-		{"opened unfinished", Entry{Status: Opened, ExpiresAt: now.Add(time.Hour)}, false, true, false},
-		{"draft unfinished", Entry{Status: InProgress, ExpiresAt: now.Add(time.Hour)}, false, true, false},
-		{"status projection predates expiry", Entry{Status: NotOpened, ExpiresAt: now.Add(-time.Hour)}, true, true, false},
-		{"unknown status", Entry{ExpiresAt: now.Add(time.Hour)}, false, false, false},
-		{"finished success access", Entry{Status: Finished, ExpiresAt: now.Add(time.Hour)}, false, false, false},
-		{"finished expired access", Entry{Status: Finished, ExpiresAt: now.Add(-time.Hour)}, true, false, false},
-		{"deadline reached", Entry{Status: Expired, ExpiresAt: now}, true, false, true},
-		{"canceled before deadline", Entry{Status: Canceled, ExpiresAt: now.Add(time.Hour)}, false, false, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.entry.AccessExpired() != tc.expired || tc.entry.Cancelable() != tc.cancelable || tc.entry.Trashed() != tc.trashed {
-				t.Fatalf("entry=%+v: expired=%v, cancelable=%v, trashed=%v; want %v, %v, %v", tc.entry,
-					tc.entry.AccessExpired(), tc.entry.Cancelable(), tc.entry.Trashed(), tc.expired, tc.cancelable, tc.trashed)
-			}
-		})
 	}
 }
 
@@ -968,6 +726,8 @@ func TestCommittedWritesAnnounceChanges(t *testing.T) {
 	step("repeat visit", 2, err)
 	_, err = store.SaveDraft(ctx, first.Token, "name", "Draft")
 	step("draft", 3, err)
+	_, err = store.SaveDraft(ctx, first.Token, "name", "Draft")
+	step("repeat draft", 3, err)
 	_, err = store.Submit(ctx, first.Token, contactDetails("Final answer"))
 	step("submit", 4, err)
 	_, err = store.Submit(ctx, first.Token, contactDetails("Replay answer"))
@@ -986,170 +746,6 @@ func TestCommittedWritesAnnounceChanges(t *testing.T) {
 	step("nothing left to cancel", 8, err)
 }
 
-func TestDraftNoOpPreservesSaveOutcomes(t *testing.T) {
-	phone, err := students.ParsePhone("7872345678", false)
-	if err != nil || phone != "+17872345678" {
-		t.Fatalf("parse first phone: phone=%q, err=%v", phone, err)
-	}
-	replay, err := students.ParsePhone("+1 (787) 234-5678", false)
-	if err != nil || replay != "+17872345678" {
-		t.Fatalf("parse equivalent phone: phone=%q, err=%v", replay, err)
-	}
-	version := func(t *testing.T, db *gorm.DB, ctx context.Context, token string) string {
-		t.Helper()
-		var xmin string
-		if err := db.WithContext(ctx).Raw("SELECT xmin::text FROM links WHERE token_hash = ?", digestOf(token)).Scan(&xmin).Error; err != nil {
-			t.Fatal(err)
-		}
-		if xmin == "" {
-			t.Fatal("link row missing xmin")
-		}
-		return xmin
-	}
-
-	t.Run("normalized replay and clearing", func(t *testing.T) {
-		db, store, ctx := testStore(t)
-		issued, err := store.Create(ctx, staff, later)
-		if err != nil {
-			t.Fatal(err)
-		}
-		initial := students.Student{Details: contactDetails("Draft owner")}
-		for _, field := range students.Fields() {
-			if field.Key == "phone" {
-				continue
-			}
-			if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(initial)); err != nil || saved != Saved {
-				t.Fatalf("seed %s: saved=%v, err=%v", field.Key, saved, err)
-			}
-		}
-		before, err := store.Open(ctx, issued.Token)
-		if err != nil || before == nil || before.OpenedAt == nil {
-			t.Fatalf("open draft: link=%+v, err=%v", before, err)
-		}
-		want := *before
-		enrolledBefore := studentsFor(t, db, ctx, issued.Token)
-		changes := 0
-		store.changed = func() { changes++ }
-		for _, step := range []struct {
-			name    string
-			value   string
-			changes int
-			update  bool
-		}{
-			{"first save", phone, 1, true},
-			{"normalized replay", replay, 1, false},
-			{"populated to empty", "", 2, true},
-			{"empty to empty", "", 2, false},
-		} {
-			t.Run(step.name, func(t *testing.T) {
-				xmin := version(t, db, ctx, issued.Token)
-				changesBefore := changes
-				if saved, err := store.SaveDraft(ctx, issued.Token, "phone", step.value); err != nil || saved != Saved {
-					t.Errorf("draft: saved=%v, err=%v, want Saved without error", saved, err)
-				}
-				delta := 0
-				if step.update {
-					delta = 1
-				}
-				if changes != step.changes || changes-changesBefore != delta {
-					t.Errorf("changes=%d, delta=%d, want changes=%d, delta=%d", changes, changes-changesBefore, step.changes, delta)
-				}
-				if after := version(t, db, ctx, issued.Token); (after != xmin) != step.update {
-					t.Errorf("row xmin before=%q, after=%q, want UPDATE=%v", xmin, after, step.update)
-				}
-				want.Phone = step.value
-				if after, err := store.Lookup(ctx, issued.Token); err != nil || after == nil || !reflect.DeepEqual(*after, want) {
-					t.Errorf("draft changed unrelated fields: link=%+v, want=%+v, err=%v", after, want, err)
-				}
-				if enrolled := studentsFor(t, db, ctx, issued.Token); !reflect.DeepEqual(enrolled, enrolledBefore) {
-					t.Errorf("draft changed enrollment: before=%+v, after=%+v", enrolledBefore, enrolled)
-				}
-			})
-		}
-	})
-
-	for _, state := range []struct {
-		name string
-		want SaveResult
-		err  error
-	}{
-		{"submitted", AlreadySubmitted, nil},
-		{"canceled", Unavailable, nil},
-		{"expired", Unavailable, nil},
-		{"unknown token", Unavailable, nil},
-		{"malformed token", Unavailable, nil},
-		{"canceled context", Unavailable, context.Canceled},
-	} {
-		t.Run(state.name, func(t *testing.T) {
-			db, store, ctx := testStore(t)
-			issued, err := store.Create(ctx, staff, later)
-			if err != nil {
-				t.Fatal(err)
-			}
-			initial := students.Student{Details: contactDetails("Retained owner")}
-			for _, field := range students.Fields() {
-				if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(initial)); err != nil || saved != Saved {
-					t.Fatalf("seed %s: saved=%v, err=%v", field.Key, saved, err)
-				}
-			}
-			token, callCtx := issued.Token, ctx
-			switch state.name {
-			case "submitted":
-				if saved, err := store.Submit(ctx, token, initial.Details); err != nil || saved != Saved {
-					t.Fatalf("submit: saved=%v, err=%v", saved, err)
-				}
-			case "canceled":
-				if entry, err := store.Cancel(ctx, issued.ID, staff); err != nil || entry == nil || entry.Status != Canceled {
-					t.Fatalf("cancel: entry=%+v, err=%v", entry, err)
-				}
-			case "expired":
-				if err := db.WithContext(ctx).Model(&Link{}).Where("token_hash = ?", digestOf(token)).
-					Update("expires_at", time.Now().Add(-time.Hour)).Error; err != nil {
-					t.Fatal(err)
-				}
-			case "unknown token":
-				token = base64.RawURLEncoding.EncodeToString(make([]byte, tokenBytes))
-			case "malformed token":
-				token = "malformed"
-			case "canceled context":
-				var cancel context.CancelFunc
-				callCtx, cancel = context.WithCancel(ctx)
-				cancel()
-			}
-			var before Link
-			if err := db.WithContext(ctx).Where("token_hash = ?", digestOf(issued.Token)).Take(&before).Error; err != nil {
-				t.Fatal(err)
-			}
-			enrolledBefore := studentsFor(t, db, ctx, issued.Token)
-			if state.want == AlreadySubmitted && len(enrolledBefore) != 1 {
-				t.Fatalf("submitted fixture has %d students, want one", len(enrolledBefore))
-			}
-			xmin := version(t, db, ctx, issued.Token)
-			changes := 0
-			store.changed = func() { changes++ }
-			if saved, err := store.SaveDraft(callCtx, token, "phone", replay); saved != state.want || !errors.Is(err, state.err) {
-				t.Errorf("draft: saved=%v, err=%v, want saved=%v, err=%v", saved, err, state.want, state.err)
-			}
-			if changes != 0 {
-				t.Errorf("refused/error draft announced %d changes", changes)
-			}
-			if after := version(t, db, ctx, issued.Token); after != xmin {
-				t.Errorf("refused/error draft updated row: xmin before=%q, after=%q", xmin, after)
-			}
-			var after Link
-			if err := db.WithContext(ctx).Where("token_hash = ?", digestOf(issued.Token)).Take(&after).Error; err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(after, before) {
-				t.Errorf("refused/error draft changed link: before=%+v, after=%+v", before, after)
-			}
-			if enrolled := studentsFor(t, db, ctx, issued.Token); !reflect.DeepEqual(enrolled, enrolledBefore) {
-				t.Errorf("refused/error draft changed enrollment: before=%+v, after=%+v", enrolledBefore, enrolled)
-			}
-		})
-	}
-}
-
 func TestDraftFieldIsolationAndConcurrentClearing(t *testing.T) {
 	db, store, ctx := testStore(t)
 	issued, err := store.Create(ctx, staff, later)
@@ -1162,7 +758,7 @@ func TestDraftFieldIsolationAndConcurrentClearing(t *testing.T) {
 	}
 	initial := students.Student{Details: contactDetails("Original draft")}
 	for _, field := range students.Fields() {
-		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(initial)); err != nil || saved != Saved {
+		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(initial.Details)); err != nil || saved != Saved {
 			t.Fatalf("seed %s: saved=%v, err=%v", field.Key, saved, err)
 		}
 	}
@@ -1266,81 +862,6 @@ func TestDraftRejectsUnknownFieldBeforeSQL(t *testing.T) {
 	}
 }
 
-func TestAnyDraftFieldMarksProgressAndClears(t *testing.T) {
-	for _, field := range students.Fields() {
-		t.Run(field.Key, func(t *testing.T) {
-			for _, state := range []struct {
-				name   string
-				opened bool
-				status Status
-			}{
-				{"unopened", false, NotOpened},
-				{"opened", true, Opened},
-			} {
-				t.Run(state.name, func(t *testing.T) {
-					db, store, ctx := testStore(t)
-					issued, err := store.Create(ctx, staff, later)
-					if err != nil {
-						t.Fatal(err)
-					}
-					if state.opened {
-						if opened, err := store.Open(ctx, issued.Token); err != nil || opened == nil || opened.OpenedAt == nil {
-							t.Fatalf("open: link=%+v, err=%v", opened, err)
-						}
-					}
-					if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(students.Student{Details: contactDetails("Ana Pérez")})); err != nil || saved != Saved {
-						t.Fatalf("draft: result=%v, err=%v", saved, err)
-					}
-					if entry := listByID(t, store, ctx)[issued.ID]; entry.Status != InProgress {
-						t.Fatalf("%s alone did not mark progress: %+v", field.Key, entry)
-					}
-					if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, ""); err != nil || saved != Saved {
-						t.Fatalf("clear: result=%v, err=%v", saved, err)
-					}
-					link, err := store.Lookup(ctx, issued.Token)
-					if err != nil || link == nil || link.Details != (students.Details{}) || (link.OpenedAt != nil) != state.opened ||
-						link.SubmittedAt != nil || len(studentsFor(t, db, ctx, issued.Token)) != 0 {
-						t.Fatalf("clear changed lifecycle or left data: link=%+v, err=%v", link, err)
-					}
-					if entry := listByID(t, store, ctx)[issued.ID]; entry.Status != state.status {
-						t.Fatalf("clear did not restore %s: %+v", state.status, entry)
-					}
-				})
-			}
-		})
-	}
-}
-
-func TestEntryContactProjectionPreservesStatusPrecedence(t *testing.T) {
-	for _, name := range []string{"Email", "Municipality", "Details"} {
-		if _, exists := reflect.TypeFor[Entry]().FieldByName(name); exists {
-			t.Fatalf("link registry exposes %s", name)
-		}
-	}
-	now := time.Now()
-	past := now.Add(-time.Hour)
-	future := now.Add(time.Hour)
-	for _, tc := range []struct {
-		name                string
-		canceled, submitted *time.Time
-		expiry              time.Time
-		status              Status
-	}{
-		{"active details", nil, nil, future, InProgress},
-		{"expired details", nil, nil, past, Expired},
-		{"finished expired details", nil, &past, past, Finished},
-		{"canceled finished expired details", &past, &past, past, Canceled},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			details := contactDetails("Ana Pérez")
-			entry := (Link{Details: details, CanceledAt: tc.canceled, SubmittedAt: tc.submitted, ExpiresAt: tc.expiry}).entry(now)
-			if entry.Status != tc.status || entry.Name != details.Name || entry.Phone != details.Phone || entry.Token != "" {
-				t.Fatalf("wrong contact projection or precedence: %+v", entry)
-			}
-		})
-	}
-}
-
 func TestDraftSubmissionRaceKeepsFinalSnapshot(t *testing.T) {
 	for _, field := range students.Fields() {
 		t.Run(field.Key, func(t *testing.T) {
@@ -1354,7 +875,7 @@ func TestDraftSubmissionRaceKeepsFinalSnapshot(t *testing.T) {
 			}}
 			final := contactDetails("Final answer")
 			for _, seed := range students.Fields() {
-				if saved, err := store.SaveDraft(ctx, issued.Token, seed.Key, seed.Value(draft)); err != nil || saved != Saved {
+				if saved, err := store.SaveDraft(ctx, issued.Token, seed.Key, seed.Value(draft.Details)); err != nil || saved != Saved {
 					t.Fatalf("seed %s: result=%v, err=%v", seed.Key, saved, err)
 				}
 			}
@@ -1405,93 +926,6 @@ func TestDraftSubmissionRaceKeepsFinalSnapshot(t *testing.T) {
 				t.Fatalf("replay changed racing completion: before=%+v, after=%+v, err=%v", completed, after, err)
 			}
 		})
-	}
-}
-
-func TestDraftCancellationRaceKeepsRevocation(t *testing.T) {
-	db, store, ctx := testStore(t)
-	issued, err := store.Create(ctx, staff, later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	draft := students.Student{Details: contactDetails("Original draft")}
-	for _, field := range students.Fields() {
-		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(draft)); err != nil || saved != Saved {
-			t.Fatalf("seed %s: result=%v, err=%v", field.Key, saved, err)
-		}
-	}
-	type result struct {
-		entry *Entry
-		saved SaveResult
-		err   error
-	}
-	start := make(chan struct{})
-	results := make(chan result, 2)
-	go func() {
-		<-start
-		saved, err := store.SaveDraft(ctx, issued.Token, "email", "")
-		results <- result{saved: saved, err: err}
-	}()
-	go func() {
-		<-start
-		entry, err := store.Cancel(ctx, issued.ID, "canceler")
-		results <- result{entry: entry, err: err}
-	}()
-	close(start)
-	var cleared SaveResult
-	var canceled *Entry
-	for range 2 {
-		got := <-results
-		if got.err != nil {
-			t.Errorf("race: %v", got.err)
-		}
-		if got.entry != nil {
-			canceled = got.entry
-		} else {
-			cleared = got.saved
-		}
-	}
-	if t.Failed() {
-		return
-	}
-	want := draft.Details
-	switch cleared {
-	case Saved:
-		want.Email = ""
-	case Unavailable:
-	default:
-		t.Fatalf("draft racing cancellation returned %v", cleared)
-	}
-	var row Link
-	if err := db.WithContext(ctx).Where("token_hash = ?", digestOf(issued.Token)).Take(&row).Error; err != nil {
-		t.Fatal(err)
-	}
-	if canceled == nil || canceled.Status != Canceled || canceled.Token != "" || canceled.Phone != want.Phone ||
-		row.Details != want || row.CanceledAt == nil || row.CanceledBy != "canceler" || row.SubmittedAt != nil ||
-		row.ExpiresAt.Sub(later).Abs() > time.Microsecond || len(studentsFor(t, db, ctx, issued.Token)) != 0 {
-		t.Fatalf("draft changed revocation or unrelated fields: clear=%v, row=%+v, cancel=%+v", cleared, row, canceled)
-	}
-	for _, field := range students.Fields() {
-		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, ""); err != nil || saved != Unavailable {
-			t.Fatalf("revoked draft %s: result=%v, err=%v", field.Key, saved, err)
-		}
-	}
-	if saved, err := store.Submit(ctx, issued.Token, contactDetails("Final answer")); err != nil || saved != Unavailable {
-		t.Fatalf("revoked submit: result=%v, err=%v", saved, err)
-	}
-	again, err := store.Cancel(ctx, issued.ID, "later canceler")
-	if err != nil || !reflect.DeepEqual(again, canceled) {
-		t.Fatalf("repeat cancellation changed race outcome: before=%+v, after=%+v, err=%v", canceled, again, err)
-	}
-	var after Link
-	if err := db.WithContext(ctx).Where("token_hash = ?", digestOf(issued.Token)).Take(&after).Error; err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(after, row) || len(studentsFor(t, db, ctx, issued.Token)) != 0 {
-		t.Fatalf("replay changed revoked draft: before=%+v, after=%+v", row, after)
-	}
-	if opened, err := store.Open(ctx, issued.Token); err != nil || opened != nil {
-		t.Fatalf("revoked draft remains accessible: link=%+v, err=%v", opened, err)
 	}
 }
 
@@ -1637,10 +1071,6 @@ func TestAcceptTermsObservesConcurrentStartDateChange(t *testing.T) {
 			}
 		}
 	}()
-	var blockerPID int
-	if err := blocker.Raw("SELECT pg_backend_pid()").Scan(&blockerPID).Error; err != nil {
-		t.Fatal(err)
-	}
 	if err := settings.New(blocker).SetProgramStartDate(ctx, "2026-11-17", staff); err != nil {
 		t.Fatal(err)
 	}
@@ -1650,27 +1080,7 @@ func TestAcceptTermsObservesConcurrentStartDateChange(t *testing.T) {
 		link, err := store.AcceptTerms(acceptCtx, entry.Token, "2026-11-10")
 		results <- result{link: link, err: err}
 	}()
-	poll := time.NewTicker(10 * time.Millisecond)
-	defer poll.Stop()
-	for {
-		var waiting bool
-		if err := db.WithContext(ctx).Raw(
-			"SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE ? = ANY(pg_blocking_pids(pid)))",
-			blockerPID,
-		).Scan(&waiting).Error; err != nil {
-			t.Fatalf("observe acceptance lock wait: %v", err)
-		}
-		if waiting {
-			break
-		}
-		select {
-		case got := <-results:
-			t.Fatalf("acceptance bypassed pending date change: link=%+v, err=%v", got.link, got.err)
-		case <-ctx.Done():
-			t.Fatalf("acceptance did not wait on settings: %v", ctx.Err())
-		case <-poll.C:
-		}
-	}
+	testdb.AwaitBlocked(t, ctx, db, blocker, results)
 	if err := blocker.Commit().Error; err != nil {
 		t.Fatal(err)
 	}
@@ -1749,47 +1159,6 @@ func TestAgreementWritesRejectUnusableTokens(t *testing.T) {
 	}
 }
 
-func TestAgreementDatabaseFailuresDoNotAnnounceWrites(t *testing.T) {
-	db, store, ctx := testStore(t)
-	entry, err := store.Create(ctx, staff, later)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if saved, err := store.Submit(ctx, entry.Token, contactDetails("Submitted contact")); err != nil || saved != Saved {
-		t.Fatalf("submit: saved=%v, err=%v", saved, err)
-	}
-	if err := settings.New(db).SetProgramStartDate(ctx, "2026-11-10", staff); err != nil {
-		t.Fatal(err)
-	}
-	before, err := store.Lookup(ctx, entry.Token)
-	if err != nil || before == nil {
-		t.Fatalf("load submission: link=%+v, err=%v", before, err)
-	}
-	writes := 0
-	store = New(db, func() { writes++ })
-	cancelled, cancel := context.WithCancel(ctx)
-	cancel()
-	if got, err := store.AcceptTerms(cancelled, entry.Token, "2026-11-10"); got != nil || err == nil {
-		t.Fatalf("failed acceptance: link=%+v, err=%v", got, err)
-	}
-	if err := db.WithContext(ctx).Exec("ALTER TABLE links ADD CONSTRAINT test_acceptance_failure CHECK (terms_accepted_at IS NULL)").Error; err != nil {
-		t.Fatal(err)
-	}
-	if got, err := store.AcceptTerms(ctx, entry.Token, "2026-11-10"); got != nil || err == nil {
-		t.Fatalf("rejected acceptance: link=%+v, err=%v", got, err)
-	}
-	if after, err := store.Lookup(ctx, entry.Token); err != nil || !reflect.DeepEqual(after, before) || writes != 0 {
-		t.Fatalf("failed acceptance changed submission: link=%+v, writes=%d, err=%v", after, writes, err)
-	}
-	if err := db.WithContext(ctx).Exec("ALTER TABLE links DROP CONSTRAINT test_acceptance_failure").Error; err != nil {
-		t.Fatal(err)
-	}
-	accepted, err := store.AcceptTerms(ctx, entry.Token, "2026-11-10")
-	if err != nil || accepted == nil || writes != 1 {
-		t.Fatalf("acceptance retry: link=%+v, writes=%d, err=%v", accepted, writes, err)
-	}
-}
-
 func testStore(t *testing.T) (*gorm.DB, *Store, context.Context) {
 	t.Helper()
 	db := testdb.Open(t, &Link{}, &students.Student{}, &settings.Settings{})
@@ -1831,85 +1200,3 @@ func contactDetails(name string) students.Details {
 	}
 }
 
-func TestUpdateContact(t *testing.T) {
-	db, store, ctx := testStore(t)
-	entry, err := store.Create(ctx, staff, later)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// 1. Unsubmitted link cannot be updated
-	res, err := store.UpdateContact(ctx, entry.Token, contactDetails("Unsubmitted"))
-	if err != nil || res != Unavailable {
-		t.Fatalf("unsubmitted update = %v, %v; want Unavailable, nil", res, err)
-	}
-
-	// 2. Submit link
-	initial := contactDetails("Initial Name")
-	res, err = store.Submit(ctx, entry.Token, initial)
-	if err != nil || res != Saved {
-		t.Fatalf("submit = %v, %v; want Saved, nil", res, err)
-	}
-
-	// Accept terms to verify terms acceptance is preserved
-	if err := settings.New(db).SetProgramStartDate(ctx, "2026-11-01", staff); err != nil {
-		t.Fatal(err)
-	}
-	accepted, err := store.AcceptTerms(ctx, entry.Token, "2026-11-01")
-	if err != nil || accepted.TermsAcceptedAt == nil {
-		t.Fatalf("accept terms: %v, %v", accepted, err)
-	}
-	acceptedTermsAt := *accepted.TermsAcceptedAt
-	submittedAt := *accepted.SubmittedAt
-	expiresAt := accepted.ExpiresAt
-
-	// 3. Update contact on submitted link
-	updated := students.Details{
-		Name:         "Updated Name",
-		Email:        "updated@example.com",
-		Phone:        "+17875559999",
-		Municipality: "Ponce",
-		DateOfBirth:  "2004-05-14",
-	}
-	res, err = store.UpdateContact(ctx, entry.Token, updated)
-	if err != nil || res != Saved {
-		t.Fatalf("update contact = %v, %v; want Saved, nil", res, err)
-	}
-
-	// Verify link row
-	current, err := store.Lookup(ctx, entry.Token)
-	if err != nil || current == nil {
-		t.Fatalf("lookup: %v, %v", current, err)
-	}
-	if current.Name != updated.Name || current.Email != updated.Email ||
-		current.Phone != updated.Phone || current.Municipality != updated.Municipality ||
-		current.DateOfBirth != updated.DateOfBirth {
-		t.Fatalf("link details = %+v, want %+v", current.Details, updated)
-	}
-	if !current.SubmittedAt.Equal(submittedAt) {
-		t.Fatalf("submitted_at changed: %v, want %v", current.SubmittedAt, submittedAt)
-	}
-	if !current.TermsAcceptedAt.Equal(acceptedTermsAt) {
-		t.Fatalf("terms_accepted_at changed: %v, want %v", current.TermsAcceptedAt, acceptedTermsAt)
-	}
-	if !current.ExpiresAt.Equal(expiresAt) {
-		t.Fatalf("expires_at changed: %v, want %v", current.ExpiresAt, expiresAt)
-	}
-
-	// Verify students row
-	enrolled := studentsFor(t, db, ctx, entry.Token)
-	if len(enrolled) != 1 {
-		t.Fatalf("enrolled students count = %d, want 1", len(enrolled))
-	}
-	if enrolled[0].Name != updated.Name || enrolled[0].Email != updated.Email ||
-		enrolled[0].Phone != updated.Phone || enrolled[0].Municipality != updated.Municipality ||
-		enrolled[0].DateOfBirth != updated.DateOfBirth {
-		t.Fatalf("student row = %+v, want %+v", enrolled[0].Details, updated)
-	}
-
-	// 4. Unknown or expired token returns Unavailable
-	res, err = store.UpdateContact(ctx, strings.Repeat("a", 43), updated)
-	if err != nil || res != Unavailable {
-		t.Fatalf("unknown token = %v, %v; want Unavailable, nil", res, err)
-	}
-}

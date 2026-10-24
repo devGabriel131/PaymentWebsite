@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/alexedwards/argon2id"
@@ -63,14 +64,11 @@ func New(db *gorm.DB, secureCookies bool, log *slog.Logger) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := postgresstore.NewWithCleanupInterval(sqlDB, 0)
 	sessions := scs.New()
-	sessions.Store = store
+	sessions.Store = postgresstore.NewWithCleanupInterval(sqlDB, 0)
 	sessions.Lifetime = 14 * 24 * time.Hour
-	sessions.IdleTimeout = 0
 	sessions.Cookie.Name = cookieName
 	sessions.Cookie.Path = "/management/"
-	sessions.Cookie.Domain = ""
 	sessions.Cookie.HttpOnly = true
 	sessions.Cookie.SameSite = http.SameSiteLaxMode
 	sessions.Cookie.Persist = true
@@ -122,8 +120,8 @@ func (m *Manager) deleteExpiredSessions(ctx context.Context, log *slog.Logger) {
 }
 
 func (m *Manager) RegisterRoutes(mux *http.ServeMux) {
-	mux.Handle("POST /management/login", logging.Operation("sign_in", m.sessions.LoadAndSave(http.HandlerFunc(m.login))))
-	mux.Handle("POST /management/logout", logging.Operation("sign_out", m.sessions.LoadAndSave(http.HandlerFunc(m.logout))))
+	mux.Handle("POST /management/login", m.sessions.LoadAndSave(http.HandlerFunc(m.login)))
+	mux.Handle("POST /management/logout", m.sessions.LoadAndSave(http.HandlerFunc(m.logout)))
 }
 
 type staffKey struct{}
@@ -138,7 +136,7 @@ func Staff(ctx context.Context) string {
 // Require serves next only for a session whose account still exists with the
 // auth version recorded at sign-in, exposing the account through Staff.
 func (m *Manager) Require(next http.Handler) http.Handler {
-	return logging.Operation("session_check", m.sessions.LoadAndSave(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return m.sessions.LoadAndSave(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		username, err := m.authenticated(r.Context())
 		if err != nil {
 			logging.RecordError(r, "authenticate", err)
@@ -158,7 +156,7 @@ func (m *Manager) Require(next http.Handler) http.Handler {
 		default:
 			http.Redirect(w, r, "/management/", http.StatusSeeOther)
 		}
-	})))
+	}))
 }
 
 // authenticated returns the session's username, or "" when it is signed out.
@@ -201,7 +199,7 @@ func (m *Manager) login(w http.ResponseWriter, r *http.Request) {
 	}
 	page := loginPage{Username: r.PostForm.Get("username")}
 	if !m.limiter.Allow() {
-		w.Header().Set("Retry-After", "12")
+		w.Header().Set("Retry-After", strconv.Itoa(int(loginInterval/time.Second)))
 		page.Error = "Too many sign-in attempts. Please wait a few seconds and try again."
 		m.render(w, r, http.StatusTooManyRequests, page)
 		return

@@ -7,16 +7,15 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/stripe/stripe-go/v87"
 	"gorm.io/gorm"
 	"paymentwebsite/internal/billing"
+	"paymentwebsite/internal/billing/billingtest"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/payments"
 	"paymentwebsite/internal/students"
@@ -26,22 +25,21 @@ import (
 type customerUpdate struct{ ID, Name, Email string }
 
 type mockStripeServer struct {
-	server       *httptest.Server
-	customerReqs int64
-	sessionReqs  int64
-	expireReqs   int64
+	mux         *http.ServeMux
+	sessionReqs int64
+	expireReqs  int64
 
 	mu                        sync.Mutex
 	expireReturnsPaid         bool
 	createSessionError        bool
 	createSessionLoseResponse bool // Stripe creates the Session, but the response never arrives
-	sessionReturnStatus       string
 	receivedCurrency          string
 	receivedCustomer          string
-	receivedIdempKey          string
+	receivedLinkDisplay       string
 	customersCreated          map[string]string         // contractRef -> customerID
 	sessionsCreated           map[string]string         // attemptRef -> sessionID
 	sessions                  map[string]map[string]any // sessionID -> stored Session
+	customerUpdateError       bool
 	customerUpdates           []customerUpdate          // guarded by mu
 }
 
@@ -54,7 +52,6 @@ func newMockStripeServer() *mockStripeServer {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /v1/customers", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt64(&m.customerReqs, 1)
 		idemp := r.Header.Get("Idempotency-Key")
 		m.mu.Lock()
 		defer m.mu.Unlock()
@@ -75,8 +72,13 @@ func newMockStripeServer() *mockStripeServer {
 	})
 
 	mux.HandleFunc("POST /v1/customers/{id}", func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
 		m.mu.Lock()
+		if m.customerUpdateError {
+			m.mu.Unlock()
+			http.Error(w, `{"error":{"message":"customer update error"}}`, http.StatusInternalServerError)
+			return
+		}
+		_ = r.ParseForm()
 		m.customerUpdates = append(m.customerUpdates, customerUpdate{r.PathValue("id"), r.FormValue("name"), r.FormValue("email")})
 		m.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": r.PathValue("id"), "object": "customer", "livemode": false})
@@ -93,19 +95,16 @@ func newMockStripeServer() *mockStripeServer {
 		_ = r.ParseForm()
 		m.receivedCurrency = r.FormValue("currency")
 		m.receivedCustomer = r.FormValue("customer")
-		m.receivedIdempKey = r.Header.Get("Idempotency-Key")
+		m.receivedLinkDisplay = r.FormValue("wallet_options[link][display]")
 
 		sessID := "cs_mock_" + rand.Text()[:8]
-		idemp := m.receivedIdempKey
+		idemp := r.Header.Get("Idempotency-Key")
 		if idemp != "" && m.sessionsCreated[idemp] != "" {
 			sessID = m.sessionsCreated[idemp]
 		} else if idemp != "" {
 			m.sessionsCreated[idemp] = sessID
 		}
 		status := "open"
-		if m.sessionReturnStatus != "" {
-			status = m.sessionReturnStatus
-		}
 		price := r.FormValue("line_items[0][price]")
 		amountTotal := int64(20834)
 		switch price {
@@ -129,7 +128,6 @@ func newMockStripeServer() *mockStripeServer {
 			"status":              status,
 			"payment_status":      "unpaid",
 			"amount_total":        amountTotal,
-			"expires_at":          time.Now().Add(24 * time.Hour).Unix(),
 		}
 		m.sessions[sessID] = resp
 		lose := m.createSessionLoseResponse
@@ -193,12 +191,8 @@ func newMockStripeServer() *mockStripeServer {
 		})
 	})
 
-	m.server = httptest.NewServer(mux)
+	m.mux = mux
 	return m
-}
-
-func (m *mockStripeServer) Close() {
-	m.server.Close()
 }
 
 // with runs f holding the mock lock, for reading or flipping fields the handlers share.
@@ -206,17 +200,6 @@ func (m *mockStripeServer) with(f func()) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	f()
-}
-
-func (m *mockStripeServer) Client() *stripe.Client {
-	maxRetries := int64(0)
-	backends := stripe.NewBackendsWithConfig(&stripe.BackendConfig{
-		URL:               stripe.String(m.server.URL),
-		HTTPClient:        m.server.Client(),
-		MaxNetworkRetries: &maxRetries,
-		LeveledLogger:     &stripe.LeveledLogger{Level: stripe.LevelNull},
-	})
-	return stripe.NewClient("sk_test_mock", stripe.WithBackends(backends))
 }
 
 func setupTestEnvironment(t *testing.T, mock *mockStripeServer) (*gorm.DB, *billing.Service, []byte, uint64) {
@@ -241,7 +224,6 @@ func setupTestEnvironment(t *testing.T, mock *mockStripeServer) (*gorm.DB, *bill
 		SubmittedAt:      &now,
 		TermsAcceptedAt:  &now,
 		ProgramStartDate: "2026-11-01",
-		PaymentPlan:      "three",
 		ExpiresAt:        now.Add(7 * 24 * time.Hour),
 	}
 	if err := db.Create(&link).Error; err != nil {
@@ -258,33 +240,13 @@ func setupTestEnvironment(t *testing.T, mock *mockStripeServer) (*gorm.DB, *bill
 		t.Fatalf("create test student: %v", err)
 	}
 
-	cfg := billing.Config{
-		BaseURL:                      "http://127.0.0.1:3000",
-		WebhookSecret:                "whsec_test",
-		PaymentMethodConfigurationID: "pmc_test",
-		PortalConfigurationID:        "bpc_test",
-		Live:                         false,
-	}
-	catalog := billing.Catalog{
-		Full:          "pr_full",
-		ThreeFirst:    "pr_three_1",
-		ThreeLater:    "pr_three_2",
-		SixFirst:      "pr_six_1",
-		SixLater:      "pr_six_2",
-		Reinstatement: "pr_reinstatement",
-	}
-
-	svc, err := billing.New(db, mock.Client(), cfg, catalog, nil, nil)
-	if err != nil {
-		t.Fatalf("billing.New: %v", err)
-	}
+	svc := billingtest.New(t, db, mock.mux)
 
 	return db, svc, tokenHash, student.ID
 }
 
 func TestCheckoutConcurrencyAndRecovery(t *testing.T) {
 	mock := newMockStripeServer()
-	defer mock.Close()
 
 	db, svc, tokenHash, studentID := setupTestEnvironment(t, mock)
 
@@ -359,6 +321,9 @@ func TestCheckoutConcurrencyAndRecovery(t *testing.T) {
 		mock.mu.Lock()
 		if mock.receivedCurrency != "usd" {
 			t.Errorf("expected Stripe currency 'usd', got %q", mock.receivedCurrency)
+		}
+		if mock.receivedLinkDisplay != "never" {
+			t.Errorf("expected wallet_options[link][display]='never', got %q", mock.receivedLinkDisplay)
 		}
 		mock.mu.Unlock()
 	})
@@ -451,7 +416,6 @@ func TestCheckoutConcurrencyAndRecovery(t *testing.T) {
 
 func TestPlanChangeExpiresPreviousSession(t *testing.T) {
 	mock := newMockStripeServer()
-	defer mock.Close()
 
 	db, svc, tokenHash, studentID := setupTestEnvironment(t, mock)
 
@@ -478,15 +442,6 @@ func TestPlanChangeExpiresPreviousSession(t *testing.T) {
 		t.Fatalf("expected Stripe expire to be called, got %d", mock.expireReqs)
 	}
 
-	// Verify old attempt is terminal "expired"
-	var oldAttempt billing.CheckoutAttempt
-	if err := db.Where("contract_id = ? AND plan_id = 'three'", studentID).First(&oldAttempt).Error; err != nil {
-		t.Fatalf("find old attempt: %v", err)
-	}
-	if oldAttempt.State != "expired" {
-		t.Fatalf("expected old attempt state 'expired', got %q", oldAttempt.State)
-	}
-
 	// Verify contract updated to six
 	var contract billing.Contract
 	if err := db.Where("student_id = ?", studentID).First(&contract).Error; err != nil {
@@ -494,6 +449,15 @@ func TestPlanChangeExpiresPreviousSession(t *testing.T) {
 	}
 	if contract.PlanID != "six" || contract.InstallmentCount != 6 {
 		t.Fatalf("expected plan six with 6 installments, got %s (%d)", contract.PlanID, contract.InstallmentCount)
+	}
+
+	// Verify old attempt is terminal "expired"
+	var oldAttempt billing.CheckoutAttempt
+	if err := db.Where("contract_id = ? AND plan_id = 'three'", contract.ID).First(&oldAttempt).Error; err != nil {
+		t.Fatalf("find old attempt: %v", err)
+	}
+	if oldAttempt.State != "expired" {
+		t.Fatalf("expected old attempt state 'expired', got %q", oldAttempt.State)
 	}
 
 	// Verify 6 obligations exist
@@ -528,7 +492,6 @@ func TestPlanChangeExpiresPreviousSession(t *testing.T) {
 
 func TestSummaryAndReturnStatus(t *testing.T) {
 	mock := newMockStripeServer()
-	defer mock.Close()
 
 	db, svc, tokenHash, studentID := setupTestEnvironment(t, mock)
 
@@ -573,10 +536,7 @@ func TestSummaryAndReturnStatus(t *testing.T) {
 	}
 
 	// Test ReturnStatus
-	var attempt billing.CheckoutAttempt
-	if err := db.Where("contract_id = ?", summary.Installments[0].Number).First(&attempt).Error; err != nil {
-		db.First(&attempt)
-	}
+	attempt := latestAttempt(t, db)
 	if attempt.StripeSessionID == nil {
 		t.Fatal("attempt stripe session ID is nil")
 	}
@@ -624,7 +584,6 @@ func TestCheckoutCreateResumes(t *testing.T) {
 
 	t.Run("unknown_create_is_replayed", func(t *testing.T) {
 		mock := newMockStripeServer()
-		defer mock.Close()
 		db, svc, tokenHash, studentID := setupTestEnvironment(t, mock)
 
 		mock.with(func() { mock.createSessionError = true })
@@ -638,7 +597,7 @@ func TestCheckoutCreateResumes(t *testing.T) {
 		}
 
 		mock.with(func() { mock.createSessionError = false })
-		if _, err := svc.ReconcileStudent(ctx, studentID, "staff"); err != nil {
+		if _, err := svc.ReconcileStudent(ctx, studentID); err != nil {
 			t.Fatalf("ReconcileStudent: %v", err)
 		}
 		a = latestAttempt(t, db)
@@ -663,7 +622,6 @@ func TestCheckoutCreateResumes(t *testing.T) {
 
 	t.Run("landed_create_is_adopted", func(t *testing.T) {
 		mock := newMockStripeServer()
-		defer mock.Close()
 		db, svc, tokenHash, studentID := setupTestEnvironment(t, mock)
 
 		mock.with(func() { mock.createSessionLoseResponse = true })
@@ -678,7 +636,7 @@ func TestCheckoutCreateResumes(t *testing.T) {
 
 		mock.with(func() { mock.createSessionLoseResponse = false })
 		before := atomic.LoadInt64(&mock.sessionReqs)
-		if _, err := svc.ReconcileStudent(ctx, studentID, "staff"); err != nil {
+		if _, err := svc.ReconcileStudent(ctx, studentID); err != nil {
 			t.Fatalf("ReconcileStudent: %v", err)
 		}
 		a = latestAttempt(t, db)
@@ -697,7 +655,6 @@ func TestCheckoutCreateResumes(t *testing.T) {
 
 	t.Run("expired_key_fails_and_frees_contract", func(t *testing.T) {
 		mock := newMockStripeServer()
-		defer mock.Close()
 		db, svc, tokenHash, studentID := setupTestEnvironment(t, mock)
 
 		mock.with(func() { mock.createSessionError = true })
@@ -717,7 +674,7 @@ func TestCheckoutCreateResumes(t *testing.T) {
 
 		mock.with(func() { mock.createSessionError = false })
 		before := atomic.LoadInt64(&mock.sessionReqs)
-		if _, err := svc.ReconcileStudent(ctx, studentID, "staff"); err != nil {
+		if _, err := svc.ReconcileStudent(ctx, studentID); err != nil {
 			t.Fatalf("ReconcileStudent: %v", err)
 		}
 		if a = latestAttempt(t, db); a.State != "failed" {

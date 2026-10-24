@@ -3,14 +3,15 @@ package billing_test
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/stripe/stripe-go/v87"
 	"paymentwebsite/internal/billing"
+	"paymentwebsite/internal/billing/billingtest"
 )
 
 func TestConfigValidation(t *testing.T) {
@@ -217,36 +218,23 @@ func mockStripePrice(id, lookupKey string, cents int64, currency string, active,
 
 func TestLoadCatalogValidation(t *testing.T) {
 	validPrices := []map[string]any{
-		mockStripePrice("pr_full", billing.LookupKeyFullInitial, 60000, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
-		mockStripePrice("pr_three_1", billing.LookupKeyThreeInitial, 20834, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
-		mockStripePrice("pr_three_2", billing.LookupKeyThreeLater, 20833, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
-		mockStripePrice("pr_six_1", billing.LookupKeySixInitial, 10835, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
-		mockStripePrice("pr_six_2", billing.LookupKeySixLater, 10833, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
-		mockStripePrice("pr_reinstatement", billing.LookupKeyReinstatement, 2500, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
-	}
-
-	createClient := func(handler http.HandlerFunc) (*stripe.Client, *httptest.Server) {
-		ts := httptest.NewServer(handler)
-		maxRetries := int64(0)
-		backends := stripe.NewBackendsWithConfig(&stripe.BackendConfig{
-			URL:               stripe.String(ts.URL),
-			HTTPClient:        ts.Client(),
-			MaxNetworkRetries: &maxRetries,
-			LeveledLogger:     &stripe.LeveledLogger{Level: stripe.LevelNull},
-		})
-		return stripe.NewClient("sk_test_mock", stripe.WithBackends(backends)), ts
+		mockStripePrice("pr_full", "asvab_full_initial_usd", 60000, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
+		mockStripePrice("pr_three_1", "asvab_three_initial_usd", 20834, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
+		mockStripePrice("pr_three_2", "asvab_three_remaining_usd", 20833, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
+		mockStripePrice("pr_six_1", "asvab_six_initial_usd", 10835, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
+		mockStripePrice("pr_six_2", "asvab_six_remaining_usd", 10833, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
+		mockStripePrice("pr_reinstatement", "asvab_reinstatement_usd", 2500, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime),
 	}
 
 	t.Run("valid_catalog", func(t *testing.T) {
-		client, ts := createClient(func(w http.ResponseWriter, r *http.Request) {
+		client := billingtest.Client(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			resp := map[string]any{
 				"object":   "list",
 				"data":     validPrices,
 				"has_more": false,
 			}
 			_ = json.NewEncoder(w).Encode(resp)
-		})
-		defer ts.Close()
+		}))
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -255,23 +243,29 @@ func TestLoadCatalogValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error loading catalog: %v", err)
 		}
-		if catalog.Full != "pr_full" || catalog.ThreeFirst != "pr_three_1" || catalog.ThreeLater != "pr_three_2" ||
-			catalog.SixFirst != "pr_six_1" || catalog.SixLater != "pr_six_2" || catalog.Reinstatement != "pr_reinstatement" {
+		want := billing.Catalog{
+			"asvab_full_initial_usd":    "pr_full",
+			"asvab_three_initial_usd":   "pr_three_1",
+			"asvab_three_remaining_usd": "pr_three_2",
+			"asvab_six_initial_usd":     "pr_six_1",
+			"asvab_six_remaining_usd":   "pr_six_2",
+			"asvab_reinstatement_usd":   "pr_reinstatement",
+		}
+		if !maps.Equal(catalog, want) {
 			t.Fatalf("catalog price IDs mismatched: %+v", catalog)
 		}
 	})
 
 	t.Run("missing_price", func(t *testing.T) {
 		incompletePrices := validPrices[:5] // omit reinstatement
-		client, ts := createClient(func(w http.ResponseWriter, r *http.Request) {
+		client := billingtest.Client(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			resp := map[string]any{
 				"object":   "list",
 				"data":     incompletePrices,
 				"has_more": false,
 			}
 			_ = json.NewEncoder(w).Encode(resp)
-		})
-		defer ts.Close()
+		}))
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -285,17 +279,16 @@ func TestLoadCatalogValidation(t *testing.T) {
 	t.Run("wrong_unit_amount", func(t *testing.T) {
 		corruptedPrices := make([]map[string]any, len(validPrices))
 		copy(corruptedPrices, validPrices)
-		corruptedPrices[0] = mockStripePrice("pr_full", billing.LookupKeyFullInitial, 59999, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime)
+		corruptedPrices[0] = mockStripePrice("pr_full", "asvab_full_initial_usd", 59999, "usd", true, false, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime)
 
-		client, ts := createClient(func(w http.ResponseWriter, r *http.Request) {
+		client := billingtest.Client(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			resp := map[string]any{
 				"object":   "list",
 				"data":     corruptedPrices,
 				"has_more": false,
 			}
 			_ = json.NewEncoder(w).Encode(resp)
-		})
-		defer ts.Close()
+		}))
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -309,17 +302,16 @@ func TestLoadCatalogValidation(t *testing.T) {
 	t.Run("wrong_livemode", func(t *testing.T) {
 		corruptedPrices := make([]map[string]any, len(validPrices))
 		copy(corruptedPrices, validPrices)
-		corruptedPrices[0] = mockStripePrice("pr_full", billing.LookupKeyFullInitial, 60000, "usd", true, true, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime)
+		corruptedPrices[0] = mockStripePrice("pr_full", "asvab_full_initial_usd", 60000, "usd", true, true, stripe.PriceBillingSchemePerUnit, stripe.PriceTypeOneTime)
 
-		client, ts := createClient(func(w http.ResponseWriter, r *http.Request) {
+		client := billingtest.Client(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			resp := map[string]any{
 				"object":   "list",
 				"data":     corruptedPrices,
 				"has_more": false,
 			}
 			_ = json.NewEncoder(w).Encode(resp)
-		})
-		defer ts.Close()
+		}))
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()

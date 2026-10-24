@@ -3,6 +3,7 @@ package customer
 import (
 	"context"
 	"embed"
+	"errors"
 	"html/template"
 	"net/http"
 	"net/url"
@@ -20,6 +21,15 @@ import (
 //go:embed templates/*.html
 var templates embed.FS
 
+// dbTimeout bounds each request's database work.
+const dbTimeout = 5 * time.Second
+
+// customerCSP matches the page's external HTMX, Google Fonts stylesheet, and fonts; the
+// hosted Stripe Checkout redirect needs only form-action, never Stripe.js or framing.
+const customerCSP = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' https://fonts.googleapis.com; " +
+	"font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; object-src 'none'; " +
+	"base-uri 'self'; form-action 'self' https://checkout.stripe.com;"
+
 type pageData struct {
 	students.Details
 	Path              string
@@ -28,7 +38,6 @@ type pageData struct {
 	EmailConfirm      string
 	EmailMismatch     bool
 	FieldErrors       map[string]string
-	DraftField        string
 	ProgramStartDate  string
 	ProgramStartLabel string
 	TermsAcceptedAt   *time.Time
@@ -45,17 +54,25 @@ type pageData struct {
 	ReturnSessionID string
 	ReturnPollsNext int
 	ReturnStopPoll  bool
-	// Editing marks the contact form reopened after submit; Funded hides that edit once the first payment is confirmed.
-	Editing bool
-	Funded  bool
+	// Editing marks the contact form reopened after submit.
+	Editing         bool
+	ContactEditable bool
 }
 
-func RegisterRoutes(mux *http.ServeMux, store *links.Store, configuration *settings.Store, biller *billing.Service) error {
+// site is the customer-facing handler set: one template set over the stores the pages read and write.
+type site struct {
+	page     *template.Template
+	links    *links.Store
+	roster   *students.Store
+	settings *settings.Store
+	billing  *billing.Service
+}
+
+func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Store, configuration *settings.Store, biller *billing.Service) error {
 	page, err := template.New("index.html").Funcs(template.FuncMap{
 		"municipalities": students.MunicipalityOptions,
 		"trim":           strings.TrimSpace,
 		"money":          payments.Money,
-		"money64":        payments.Money64,
 		"spanishDate":    payments.SpanishDate,
 		"billingDate":    func(t time.Time) string { return payments.SpanishDate(t.In(payments.PuertoRico)) },
 	}).ParseFS(templates, "templates/*.html")
@@ -63,153 +80,307 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, configuration *setti
 		return err
 	}
 
-	// handle serves the welcome, form, final submit, and blur autosave.
-	// Autosave responds only with status so it never redraws fields in use.
-	// Submission advances to the agreement. GET records a visit;
-	// HEAD only checks usability; POST writes without recording a visit.
-	handle := func(view string) http.HandlerFunc {
-		draft := view == "save-status"
-		return func(w http.ResponseWriter, r *http.Request) {
-			customerHeaders(w)
-			token := r.PathValue("token")
-			data := pageData{Path: "/customer/" + url.PathEscape(token), View: view}
-			show := func(status int) {
-				name := "index.html"
-				switch {
-				case status == http.StatusNotFound:
-					name = "not-found.html"
-					if r.Header.Get("HX-Request") == "true" {
-						w.Header().Set("HX-Refresh", "true")
-					}
-				case draft:
-					name = "save-status"
-				case r.Method == http.MethodPost && r.Header.Get("HX-Request") == "true":
-					name = "customer-response"
-				}
-				renderPage(w, r, page, name, data, status)
-			}
-			advance := func() {
-				if draft {
-					if r.Header.Get("HX-Request") == "true" {
-						w.Header().Set("HX-Refresh", "true")
-					}
-					w.WriteHeader(http.StatusConflict)
-					return
-				}
-				if r.Method == http.MethodHead {
-					w.WriteHeader(http.StatusOK)
-					return
-				}
-				redirectCustomer(w, r, data.Path+"/agreement", true)
-			}
+	s := &site{page: page, links: store, roster: roster, settings: configuration, billing: biller}
+	mux.Handle("GET /customer/{token}", withHeaders(s.view("welcome")))
+	mux.Handle("GET /customer/{token}/forms", withHeaders(s.view("form")))
+	mux.Handle("POST /customer/{token}", withHeaders(s.submit))
+	mux.Handle("POST /customer/{token}/draft/{field}", withHeaders(s.draft))
+	mux.Handle("GET /customer/{token}/edit", withHeaders(s.edit))
+	mux.Handle("POST /customer/{token}/edit", withHeaders(s.edit))
+	mux.Handle("GET /customer/{token}/agreement", withHeaders(s.agreement))
+	mux.Handle("POST /customer/{token}/agreement", withHeaders(s.agreement))
+	mux.Handle("GET /customer/{token}/payments", withHeaders(s.payments))
+	mux.Handle("POST /customer/{token}/payments", withHeaders(s.payments))
+	mux.Handle("GET /payments/return", withHeaders(s.paymentReturn))
+	return nil
+}
 
-			var draftField students.Field
-			if draft {
-				var known bool
-				data.DraftField = r.PathValue("field")
-				draftField, known = students.FindField(data.DraftField)
-				if !known {
-					show(http.StatusNotFound)
-					return
-				}
-			}
+func htmx(r *http.Request) bool { return r.Header.Get("HX-Request") == "true" }
 
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-			defer cancel()
-			status := http.StatusOK
-			if r.Method == http.MethodPost {
-				status = parseCustomerForm(w, r)
-				if status != http.StatusOK {
-					data.Error = "No pudimos leer tu información. Intenta de nuevo."
-				} else if draft && len(r.PostForm[draftField.Key]) != 1 {
-					status = http.StatusBadRequest
-					data.Error = "No pudimos leer tu información. Intenta de nuevo."
-				} else {
-					data.Details = students.Details{
-						Name: r.PostForm.Get("name"), Email: r.PostForm.Get("email"),
-						Phone: r.PostForm.Get("phone"), Municipality: r.PostForm.Get("municipality"),
-						DateOfBirth: r.PostForm.Get("date_of_birth"),
-					}
-					data.EmailConfirm = r.PostForm.Get("email_confirm")
-					var parsed students.Details
-					var draftValue string
-					if draft {
-						data.FieldErrors = make(map[string]string)
-						value, err := draftField.Parse(r.PostForm.Get(draftField.Key), false)
-						if err != nil {
-							data.FieldErrors[draftField.Key] = fieldError(draftField.Key)
-						}
-						draftValue = value
-					} else {
-						parsed, data.FieldErrors, data.EmailMismatch = parseContact(r.PostForm)
-					}
-					if len(data.FieldErrors) != 0 {
-						status = http.StatusUnprocessableEntity
-					} else {
-						var result links.SaveResult
-						var err error
-						if draft {
-							result, err = store.SaveDraft(ctx, token, draftField.Key, draftValue)
-						} else {
-							result, err = store.Submit(ctx, token, parsed)
-						}
-						switch {
-						case err != nil:
-							logging.RecordError(r, "save", err)
-							data.Error = "No pudimos guardar tu información. Intenta de nuevo."
-							show(http.StatusInternalServerError)
-						case result == links.AlreadySubmitted:
-							advance()
-						case result == links.Saved:
-							if draft {
-								show(http.StatusOK)
-							} else {
-								advance()
-							}
-						default:
-							show(http.StatusNotFound)
-						}
-						return
-					}
-				}
-			}
+// withHeaders sets the customer response headers before h runs, so every outcome carries them.
+func withHeaders(h http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Security-Policy", customerCSP)
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Vary", "HX-Request")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		h(w, r)
+	})
+}
 
-			// Invalid input still observes link usability and completion first.
-			lookup := store.Lookup
-			if r.Method == http.MethodGet {
-				lookup = store.Open
-			}
-			link, err := lookup(ctx, token)
-			if err != nil {
-				logging.RecordError(r, "lookup", err)
-				data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
-				show(http.StatusInternalServerError)
-				return
-			}
-			if link == nil {
-				show(http.StatusNotFound)
-				return
-			}
-			if link.SubmittedAt != nil {
-				advance()
-				return
-			}
-			if status != http.StatusUnprocessableEntity {
-				data.Details = link.Details
-			}
-			show(status)
+// render writes the named template, or the branded 404 that makes HTMX reload the page.
+func (s *site) render(w http.ResponseWriter, r *http.Request, name string, data pageData, status int) {
+	if status == http.StatusNotFound {
+		name = "not-found.html"
+		if htmx(r) {
+			w.Header().Set("HX-Refresh", "true")
 		}
 	}
+	w.WriteHeader(status)
+	if r.Method == http.MethodHead {
+		return
+	}
+	if err := s.page.ExecuteTemplate(w, name, data); err != nil {
+		logging.RecordError(r, "render", err)
+	}
+}
 
-	mux.Handle("GET /customer/{token}", logging.Operation("link_read", handle("welcome")))
-	mux.Handle("GET /customer/{token}/forms", logging.Operation("link_read", handle("form")))
-	mux.Handle("POST /customer/{token}", logging.Operation("final_submit", handle("form")))
-	mux.Handle("POST /customer/{token}/draft/{field}", logging.Operation("draft_save", handle("save-status")))
-	registerEditRoutes(mux, store, biller, page)
-	registerAgreementRoutes(mux, store, configuration, biller, page)
-	registerPaymentRoutes(mux, store, biller, page)
-	mux.Handle("GET /payments/return", logging.Operation("link_read", paymentReturn(biller, page)))
-	return nil
+// found reports whether a link lookup produced a usable link; otherwise it has already rendered
+// the failure (500 for a database error, 404 for no link) with the named template.
+func (s *site) found(w http.ResponseWriter, r *http.Request, name string, data *pageData, link *links.Link, err error) bool {
+	switch {
+	case err != nil:
+		logging.RecordError(r, "lookup", err)
+		data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
+		s.render(w, r, name, *data, http.StatusInternalServerError)
+	case link == nil:
+		s.render(w, r, name, *data, http.StatusNotFound)
+	default:
+		return true
+	}
+	return false
+}
+
+// Redirects carry no contact data, including the HTMX submission response.
+func redirectCustomer(w http.ResponseWriter, r *http.Request, target string) {
+	if r.Method == http.MethodPost && htmx(r) {
+		w.Header().Set("HX-Redirect", target)
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	w.Header().Set("Location", target)
+	w.WriteHeader(http.StatusSeeOther)
+}
+
+// view serves the welcome and form pages. GET records a visit; HEAD only checks usability.
+// A submitted form never shows again: GET continues to the agreement, HEAD reports it usable.
+func (s *site) view(name string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.PathValue("token")
+		data := pageData{Path: "/customer/" + url.PathEscape(token), View: name}
+		ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+		defer cancel()
+		lookup := s.links.Lookup
+		if r.Method == http.MethodGet {
+			lookup = s.links.Open
+		}
+		link, err := lookup(ctx, token)
+		if !s.found(w, r, "index.html", &data, link, err) {
+			return
+		}
+		if link.SubmittedAt != nil {
+			if r.Method == http.MethodHead {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			redirectCustomer(w, r, data.Path+"/agreement")
+			return
+		}
+		data.Details = link.Details
+		s.render(w, r, "index.html", data, http.StatusOK)
+	}
+}
+
+// submit commits the final contact form and advances to the agreement. Valid input is written with
+// no prior lookup, so a database failure is recorded as a save failure; anything else observes
+// link usability and completion first. The HTMX request swaps in only the content section.
+func (s *site) submit(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	data := pageData{Path: "/customer/" + url.PathEscape(token), View: "form"}
+	name := "index.html"
+	if htmx(r) {
+		name = "customer-content"
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+	defer cancel()
+	status := parseCustomerForm(w, r)
+	if status != http.StatusOK {
+		data.Error = "No pudimos leer tu información. Intenta de nuevo."
+	} else if parsed, ok := readContact(r.PostForm, &data); !ok {
+		status = http.StatusUnprocessableEntity
+	} else {
+		result, err := s.links.Submit(ctx, token, parsed)
+		switch {
+		case err != nil:
+			logging.RecordError(r, "save", err)
+			data.Error = "No pudimos guardar tu información. Intenta de nuevo."
+			s.render(w, r, name, data, http.StatusInternalServerError)
+		case result == links.Saved, result == links.AlreadySubmitted:
+			redirectCustomer(w, r, data.Path+"/agreement")
+		default:
+			s.render(w, r, name, data, http.StatusNotFound)
+		}
+		return
+	}
+
+	link, err := s.links.Lookup(ctx, token)
+	if !s.found(w, r, name, &data, link, err) {
+		return
+	}
+	if link.SubmittedAt != nil {
+		redirectCustomer(w, r, data.Path+"/agreement")
+		return
+	}
+	// A 422 keeps the attempted values; any other rejection shows what is stored.
+	if status != http.StatusUnprocessableEntity {
+		data.Details = link.Details
+	}
+	s.render(w, r, name, data, status)
+}
+
+// draft autosaves one field on blur. It answers only with status so it never redraws fields in use.
+// An unknown field is refused before the body is read or the database is touched.
+func (s *site) draft(w http.ResponseWriter, r *http.Request) {
+	token, key := r.PathValue("token"), r.PathValue("field")
+	data := pageData{View: "save-status"}
+	field, known := students.FindField(key)
+	if !known {
+		s.render(w, r, "save-status", data, http.StatusNotFound)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+	defer cancel()
+	status := parseCustomerForm(w, r)
+	if status == http.StatusOK && len(r.PostForm[key]) != 1 {
+		status = http.StatusBadRequest
+	}
+	if status != http.StatusOK {
+		data.Error = "No pudimos leer tu información. Intenta de nuevo."
+	} else if value, err := field.Parse(r.PostForm.Get(key), false); err != nil {
+		data.FieldErrors = map[string]string{key: fieldError(key)}
+		status = http.StatusUnprocessableEntity
+	} else {
+		result, err := s.links.SaveDraft(ctx, token, key, value)
+		switch {
+		case err != nil:
+			logging.RecordError(r, "save", err)
+			data.Error = "No pudimos guardar tu información. Intenta de nuevo."
+			s.render(w, r, "save-status", data, http.StatusInternalServerError)
+		case result == links.Saved:
+			s.render(w, r, "save-status", data, http.StatusOK)
+		case result == links.AlreadySubmitted:
+			locked(w, r)
+		default:
+			s.render(w, r, "save-status", data, http.StatusNotFound)
+		}
+		return
+	}
+
+	link, err := s.links.Lookup(ctx, token)
+	if !s.found(w, r, "save-status", &data, link, err) {
+		return
+	}
+	if link.SubmittedAt != nil {
+		locked(w, r)
+		return
+	}
+	s.render(w, r, "save-status", data, status)
+}
+
+// locked answers an autosave against a submitted form: the page is stale, so HTMX reloads it.
+func locked(w http.ResponseWriter, r *http.Request) {
+	if htmx(r) {
+		w.Header().Set("HX-Refresh", "true")
+	}
+	w.WriteHeader(http.StatusConflict)
+}
+
+// edit reopens the contact form of a submitted link until payment is confirmed or in flight.
+// The edit has no autosave: one POST updates the canonical student, then returns to the agreement.
+// Submission time, expiry, link snapshot, and accepted terms never change.
+func (s *site) edit(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	data := pageData{Path: "/customer/" + url.PathEscape(token), View: "form", Editing: true}
+	ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+	defer cancel()
+	link, err := s.links.Lookup(ctx, token)
+	if !s.found(w, r, "index.html", &data, link, err) {
+		return
+	}
+	if link.SubmittedAt == nil {
+		redirectCustomer(w, r, data.Path+"/forms")
+		return
+	}
+	editable, err := s.billing.ContactEditable(ctx, link.TokenHash)
+	if err != nil {
+		logging.RecordError(r, "load", err)
+		data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
+		s.render(w, r, "index.html", data, http.StatusInternalServerError)
+		return
+	}
+	if !editable {
+		redirectCustomer(w, r, data.Path+"/payments")
+		return
+	}
+	student, err := s.roster.BySourceLinkHash(ctx, link.TokenHash)
+	if err != nil {
+		logging.RecordError(r, "load", err)
+		data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
+		s.render(w, r, "index.html", data, http.StatusInternalServerError)
+		return
+	}
+	if student == nil {
+		s.render(w, r, "index.html", data, http.StatusNotFound)
+		return
+	}
+
+	status := http.StatusOK
+	data.Details = student.Details
+	if r.Method == http.MethodPost {
+		if status = parseCustomerForm(w, r); status != http.StatusOK {
+			data.Error = "No pudimos leer tu información. Intenta de nuevo."
+		} else if parsed, ok := readContact(r.PostForm, &data); !ok {
+			status = http.StatusUnprocessableEntity
+		} else if parsed == student.Details {
+			// Nothing changed: skip the write, the management refresh and the provider sync.
+			redirectCustomer(w, r, data.Path+"/agreement")
+			return
+		} else {
+			err = s.billing.UpdateContact(ctx, link.TokenHash, parsed)
+			switch {
+			case errors.Is(err, billing.ErrContactLocked):
+				redirectCustomer(w, r, data.Path+"/payments")
+				return
+			case errors.Is(err, billing.ErrUnavailable):
+				s.render(w, r, "index.html", data, http.StatusNotFound)
+				return
+			case err != nil:
+				logging.RecordError(r, "save", err)
+				data.Error = "No pudimos guardar tu información. Intenta de nuevo."
+				status = http.StatusInternalServerError
+			default:
+				redirectCustomer(w, r, data.Path+"/agreement")
+				return
+			}
+		}
+	}
+	s.render(w, r, "index.html", data, status)
+}
+
+func parseCustomerForm(w http.ResponseWriter, r *http.Request) int {
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
+	if err := r.ParseForm(); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return http.StatusRequestEntityTooLarge
+		}
+		return http.StatusBadRequest
+	}
+	return http.StatusOK
+}
+
+// readContact records the attempted contact form on data, so a rejection redraws what was typed,
+// and reports the validated details and whether every field passed.
+func readContact(form url.Values, data *pageData) (parsed students.Details, ok bool) {
+	data.Details = students.Details{
+		Name: form.Get("name"), Email: form.Get("email"),
+		Phone: form.Get("phone"), Municipality: form.Get("municipality"),
+		DateOfBirth: form.Get("date_of_birth"),
+	}
+	data.EmailConfirm = form.Get("email_confirm")
+	parsed, data.FieldErrors, data.EmailMismatch = parseContact(form)
+	return parsed, len(data.FieldErrors) == 0
 }
 
 // parseContact validates every contact field and the email confirmation, collecting all errors.
@@ -241,93 +412,6 @@ func parseContact(form url.Values) (parsed students.Details, fieldErrors map[str
 		fieldErrors["email_confirm"] = "Los correos electrónicos no coinciden."
 	}
 	return parsed, fieldErrors, emailMismatch
-}
-
-// registerEditRoutes reopens the contact form of a submitted link until the first payment is confirmed.
-// The edit has no autosave: one POST updates the link and student together, then returns to the agreement.
-// Submission time, expiry and accepted terms never change.
-func registerEditRoutes(mux *http.ServeMux, store *links.Store, biller *billing.Service, page *template.Template) {
-	handle := func(w http.ResponseWriter, r *http.Request) {
-		customerHeaders(w)
-		token := r.PathValue("token")
-		data := pageData{Path: "/customer/" + url.PathEscape(token), View: "form", Editing: true, FieldErrors: make(map[string]string)}
-		show := func(status int) { renderCustomer(w, r, page, data, status) }
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
-		link, err := store.Lookup(ctx, token)
-		if err != nil {
-			logging.RecordError(r, "lookup", err)
-			data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
-			show(http.StatusInternalServerError)
-			return
-		}
-		if link == nil {
-			show(http.StatusNotFound)
-			return
-		}
-		if link.SubmittedAt == nil {
-			redirectCustomer(w, r, data.Path+"/forms", false)
-			return
-		}
-		funded, err := biller.IsFunded(ctx, link.TokenHash)
-		if err != nil {
-			logging.RecordError(r, "load", err)
-			data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
-			show(http.StatusInternalServerError)
-			return
-		}
-		if funded {
-			redirectCustomer(w, r, data.Path+"/payments", false)
-			return
-		}
-
-		status := http.StatusOK
-		data.Details, data.EmailConfirm = link.Details, link.Email
-		if r.Method == http.MethodPost {
-			if status = parseCustomerForm(w, r); status != http.StatusOK {
-				data.Error = "No pudimos leer tu información. Intenta de nuevo."
-			} else {
-				data.Details = students.Details{
-					Name: r.PostForm.Get("name"), Email: r.PostForm.Get("email"),
-					Phone: r.PostForm.Get("phone"), Municipality: r.PostForm.Get("municipality"),
-					DateOfBirth: r.PostForm.Get("date_of_birth"),
-				}
-				data.EmailConfirm = r.PostForm.Get("email_confirm")
-				var parsed students.Details
-				parsed, data.FieldErrors, data.EmailMismatch = parseContact(r.PostForm)
-				if len(data.FieldErrors) != 0 {
-					status = http.StatusUnprocessableEntity
-				} else if parsed == link.Details {
-					// Nothing changed: skip the write, the management refresh and the provider sync.
-					redirectCustomer(w, r, data.Path+"/agreement", false)
-					return
-				} else {
-					result, err := store.UpdateContact(ctx, token, parsed)
-					switch {
-					case err != nil:
-						logging.RecordError(r, "save", err)
-						data.Error = "No pudimos guardar tu información. Intenta de nuevo."
-						status = http.StatusInternalServerError
-					case result != links.Saved:
-						show(http.StatusNotFound)
-						return
-					default:
-						// The edit is already committed; a failed provider update must not undo it.
-						if parsed.Name != link.Name || parsed.Email != link.Email {
-							if err := biller.UpdateCustomerContact(ctx, link.TokenHash, parsed.Name, parsed.Email); err != nil {
-								logging.RecordError(r, "sync", err)
-							}
-						}
-						redirectCustomer(w, r, data.Path+"/agreement", false)
-						return
-					}
-				}
-			}
-		}
-		show(status)
-	}
-	mux.Handle("GET /customer/{token}/edit", logging.Operation("link_read", http.HandlerFunc(handle)))
-	mux.Handle("POST /customer/{token}/edit", logging.Operation("final_submit", http.HandlerFunc(handle)))
 }
 
 func fieldError(key string) string {

@@ -109,7 +109,7 @@
         {{- with .SubmittedAt}}<span> · submitted <time datetime="{{.UTC.Format "2006-01-02T15:04:05Z"}}">{{.UTC.Format "Jan 2, 2006 15:04 UTC"}}</time></span>{{end}}
         {{- with .PaidAt}}<span> · paid <time datetime="{{.UTC.Format "2006-01-02T15:04:05Z"}}">{{.UTC.Format "Jan 2, 2006 15:04 UTC"}}</time></span>{{end}}
         {{- if ne .Status "Finished"}}
-        <span> · {{if .AccessExpired}}expired{{else}}expires{{end}}
+        <span> · {{if eq .Status "Expired"}}expired{{else}}expires{{end}}
         <time datetime="{{.ExpiresAt.UTC.Format "2006-01-02T15:04:05Z"}}">{{.ExpiresAt.UTC.Format "Jan 2, 2006 15:04 UTC"}}</time></span>{{end}}{{end}}
     </div>
     {{template "link-url" .}}

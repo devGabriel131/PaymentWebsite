@@ -8,46 +8,34 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/stripe/stripe-go/v87"
 	"paymentwebsite/internal/billing"
-	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/billing/billingtest"
 	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
 )
 
 type workerMockServer struct {
-	server *httptest.Server
+	mux           *http.ServeMux
+	initialAmount int64 // fixed at construction
 
 	mu                    sync.Mutex
 	paidAtUnix            int64
-	initialAmount         int64
 	invoicesCreated       int64
 	invoiceItemsCreated   int64
-	invoicesUpdated       int64
-	disputesReturned      []map[string]any
+	refundedCents         int64
 	earlyWarningsReturned []map[string]any
 	invoicesByID          map[string]map[string]any
 }
 
-func (wms *workerMockServer) getInitialAmount() int64 {
-	wms.mu.Lock()
-	defer wms.mu.Unlock()
-	if wms.initialAmount > 0 {
-		return wms.initialAmount
-	}
-	return 20834
-}
-
-func newWorkerMockServer(paidAt time.Time) *workerMockServer {
+func newWorkerMockServer(paidAt time.Time, initialAmount int64) *workerMockServer {
 	wms := &workerMockServer{
 		paidAtUnix:    paidAt.Unix(),
-		initialAmount: 20834,
+		initialAmount: initialAmount,
 		invoicesByID:  make(map[string]map[string]any),
 	}
 
@@ -63,7 +51,7 @@ func newWorkerMockServer(paidAt time.Time) *workerMockServer {
 			"mode":           "payment",
 			"payment_status": "paid",
 			"status":         "complete",
-			"amount_total":   wms.getInitialAmount(),
+			"amount_total":   wms.initialAmount,
 			"customer":       "cus_worker_test",
 			"invoice": map[string]any{
 				"id": "in_initial_paid",
@@ -94,7 +82,7 @@ func newWorkerMockServer(paidAt time.Time) *workerMockServer {
 				"object":      "invoice",
 				"status":      "paid",
 				"currency":    "usd",
-				"amount_paid": wms.getInitialAmount(),
+				"amount_paid": wms.initialAmount,
 				"customer":    "cus_worker_test",
 				"status_transitions": map[string]any{
 					"paid_at": wms.paidAtUnix,
@@ -103,7 +91,7 @@ func newWorkerMockServer(paidAt time.Time) *workerMockServer {
 					"object": "list",
 					"data": []map[string]any{
 						{
-							"amount":   wms.getInitialAmount(),
+							"amount":   wms.initialAmount,
 							"currency": "usd",
 							"metadata": map[string]any{
 								"tuition_obligation": "ref_first_obl",
@@ -146,7 +134,7 @@ func newWorkerMockServer(paidAt time.Time) *workerMockServer {
 					"id":          "invp_" + invID,
 					"object":      "invoice_payment",
 					"status":      "paid",
-					"amount_paid": wms.getInitialAmount(),
+					"amount_paid": wms.initialAmount,
 					"payment": map[string]any{
 						"type": "payment_intent",
 						"payment_intent": map[string]any{
@@ -165,18 +153,22 @@ func newWorkerMockServer(paidAt time.Time) *workerMockServer {
 		if r.PathValue("id") != "pi_worker_test" {
 			chID = "ch_" + r.PathValue("id")
 		}
+		wms.mu.Lock()
+		refunded := wms.refundedCents
+		wms.mu.Unlock()
 		resp := map[string]any{
 			"id":              r.PathValue("id"),
 			"object":          "payment_intent",
 			"status":          "succeeded",
-			"amount_received": wms.getInitialAmount(),
+			"amount_received": wms.initialAmount,
 			"currency":        "usd",
 			"payment_method": map[string]any{
 				"id":       "pm_card_test",
 				"customer": "cus_worker_test",
 			},
 			"latest_charge": map[string]any{
-				"id": chID,
+				"id":              chID,
+				"amount_refunded": refunded,
 			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -253,7 +245,7 @@ func newWorkerMockServer(paidAt time.Time) *workerMockServer {
 		if price == "" {
 			price = r.FormValue("price")
 		}
-		if price == "price_reinstatement" {
+		if price == "pr_reinstatement" {
 			amount = 2500
 		}
 
@@ -284,7 +276,6 @@ func newWorkerMockServer(paidAt time.Time) *workerMockServer {
 
 	// 9. POST /v1/invoices/{id} (Stage 3 arming)
 	mux.HandleFunc("POST /v1/invoices/{id}", func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt64(&wms.invoicesUpdated, 1)
 		id := r.PathValue("id")
 		wms.mu.Lock()
 		inv := wms.invoicesByID[id]
@@ -317,18 +308,17 @@ func newWorkerMockServer(paidAt time.Time) *workerMockServer {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	// 11. GET /v1/disputes
-	mux.HandleFunc("GET /v1/disputes", func(w http.ResponseWriter, r *http.Request) {
-		wms.mu.Lock()
-		data := wms.disputesReturned
-		wms.mu.Unlock()
-		if data == nil {
-			data = []map[string]any{}
-		}
+	// 11. GET /v1/refunds/{id}
+	mux.HandleFunc("GET /v1/refunds/{id}", func(w http.ResponseWriter, r *http.Request) {
 		resp := map[string]any{
-			"object":   "list",
-			"has_more": false,
-			"data":     data,
+			"id":     r.PathValue("id"),
+			"object": "refund",
+			"payment_intent": map[string]any{
+				"id": "pi_worker_test",
+			},
+			"charge": map[string]any{
+				"id": "ch_mock_1",
+			},
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -390,65 +380,27 @@ func newWorkerMockServer(paidAt time.Time) *workerMockServer {
 		_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "object": "invoice", "deleted": true})
 	})
 
-	// 17. POST /v1/billing_portal/sessions
-	mux.HandleFunc("POST /v1/billing_portal/sessions", func(w http.ResponseWriter, r *http.Request) {
-		resp := map[string]any{
-			"id":     "bps_mock_test",
-			"object": "billing_portal.session",
-			"url":    "https://billing.stripe.com/session/test",
-		}
-		_ = json.NewEncoder(w).Encode(resp)
-	})
-	wms.server = httptest.NewServer(mux)
+	wms.mux = mux
 	return wms
-}
-
-func (wms *workerMockServer) Close() {
-	wms.server.Close()
-}
-
-func (wms *workerMockServer) Client() *stripe.Client {
-	maxRetries := int64(0)
-	backends := stripe.NewBackendsWithConfig(&stripe.BackendConfig{
-		URL:               stripe.String(wms.server.URL),
-		HTTPClient:        wms.server.Client(),
-		MaxNetworkRetries: &maxRetries,
-		LeveledLogger:     &stripe.LeveledLogger{Level: stripe.LevelNull},
-	})
-	return stripe.NewClient("sk_test_mock", stripe.WithBackends(backends))
 }
 
 func TestScheduledInvoiceCreationRecoversEveryBoundary(t *testing.T) {
 	paidAt := time.Date(2026, time.November, 15, 4, 0, 0, 0, time.UTC)
-	mock := newWorkerMockServer(paidAt)
-	defer mock.Close()
+	mock := newWorkerMockServer(paidAt, 20834)
 
-	allModels := append([]any{&links.Link{}, &students.Student{}}, billing.Models()...)
+	allModels := append([]any{&students.Student{}}, billing.Models()...)
 	db := testdb.Open(t, allModels...)
 
 	tokenHash := make([]byte, 32)
 	rand.Read(tokenHash)
 	now := time.Now().UTC()
-	link := links.Link{
-		TokenHash: tokenHash,
+	student := students.Student{
+		SourceLinkHash: tokenHash,
 		Details: students.Details{
 			Name:  "Test Student",
 			Email: "test@example.com",
 		},
-		CreatedAt:        now,
-		SubmittedAt:      &now,
-		TermsAcceptedAt:  &now,
-		ProgramStartDate: "2026-11-01",
-		PaymentPlan:      "three",
-		ExpiresAt:        now.Add(7 * 24 * time.Hour),
-	}
-	if err := db.Create(&link).Error; err != nil {
-		t.Fatalf("create link: %v", err)
-	}
-	student := students.Student{
-		SourceLinkHash: tokenHash,
-		Details:        link.Details,
-		IsActive:       true,
+		IsActive: true,
 	}
 	if err := db.Create(&student).Error; err != nil {
 		t.Fatalf("create student: %v", err)
@@ -461,7 +413,6 @@ func TestScheduledInvoiceCreationRecoversEveryBoundary(t *testing.T) {
 		PlanID:           "three",
 		PlanName:         "Plan de 3 Pagos Mensuales",
 		InstallmentCount: 3,
-		Currency:         "usd",
 		TotalCents:       62500,
 		StripeCustomerID: &cusID,
 	}
@@ -504,61 +455,29 @@ func TestScheduledInvoiceCreationRecoversEveryBoundary(t *testing.T) {
 
 	sessID := "cs_worker_sess"
 	attempt := billing.CheckoutAttempt{
-		ContractID:            contract.ID,
-		Reference:             rand.Text(),
-		PlanID:                "three",
-		FirstAmountCents:      20834,
-		StripePriceID:         "pr_three_1",
-		IntegrationIdentifier: "tuition_ident123",
-		CreationStartedAt:     now,
-		StripeSessionID:       &sessID,
-		State:                 "open",
+		ContractID:        contract.ID,
+		Reference:         rand.Text(),
+		PlanID:            "three",
+		FirstAmountCents:  20834,
+		StripePriceID:     "pr_three_1",
+		CreationStartedAt: now,
+		StripeSessionID:   &sessID,
+		State:             "open",
 	}
 	db.Create(&attempt)
 
-	cfg := billing.Config{
-		BaseURL:                      "http://127.0.0.1:3000",
-		WebhookSecret:                "whsec_test",
-		PaymentMethodConfigurationID: "pmc_test",
-		PortalConfigurationID:        "bpc_test",
-		Live:                         false,
-	}
-	catalog := billing.Catalog{
-		Full:          "pr_full",
-		ThreeFirst:    "pr_three_1",
-		ThreeLater:    "pr_three_2",
-		SixFirst:      "pr_six_1",
-		SixLater:      "pr_six_2",
-		Reinstatement: "pr_reinstatement",
-	}
-
-	var changedCalls int64
-	changedFunc := func() {
-		atomic.AddInt64(&changedCalls, 1)
-	}
-
-	svc, err := billing.New(db, mock.Client(), cfg, catalog, changedFunc, nil)
-	if err != nil {
-		t.Fatalf("billing.New: %v", err)
-	}
+	svc := billingtest.New(t, db, mock.mux)
 
 	// Insert checkout.session.completed webhook event into DB
 	evt := billing.WebhookEvent{
 		ID:         "evt_checkout_completed",
 		EventType:  "checkout.session.completed",
 		ResourceID: sessID,
-		APIVersion: "2026-09-30.endive",
-		Livemode:   false,
-		ReceivedAt: now,
 	}
 	db.Create(&evt)
 
-	// Run worker for a brief cycle with timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Call worker once directly to drain event
-	svc.Run(ctx)
+	// One worker pass: the event funds the contract, then the same pass creates the later invoices
+	svc.DrainForTest(t.Context())
 
 	// Verify contract is now funded
 	var updatedContract billing.Contract
@@ -600,9 +519,8 @@ func TestScheduledInvoiceCreationRecoversEveryBoundary(t *testing.T) {
 
 	// Verify atomic idempotent recovery: re-running does not create duplicate invoices
 	invoicesBefore := atomic.LoadInt64(&mock.invoicesCreated)
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel2()
-	svc.Run(ctx2)
+	db.Model(&contract).Update("next_sync_at", nil)
+	svc.DrainForTest(t.Context())
 
 	invoicesAfter := atomic.LoadInt64(&mock.invoicesCreated)
 	if invoicesAfter != invoicesBefore {
@@ -610,37 +528,22 @@ func TestScheduledInvoiceCreationRecoversEveryBoundary(t *testing.T) {
 	}
 }
 
-func TestReconciliationPreservesUnpaidAndFinancialAdjustments(t *testing.T) {
+func TestRefundsAndFraudSignalsSurfaceWithoutWebhook(t *testing.T) {
 	paidAt := time.Date(2026, time.November, 15, 4, 0, 0, 0, time.UTC)
-	mock := newWorkerMockServer(paidAt)
-	defer mock.Close()
-	mock.initialAmount = 60000
-	allModels := append([]any{&links.Link{}, &students.Student{}}, billing.Models()...)
+	mock := newWorkerMockServer(paidAt, 60000)
+	allModels := append([]any{&students.Student{}}, billing.Models()...)
 	db := testdb.Open(t, allModels...)
 
 	tokenHash := make([]byte, 32)
 	rand.Read(tokenHash)
 	now := time.Now().UTC()
-	link := links.Link{
-		TokenHash: tokenHash,
+	student := students.Student{
+		SourceLinkHash: tokenHash,
 		Details: students.Details{
 			Name:  "Financial Student",
 			Email: "fin@example.com",
 		},
-		CreatedAt:        now,
-		SubmittedAt:      &now,
-		TermsAcceptedAt:  &now,
-		ProgramStartDate: "2026-11-01",
-		PaymentPlan:      "full",
-		ExpiresAt:        now.Add(7 * 24 * time.Hour),
-	}
-	if err := db.Create(&link).Error; err != nil {
-		t.Fatalf("create link: %v", err)
-	}
-	student := students.Student{
-		SourceLinkHash: tokenHash,
-		Details:        link.Details,
-		IsActive:       true,
+		IsActive: true,
 	}
 	if err := db.Create(&student).Error; err != nil {
 		t.Fatalf("create student: %v", err)
@@ -652,7 +555,6 @@ func TestReconciliationPreservesUnpaidAndFinancialAdjustments(t *testing.T) {
 		PlanID:           "full",
 		PlanName:         "Pago Único",
 		InstallmentCount: 1,
-		Currency:         "usd",
 		TotalCents:       60000,
 		FundedAt:         &now,
 		StripeCustomerID: &cusID,
@@ -664,7 +566,6 @@ func TestReconciliationPreservesUnpaidAndFinancialAdjustments(t *testing.T) {
 		ID:                 "pi_worker_test",
 		ContractID:         contract.ID,
 		StripeChargeID:     &chID,
-		Currency:           "usd",
 		GrossReceivedCents: 60000,
 		GrossRefundedCents: 0,
 		PaymentTime:        now,
@@ -686,26 +587,7 @@ func TestReconciliationPreservesUnpaidAndFinancialAdjustments(t *testing.T) {
 	}
 	db.Create(&obligation)
 
-	cfg := billing.Config{
-		BaseURL:                      "http://127.0.0.1:3000",
-		WebhookSecret:                "whsec_test",
-		PaymentMethodConfigurationID: "pmc_test",
-		PortalConfigurationID:        "bpc_test",
-		Live:                         false,
-	}
-	catalog := billing.Catalog{
-		Full:          "pr_full",
-		ThreeFirst:    "pr_three_1",
-		ThreeLater:    "pr_three_2",
-		SixFirst:      "pr_six_1",
-		SixLater:      "pr_six_2",
-		Reinstatement: "pr_reinstatement",
-	}
-
-	svc, err := billing.New(db, mock.Client(), cfg, catalog, nil, nil)
-	if err != nil {
-		t.Fatalf("billing.New: %v", err)
-	}
+	svc := billingtest.New(t, db, mock.mux)
 
 	// Verify initial summary: 60000 paid, 0 remaining
 	summary, err := svc.ForStudent(context.Background(), student.ID)
@@ -716,22 +598,37 @@ func TestReconciliationPreservesUnpaidAndFinancialAdjustments(t *testing.T) {
 		t.Fatalf("unexpected summary before adjustment: %+v", summary)
 	}
 
-	// 1. Simulate refund via refund.updated event
-	refundEvt := billing.WebhookEvent{
+	// stored reads back the payment and the contract's attention reason
+	stored := func() (p billing.Payment, attention string) {
+		db.First(&p, "id = ?", payment.ID)
+		var c billing.Contract
+		db.First(&c, contract.ID)
+		if c.AttentionReason != nil {
+			attention = *c.AttentionReason
+		}
+		return p, attention
+	}
+
+	// 1. Stripe reports a partial refund; the refund.updated event makes the worker re-read the payment
+	mock.mu.Lock()
+	mock.refundedCents = 10000
+	mock.mu.Unlock()
+	db.Create(&billing.WebhookEvent{
 		ID:         "evt_refund_1",
 		EventType:  "refund.updated",
 		ResourceID: "re_test_1",
-		APIVersion: "2026-09-30.endive",
-		Livemode:   false,
-		ReceivedAt: now,
+	})
+	svc.DrainForTest(t.Context())
+
+	p, attention := stored()
+	if p.GrossRefundedCents != 10000 {
+		t.Fatalf("expected GrossRefundedCents 10000 after refund, got %d", p.GrossRefundedCents)
 	}
-	db.Create(&refundEvt)
-
-	// Update Payment row to reflect a partial refund
-	db.Model(&billing.Payment{}).Where("id = ?", payment.ID).Update("gross_refunded_cents", 10000)
-
-	// Recheck summary: CashPaid is now 50000 (net received - refunded)
-	summary, err = svc.ForStudent(context.Background(), student.ID)
+	if attention != "payment_review" {
+		t.Fatalf("expected attention reason payment_review after refund, got %q", attention)
+	}
+	// CashPaid is now 50000 (gross received - refunded)
+	summary, err = svc.ForStudent(t.Context(), student.ID)
 	if err != nil || summary == nil {
 		t.Fatalf("ForStudent: %v", err)
 	}
@@ -752,73 +649,40 @@ func TestReconciliationPreservesUnpaidAndFinancialAdjustments(t *testing.T) {
 		},
 	}
 	mock.mu.Unlock()
+	db.Model(&contract).Update("next_sync_at", nil)
+	svc.DrainForTest(t.Context())
 
-	// Trigger contract sync via worker
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	svc.Run(ctx)
-
-	// Verify Payment record has fraud review state recorded
-	var updatedPayment billing.Payment
-	db.First(&updatedPayment, "id = ?", payment.ID)
-	if updatedPayment.DisputeOrFraudReviewState == nil {
-		t.Fatal("expected DisputeOrFraudReviewState to be recorded by audit")
+	p, attention = stored()
+	if p.DisputeOrFraudReviewState == nil || *p.DisputeOrFraudReviewState != "fraud_warning" {
+		t.Fatal("expected DisputeOrFraudReviewState fraud_warning to be recorded by audit")
+	}
+	if attention != "payment_review" {
+		t.Fatalf("expected attention reason to stay payment_review, got %q", attention)
 	}
 }
 
 func TestSuspensionAndReinstatement(t *testing.T) {
 	paidAt := time.Date(2026, time.November, 15, 4, 0, 0, 0, time.UTC)
-	mock := newWorkerMockServer(paidAt)
-	defer mock.Close()
+	mock := newWorkerMockServer(paidAt, 20834)
 
-	allModels := append([]any{&links.Link{}, &students.Student{}}, billing.Models()...)
+	allModels := append([]any{&students.Student{}}, billing.Models()...)
 	db := testdb.Open(t, allModels...)
 
-	cfg := billing.Config{
-		BaseURL:                      "http://127.0.0.1:3000",
-		Live:                         false,
-		PaymentMethodConfigurationID: "pmc_test",
-		PortalConfigurationID:        "bpc_test",
-		WebhookSecret:                "whsec_test",
-	}
-	catalog := billing.Catalog{
-		Full:          "price_full",
-		ThreeFirst:    "price_three_first",
-		ThreeLater:    "price_three_later",
-		SixFirst:      "price_six_first",
-		SixLater:      "price_six_later",
-		Reinstatement: "price_reinstatement",
-	}
-	svc, err := billing.New(db, mock.Client(), cfg, catalog, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	svc := billingtest.New(t, db, mock.mux)
 
 	now := time.Now().UTC()
 
-	// Helper to create link, student, contract
+	// Helper to create student, contract
 	setupStudent := func(name, email string) (students.Student, billing.Contract) {
 		tokenHash := make([]byte, 32)
 		rand.Read(tokenHash)
-		link := links.Link{
-			TokenHash: tokenHash,
+		student := students.Student{
+			SourceLinkHash: tokenHash,
 			Details: students.Details{
 				Name:  name,
 				Email: email,
 			},
-			CreatedAt:        now,
-			SubmittedAt:      &now,
-			TermsAcceptedAt:  &now,
-			ProgramStartDate: "2026-11-01",
-			ExpiresAt:        now.Add(7 * 24 * time.Hour),
-		}
-		if err := db.Create(&link).Error; err != nil {
-			t.Fatal(err)
-		}
-		student := students.Student{
-			SourceLinkHash: tokenHash,
-			Details:        link.Details,
-			IsActive:       true,
+			IsActive: true,
 		}
 		if err := db.Create(&student).Error; err != nil {
 			t.Fatal(err)
@@ -830,7 +694,6 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 			PlanID:           "three",
 			PlanName:         "Plan de 3 Pagos Mensuales",
 			InstallmentCount: 3,
-			Currency:         "usd",
 			TotalCents:       60000,
 			FundedAt:         &now,
 			StripeCustomerID: &cusID,
@@ -885,7 +748,7 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 		Number:                2,
 		AmountCents:           20833,
 		AmountRemainingCents:  20833,
-		StripePriceID:         catalog.ThreeLater,
+		StripePriceID:         "pr_three_2",
 		StripeInvoiceID:       &invID1,
 		DueAt:                 &dueNear,
 		CollectionDisposition: "collect",
@@ -893,9 +756,7 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 	db.Create(&obNear)
 
 	// Run worker sweep for contract 1
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel1()
-	svc.Run(ctx1)
+	svc.DrainForTest(t.Context())
 
 	var checkStudent1 students.Student
 	db.First(&checkStudent1, student1.ID)
@@ -920,7 +781,7 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 		Number:                2,
 		AmountCents:           20833,
 		AmountRemainingCents:  20833,
-		StripePriceID:         catalog.ThreeLater,
+		StripePriceID:         "pr_three_2",
 		StripeInvoiceID:       &invID2,
 		DueAt:                 &duePast,
 		CollectionDisposition: "collect",
@@ -937,16 +798,14 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 		Number:                3,
 		AmountCents:           20833,
 		AmountRemainingCents:  20833,
-		StripePriceID:         catalog.ThreeLater,
+		StripePriceID:         "pr_three_2",
 		StripeInvoiceID:       &invID3,
 		DueAt:                 &dueFuture,
 		CollectionDisposition: "collect",
 	}
 	db.Create(&obFuture)
 
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel2()
-	svc.Run(ctx2)
+	svc.DrainForTest(t.Context())
 
 	var checkStudent2 students.Student
 	db.First(&checkStudent2, student2.ID)
@@ -1010,7 +869,6 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 	}
 
 	// 5. Fee paid alone cannot reactivate if overdue tuition remains unpaid
-	settledFeeAt := now
 	mock.mu.Lock()
 	if inv := mock.invoicesByID[*feeOb.StripeInvoiceID]; inv != nil {
 		inv["status"] = "paid"
@@ -1019,15 +877,8 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 		inv["status_transitions"] = map[string]any{"paid_at": now.Unix()}
 	}
 	mock.mu.Unlock()
-	db.Model(&feeOb).Updates(map[string]any{
-		"amount_paid_cents":      2500,
-		"amount_remaining_cents": 0,
-		"first_settled_at":       settledFeeAt,
-	})
 	db.Model(&contract2).Update("next_sync_at", nil)
-	ctx3, cancel3 := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel3()
-	svc.Run(ctx3)
+	svc.DrainForTest(t.Context())
 
 	db.First(&checkStudent2, student2.ID)
 	if checkStudent2.IsActive {
@@ -1035,7 +886,6 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 	}
 
 	// 6. Full required settlement (overdue tuition + fee) auto-reactivates student
-	settledTuitionAt := now
 	mock.mu.Lock()
 	if inv := mock.invoicesByID[invID2]; inv != nil {
 		inv["status"] = "paid"
@@ -1044,15 +894,8 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 		inv["status_transitions"] = map[string]any{"paid_at": now.Unix()}
 	}
 	mock.mu.Unlock()
-	db.Model(&obPast).Updates(map[string]any{
-		"amount_paid_cents":      20833,
-		"amount_remaining_cents": 0,
-		"first_settled_at":       settledTuitionAt,
-	})
 	db.Model(&contract2).Update("next_sync_at", nil)
-	ctx4, cancel4 := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel4()
-	svc.Run(ctx4)
+	svc.DrainForTest(t.Context())
 
 	db.First(&checkStudent2, student2.ID)
 	if !checkStudent2.IsActive {
@@ -1085,73 +928,126 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 		AmountPaidCents:       20833,
 		AmountRemainingCents:  0,
 		FirstSettledAt:        &onTimeSettle,
-		StripePriceID:         catalog.ThreeLater,
+		StripePriceID:         "pr_three_2",
 		StripeInvoiceID:       &invIDOnTime,
 		DueAt:                 &dueOld,
 		CollectionDisposition: "collect",
 	}
 	db.Create(&obOnTime)
 
-	ctx5, cancel5 := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel5()
-	svc.Run(ctx5)
+	svc.DrainForTest(t.Context())
 
 	var checkStudent3 students.Student
 	db.First(&checkStudent3, student3.ID)
 	if !checkStudent3.IsActive {
 		t.Fatal("on-time payment settled before 14-day deadline should NOT suspend student")
 	}
+}
 
-	// 8. Unrelated inactive student without billing suspension remains inactive
-	unrelatedStudent := students.Student{
-		SourceLinkHash: make([]byte, 32),
-		Details: students.Details{
-			Name:  "Unrelated Inactive",
-			Email: "unrelated@example.com",
-		},
-		IsActive: false, // inactive for administrative reasons
-	}
-	rand.Read(unrelatedStudent.SourceLinkHash)
-	db.Create(&unrelatedStudent)
+func TestWorkerSyncsCustomerContact(t *testing.T) {
+	mock := newMockStripeServer()
+	db, svc, tokenHash, studentID := setupTestEnvironment(t, mock)
+	ctx := context.Background()
 
-	ctx6, cancel6 := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel6()
-	svc.Run(ctx6)
-
-	var checkUnrelated students.Student
-	db.First(&checkUnrelated, unrelatedStudent.ID)
-	if checkUnrelated.IsActive {
-		t.Fatal("unrelated inactive student without billing episode must remain inactive")
-	}
-
-	// 9. PortalURL creates a valid portal session URL
-	portalURL, err := svc.PortalURL(context.Background(), student2.ID, "staff_alice")
+	// Start checkout creates the customer in Stripe and stamps synced columns
+	res, err := svc.StartCheckout(ctx, tokenHash, "three")
 	if err != nil {
-		t.Fatalf("PortalURL failed: %v", err)
+		t.Fatalf("StartCheckout: %v", err)
 	}
-	if portalURL != "https://billing.stripe.com/session/test" {
-		t.Fatalf("unexpected portal URL: %s", portalURL)
-	}
-
-	// 10. InvoiceURL returns the hosted invoice URL
-	// Ensure mock has hosted_invoice_url set for in_boundary_2
-	mock.mu.Lock()
-	mock.invoicesByID[invID2]["hosted_invoice_url"] = "https://invoice.stripe.com/test_in_boundary_2"
-	mock.mu.Unlock()
-	invURL, err := svc.InvoiceURL(context.Background(), student2.ID, obPast.ID)
-	if err != nil {
-		t.Fatalf("InvoiceURL failed: %v", err)
-	}
-	if invURL != "https://invoice.stripe.com/test_in_boundary_2" {
-		t.Fatalf("unexpected invoice URL: %s", invURL)
+	if res.URL == "" {
+		t.Fatalf("expected checkout URL, got %+v", res)
 	}
 
-	// 11. ReconcileStudent refreshes contract and returns updated summary
-	recSummary, err := svc.ReconcileStudent(context.Background(), student2.ID, "staff_alice")
-	if err != nil {
-		t.Fatalf("ReconcileStudent failed: %v", err)
+	var c billing.Contract
+	if err := db.Where("student_id = ?", studentID).Take(&c).Error; err != nil {
+		t.Fatalf("take contract: %v", err)
 	}
-	if recSummary == nil || !recSummary.IsActive {
-		t.Fatalf("expected active student summary from ReconcileStudent: %+v", recSummary)
+	if c.StripeCustomerID == nil || *c.StripeCustomerID == "" {
+		t.Fatal("expected StripeCustomerID to be set on contract")
+	}
+	if c.SyncedCustomerName != "Maria Santos" || c.SyncedCustomerEmail != "maria@example.com" {
+		t.Fatalf("initial stamps wrong: %s, %s", c.SyncedCustomerName, c.SyncedCustomerEmail)
+	}
+
+	// 1. Unchanged student => drain produces 0 customer updates
+	svc.TouchContractForStudent(ctx, studentID)
+	svc.DrainForTest(ctx)
+	mock.with(func() {
+		if len(mock.customerUpdates) != 0 {
+			t.Fatalf("expected 0 customer updates, got %d", len(mock.customerUpdates))
+		}
+	})
+
+	// 2. Staff changes student email through students.Store.UpdateField
+	// Contract is unfunded, but customer syncs durable to Stripe
+	roster := students.New(db, nil)
+	if _, err := roster.UpdateField(ctx, studentID, "email", "maria.updated@example.com"); err != nil {
+		t.Fatalf("UpdateField: %v", err)
+	}
+	svc.TouchContractForStudent(ctx, studentID)
+
+	// One worker drain records exactly one customer update with new email
+	svc.DrainForTest(ctx)
+	var updates []customerUpdate
+	mock.with(func() {
+		updates = append([]customerUpdate(nil), mock.customerUpdates...)
+	})
+	if len(updates) != 1 {
+		t.Fatalf("expected 1 customer update, got %d", len(updates))
+	}
+	wantUpdate := customerUpdate{ID: *c.StripeCustomerID, Name: "Maria Santos", Email: "maria.updated@example.com"}
+	if updates[0] != wantUpdate {
+		t.Fatalf("customer update = %+v, want %+v", updates[0], wantUpdate)
+	}
+
+	// DB contract stamp equals student
+	if err := db.Where("id = ?", c.ID).Take(&c).Error; err != nil {
+		t.Fatal(err)
+	}
+	if c.SyncedCustomerEmail != "maria.updated@example.com" {
+		t.Fatalf("stamp not updated in DB: %s", c.SyncedCustomerEmail)
+	}
+
+	// 3. Mock fails update => contract stamp stays old and next drain succeeds
+	if _, err := roster.UpdateField(ctx, studentID, "name", "Maria Rivera"); err != nil {
+		t.Fatalf("UpdateField name: %v", err)
+	}
+	svc.TouchContractForStudent(ctx, studentID)
+	mock.with(func() {
+		mock.customerUpdateError = true
+	})
+	svc.DrainForTest(ctx)
+
+	// Stamp in DB still has old name because update failed
+	if err := db.Where("id = ?", c.ID).Take(&c).Error; err != nil {
+		t.Fatal(err)
+	}
+	if c.SyncedCustomerName != "Maria Santos" {
+		t.Fatalf("stamp should not be updated on failure: %s", c.SyncedCustomerName)
+	}
+
+	// Reset mock error and bump next_sync_at to now for next pass
+	mock.with(func() {
+		mock.customerUpdateError = false
+	})
+	svc.TouchContractForStudent(ctx, studentID)
+	svc.DrainForTest(ctx)
+
+	// Next drain succeeded
+	mock.with(func() {
+		updates = append([]customerUpdate(nil), mock.customerUpdates...)
+	})
+	if len(updates) != 2 {
+		t.Fatalf("expected 2 total customer updates, got %d", len(updates))
+	}
+	wantSecond := customerUpdate{ID: *c.StripeCustomerID, Name: "Maria Rivera", Email: "maria.updated@example.com"}
+	if updates[1] != wantSecond {
+		t.Fatalf("second update = %+v, want %+v", updates[1], wantSecond)
+	}
+	if err := db.Where("id = ?", c.ID).Take(&c).Error; err != nil {
+		t.Fatal(err)
+	}
+	if c.SyncedCustomerName != "Maria Rivera" {
+		t.Fatalf("stamp not updated after retry: %s", c.SyncedCustomerName)
 	}
 }

@@ -12,12 +12,12 @@ func TestPlans(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name, id string
-		amounts  []int
-		total    int
+		amounts  []int64
+		total    int64
 	}{
-		{"Pago Único", "full", []int{60000}, 60000},
-		{"Plan de 3 Pagos Mensuales", "three", []int{20834, 20833, 20833}, 62500},
-		{"Plan de 6 Pagos Mensuales", "six", []int{10835, 10833, 10833, 10833, 10833, 10833}, 65000},
+		{"Pago Único", "full", []int64{60000}, 60000},
+		{"Plan de 3 Pagos Mensuales", "three", []int64{20834, 20833, 20833}, 62500},
+		{"Plan de 6 Pagos Mensuales", "six", []int64{10835, 10833, 10833, 10833, 10833, 10833}, 65000},
 	}
 	plans := payments.Plans()
 	if len(plans) != len(cases) {
@@ -74,7 +74,7 @@ func TestPlanSchedule(t *testing.T) {
 			if len(schedule) != len(tc.dates) {
 				t.Fatalf("Schedule() has %d installments, want %d", len(schedule), len(tc.dates))
 			}
-			total := 0
+			total := int64(0)
 			for i, installment := range schedule {
 				if got := installment.Date.Format("2006-01-02"); got != tc.dates[i] {
 					t.Errorf("installment %d date = %s, want %s", i+1, got, tc.dates[i])
@@ -100,7 +100,7 @@ func TestMoney(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name  string
-		cents int
+		cents int64
 		want  string
 	}{
 		{"zero", 0, "$0.00"},
@@ -118,9 +118,6 @@ func TestMoney(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := payments.Money(tc.cents); got != tc.want {
 				t.Errorf("Money(%d) = %q, want %q", tc.cents, got, tc.want)
-			}
-			if got := payments.Money64(int64(tc.cents)); got != tc.want {
-				t.Errorf("Money64(%d) = %q, want %q", tc.cents, got, tc.want)
 			}
 		})
 	}

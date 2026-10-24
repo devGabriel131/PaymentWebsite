@@ -5,43 +5,8 @@ import (
 	"crypto/rand"
 	"log/slog"
 	"net/http"
-	"slices"
 	"time"
 )
-
-var operationNames = [...]string{
-	"link_read",
-	"final_submit",
-	"draft_save",
-	"link_list",
-	"trash_list",
-	"link_create",
-	"link_cancel",
-	"link_cancel_all",
-	"settings_load",
-	"settings_update",
-	"student_list",
-	"student_get",
-	"student_field_get",
-	"student_update",
-	"live_updates",
-	"sign_in",
-	"sign_out",
-	"session_check",
-	"startup_migrate",
-	"session_cleanup",
-	"cli_user",
-	"checkout_start",
-	"stripe_webhook",
-	"billing_reconcile",
-	"billing_reinstatement",
-	"billing_portal",
-	"billing_invoice_read",
-	"billing_worker",
-	"other",
-}
-
-const otherOperation = len(operationNames) - 1
 
 type requestContextKey struct{}
 type operationContextKey struct{}
@@ -50,24 +15,17 @@ type operationContextKey struct{}
 type requestState struct {
 	started   time.Time
 	requestID string
-	operation int
 	route     string
 	status    int
 
-	failure          error
-	failureStage     string
-	failureRoute     string
-	failureOperation int
+	failure      error
+	failureStage string
 }
 
 // Requests owns one failure event after the complete handler stack returns normally.
 func Requests(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		state := &requestState{
-			started:   time.Now(),
-			requestID: requestID(r.Header),
-			operation: otherOperation,
-		}
+		state := &requestState{started: time.Now(), requestID: requestID(r.Header)}
 		r = r.WithContext(context.WithValue(r.Context(), requestContextKey{}, state))
 		w.Header().Set("X-Request-ID", state.requestID)
 		next.ServeHTTP(&statusWriter{ResponseWriter: w, state: state}, r)
@@ -79,16 +37,15 @@ func Requests(log *slog.Logger, next http.Handler) http.Handler {
 			return
 		}
 
-		route, operation, stage := state.matchedRoute(r), state.operation, "response"
+		stage := "response"
 		if state.failure != nil {
-			route, operation, stage = state.failureRoute, state.failureOperation, state.failureStage
+			stage = state.failureStage
 		}
-		attrs := make([]slog.Attr, 0, 10)
+		attrs := make([]slog.Attr, 0, 9)
 		attrs = append(attrs,
 			slog.String("request_id", state.requestID),
 			slog.String("method", requestMethod(r.Method)),
-			slog.String("route", route),
-			slog.String("operation", operationNames[operation]),
+			slog.String("route", state.label()),
 			slog.String("stage", stage),
 			slog.Int("status", state.status),
 			slog.Float64("duration_ms", float64(time.Since(state.started))/float64(time.Millisecond)),
@@ -102,17 +59,25 @@ func Requests(log *slog.Logger, next http.Handler) http.Handler {
 	})
 }
 
-// Operation captures the route after its mux matches, without copying the request.
-func Operation(name string, next http.Handler) http.Handler {
-	operation := operationIndex(name)
+// Routes labels the request with mux's matching pattern before serving it, so nested muxes
+// behind request-copying middleware still report their leaf pattern.
+func Routes(mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		state := stateFromContext(r.Context())
-		state.operation, state.route = operation, r.Pattern
-		next.ServeHTTP(w, r)
+		if _, pattern := mux.Handler(r); pattern != "" {
+			stateFromContext(r.Context()).route = pattern
+		}
+		mux.ServeHTTP(w, r)
 	})
 }
 
-// RecordError freezes the first failure and its current leaf metadata; it emits nothing.
+func (state *requestState) label() string {
+	if state.route != "" {
+		return state.route
+	}
+	return "unmatched"
+}
+
+// RecordError freezes the first failure and its stage; it emits nothing.
 func RecordError(r *http.Request, stage string, err error) {
 	state := stateFromContext(r.Context())
 	if err == nil || state.failure != nil {
@@ -120,47 +85,30 @@ func RecordError(r *http.Request, stage string, err error) {
 	}
 	state.failure = err
 	state.failureStage = stage
-	state.failureRoute = state.matchedRoute(r)
-	state.failureOperation = state.operation
 }
 
 // WithOperation labels immutable startup/background contexts for database summaries.
 func WithOperation(ctx context.Context, name string) context.Context {
-	return context.WithValue(ctx, operationContextKey{}, operationIndex(name))
+	return context.WithValue(ctx, operationContextKey{}, name)
 }
 
-func operationIndex(name string) int {
-	if index := slices.Index(operationNames[:], name); index >= 0 {
-		return index
-	}
-	return otherOperation
-}
-
-func operationFromContext(ctx context.Context) int {
+// labelFromContext names what a database call belongs to: its request's route, else its
+// background operation.
+func labelFromContext(ctx context.Context) string {
 	if state, ok := ctx.Value(requestContextKey{}).(*requestState); ok {
-		return state.operation
+		return state.label()
 	}
-	if operation, ok := ctx.Value(operationContextKey{}).(int); ok {
-		return operation
+	if name, ok := ctx.Value(operationContextKey{}).(string); ok {
+		return name
 	}
-	return otherOperation
+	return "other"
 }
 
 func stateFromContext(ctx context.Context) *requestState {
 	if state, ok := ctx.Value(requestContextKey{}).(*requestState); ok {
 		return state
 	}
-	panic("logging: Requests middleware is required for Operation and RecordError")
-}
-
-func (state *requestState) matchedRoute(r *http.Request) string {
-	if state.route != "" {
-		return state.route
-	}
-	if r.Pattern != "" {
-		return r.Pattern
-	}
-	return "unmatched"
+	panic("logging: Requests middleware is required for Routes and RecordError")
 }
 
 func requestID(header http.Header) string {
