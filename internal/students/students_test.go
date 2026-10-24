@@ -114,6 +114,7 @@ func TestUpdateFieldChangesOnlySelectedCanonicalColumn(t *testing.T) {
 		{"email", " Canonical.Name+Student@EXAMPLE.ORG ", "Canonical.Name+Student@example.org"},
 		{"phone", "(939) 234-5678", "+19392345678"},
 		{"municipality", " \tAñasco \u2003", "Añasco"},
+		{"date_of_birth", " 2004-05-14 ", "2004-05-14"},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
 			updated, err := roster.UpdateField(ctx, original.ID, tc.key, tc.raw)
@@ -127,6 +128,8 @@ func TestUpdateFieldChangesOnlySelectedCanonicalColumn(t *testing.T) {
 				want.Phone = tc.want
 			case "municipality":
 				want.Municipality = tc.want
+			case "date_of_birth":
+				want.DateOfBirth = tc.want
 			}
 			if err != nil || updated == nil || !reflect.DeepEqual(*updated, want) {
 				t.Fatalf("UpdateField = %+v, %v, want %+v", updated, err, want)
@@ -208,6 +211,11 @@ func TestUpdateFieldRejectsUnknownFieldsAndInvalidDetailsWithoutWrites(t *testin
 		{"blank municipality", "municipality", " \t\u2003\n"},
 		{"forged municipality", "municipality", "PRIVATE_FORGED_MUNICIPALITY"},
 		{"alternate municipality case", "municipality", "san juan"},
+		{"empty date of birth", "date_of_birth", ""},
+		{"blank date of birth", "date_of_birth", " \t\u2003\n"},
+		{"malformed date of birth", "date_of_birth", "PRIVATE_DOB"},
+		{"future date of birth", "date_of_birth", "2099-01-01"},
+		{"over 100 date of birth", "date_of_birth", "1900-01-01"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := roster.UpdateField(ctx, original.ID, tc.key, tc.raw)
@@ -259,7 +267,7 @@ func TestUpdateFieldSuppressedWritesAreNotReportedAsSaved(t *testing.T) {
 	writes := 0
 	roster = students.New(db, func() { writes++ })
 	attempt := students.Student{Details: students.Details{
-		Name: "Changed student", Email: "Changed@example.org", Phone: "+19392345678", Municipality: "Añasco",
+		Name: "Changed student", Email: "Changed@example.org", Phone: "+19392345678", Municipality: "Añasco", DateOfBirth: "2006-07-20",
 	}}
 	for _, field := range students.Fields() {
 		t.Run(field.Key, func(t *testing.T) {
@@ -497,7 +505,7 @@ func enroll(t *testing.T, db *gorm.DB, sources *links.Store, ctx context.Context
 		t.Fatal(err)
 	}
 	details := students.Details{
-		Name: name, Email: "Original.Student@example.com", Phone: "+17872345678", Municipality: "San Juan",
+		Name: name, Email: "Original.Student@example.com", Phone: "+17872345678", Municipality: "San Juan", DateOfBirth: "2005-06-15",
 	}
 	if saved, err := sources.Submit(ctx, entry.Token, details); err != nil || saved != links.Saved {
 		t.Fatalf("enrollment saved=%v, err=%v", saved, err)

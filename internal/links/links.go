@@ -78,6 +78,7 @@ type Entry struct {
 	CreatedAt   time.Time
 	ExpiresAt   time.Time
 	SubmittedAt *time.Time
+	PaidAt      *time.Time
 	CreatedBy   string
 	CanceledBy  string
 	Status      Status
@@ -116,7 +117,7 @@ func (l Link) entry(now time.Time) Entry {
 		e.Status = Finished
 	case !now.Before(l.ExpiresAt):
 		e.Status = Expired
-	case l.Name != "" || l.Email != "" || l.Phone != "" || l.Municipality != "":
+	case l.Name != "" || l.Email != "" || l.Phone != "" || l.Municipality != "" || l.DateOfBirth != "":
 		e.Status = InProgress
 	case l.OpenedAt != nil:
 		e.Status = Opened
@@ -246,18 +247,48 @@ WITH completed AS (
            email = ?,
            phone = ?,
            municipality = ?,
+           date_of_birth = ?,
            submitted_at = now(),
            expires_at = now() + interval '168 hours'
      WHERE token_hash = ?
        AND canceled_at IS NULL
        AND expires_at > now()
        AND submitted_at IS NULL
-    RETURNING token_hash, name, email, phone, municipality, submitted_at
+    RETURNING token_hash, name, email, phone, municipality, date_of_birth, submitted_at
 )
-INSERT INTO students (source_link_hash, name, email, phone, municipality, created_at)
-SELECT token_hash, name, email, phone, municipality, submitted_at FROM completed
-`, details.Name, details.Email, details.Phone, details.Municipality, digest)
+INSERT INTO students (source_link_hash, name, email, phone, municipality, date_of_birth, created_at)
+SELECT token_hash, name, email, phone, municipality, date_of_birth, submitted_at FROM completed
+`, details.Name, details.Email, details.Phone, details.Municipality, details.DateOfBirth, digest)
 	return s.saveResult(ctx, digest, result, Unavailable)
+}
+
+// UpdateContact rewrites the contact details of an already-submitted link and its student together.
+// Submission time, expiry and accepted terms are untouched; unusable or unsubmitted links return Unavailable.
+func (s *Store) UpdateContact(ctx context.Context, token string, details students.Details) (SaveResult, error) {
+	digest, ok := tokenDigest(token)
+	if !ok {
+		return Unavailable, nil
+	}
+	contact := map[string]any{
+		"name": details.Name, "email": details.Email, "phone": details.Phone, "municipality": details.Municipality,
+		"date_of_birth": details.DateOfBirth,
+	}
+	saved := false
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&Link{}).
+			Where("token_hash = ? AND canceled_at IS NULL AND expires_at > now() AND submitted_at IS NOT NULL", digest).
+			Updates(contact)
+		if result.Error != nil || result.RowsAffected == 0 {
+			return result.Error
+		}
+		saved = true
+		return tx.Model(&students.Student{}).Where("source_link_hash = ?", digest).Updates(contact).Error
+	})
+	if err != nil || !saved {
+		return Unavailable, err
+	}
+	s.changed()
+	return Saved, nil
 }
 
 // AcceptTerms snapshots the displayed start date once, after contact submission.

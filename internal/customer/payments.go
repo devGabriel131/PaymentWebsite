@@ -6,6 +6,7 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"paymentwebsite/internal/billing"
@@ -107,6 +108,7 @@ func registerPaymentRoutes(mux *http.ServeMux, store *links.Store, biller *billi
 			data.Error = "No pudimos cargar tu información de pago. Intenta de nuevo."
 		default:
 			data.Billing = summary
+			data.Funded = summary != nil && summary.Funded
 		}
 		// A funded contract shows its persisted plan instead of a way to pay again.
 		if data.Billing == nil || !data.Billing.Funded {
@@ -125,19 +127,26 @@ func registerPaymentRoutes(mux *http.ServeMux, store *links.Store, biller *billi
 	mux.Handle("POST /customer/{token}/payments", logging.Operation("checkout_start", http.HandlerFunc(handle)))
 }
 
+// maxReturnPolls caps the return page's polling: 80 polls at 1.5s is about two minutes.
+const maxReturnPolls = 80
+
 // paymentReturn shows the outcome of a hosted Checkout redirect. It is token-free: it reads one
 // persisted attempt and never exposes student identity, contact, or payment history. Visiting it
-// (or a cancelled return) never changes financial state.
+// (or a cancelled return) never changes financial state. While the payment is pending, HTMX polls
+// this route and swaps in only the status block; a failed poll is not swapped, so polling retries.
 func paymentReturn(biller *billing.Service, page *template.Template) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		customerHeaders(w)
 		data := pageData{View: "payment-return"}
 		query := r.URL.Query()
-		switch sessionID := query.Get("session_id"); {
-		case sessionID != "":
+		polls, _ := strconv.Atoi(query.Get("polls")) // malformed input reads as 0
+		polls = min(max(polls, 0), maxReturnPolls)
+		data.ReturnSessionID, data.ReturnPollsNext, data.ReturnStopPoll = query.Get("session_id"), polls+1, polls >= maxReturnPolls
+		switch {
+		case data.ReturnSessionID != "":
 			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
-			result, err := biller.ReturnStatus(ctx, sessionID)
+			result, err := biller.ReturnStatus(ctx, data.ReturnSessionID)
 			switch {
 			case errors.Is(err, billing.ErrUnavailable):
 				renderCustomer(w, r, page, data, http.StatusNotFound)
@@ -153,6 +162,10 @@ func paymentReturn(biller *billing.Service, page *template.Template) http.Handle
 			data.Return = &billing.ReturnStatus{Status: "not_completed"}
 		default:
 			renderCustomer(w, r, page, data, http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("HX-Request") == "true" {
+			renderPage(w, r, page, "payment-return-status", data, http.StatusOK)
 			return
 		}
 		renderCustomer(w, r, page, data, http.StatusOK)

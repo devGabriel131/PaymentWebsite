@@ -124,4 +124,69 @@ func TestPaymentReturnRoute(t *testing.T) {
 	if strings.Contains(body, "Return Student") || strings.Contains(body, "return@example.com") {
 		t.Fatalf("return page leaked student details: %s", body)
 	}
+
+	// 5. Pending attempt renders polling trigger, spinner, and meta refresh
+	pendingSessID := "cs_return_pending_456"
+	pendingAttempt := billing.CheckoutAttempt{
+		ContractID:            contract.ID,
+		Reference:             rand.Text(),
+		PlanID:                "full",
+		FirstAmountCents:      60000,
+		StripePriceID:         "pr_full",
+		IntegrationIdentifier: "tuition_ret456",
+		CreationStartedAt:     now,
+		StripeSessionID:       &pendingSessID,
+		State:                 "processing",
+	}
+	if err := db.Create(&pendingAttempt).Error; err != nil {
+		t.Fatalf("create pending attempt: %v", err)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/payments/return?session_id="+pendingSessID, nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for pending session_id, got %d", rec.Code)
+	}
+	body = rec.Body.String()
+	if !strings.Contains(body, "payment-spinner") {
+		t.Fatalf("expected spinner in pending body: %s", body)
+	}
+	if !strings.Contains(body, `hx-trigger="every 1.5s"`) || !strings.Contains(body, `polls=1`) {
+		t.Fatalf("expected htmx trigger and polls=1 in pending body: %s", body)
+	}
+	if !strings.Contains(body, `<meta http-equiv="refresh"`) {
+		t.Fatalf("expected noscript refresh in pending body: %s", body)
+	}
+
+	// 6. HX-Request returns only the partial
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/payments/return?session_id="+pendingSessID+"&polls=1", nil)
+	req.Header.Set("HX-Request", "true")
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for HX-Request, got %d", rec.Code)
+	}
+	body = rec.Body.String()
+	if strings.Contains(body, "<!doctype") || strings.Contains(body, "<html") {
+		t.Fatalf("HX-Request should return only partial, got full page: %s", body)
+	}
+	if !strings.Contains(body, `polls=2`) {
+		t.Fatalf("expected next poll count polls=2 in partial: %s", body)
+	}
+
+	// 7. Cap at polls >= 80 stops polling
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/payments/return?session_id="+pendingSessID+"&polls=80", nil)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for polls=80, got %d", rec.Code)
+	}
+	body = rec.Body.String()
+	if strings.Contains(body, "hx-trigger") {
+		t.Fatalf("polls=80 should not have hx-trigger: %s", body)
+	}
+	if strings.Contains(body, `<meta http-equiv="refresh"`) {
+		t.Fatalf("polls=80 should not have meta refresh: %s", body)
+	}
 }

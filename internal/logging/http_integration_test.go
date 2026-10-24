@@ -60,6 +60,7 @@ func TestCustomerRolledBackRequestsLogOnce(t *testing.T) {
 		{"email draft", "/draft/email", "POST /customer/{token}/draft/{field}", "draft_save"},
 		{"phone draft", "/draft/phone", "POST /customer/{token}/draft/{field}", "draft_save"},
 		{"municipality draft", "/draft/municipality", "POST /customer/{token}/draft/{field}", "draft_save"},
+		{"date of birth draft", "/draft/date_of_birth", "POST /customer/{token}/draft/{field}", "draft_save"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			form := httpContactForm("Private rolled back name")
@@ -99,7 +100,7 @@ func TestCustomerCompletionFailureLogsOnceAndRetryIsSilent(t *testing.T) {
 	handler := fixture.routes(t, fixture.store)
 	const attempted = "  Reject completion  "
 	form := httpContactForm(attempted)
-	private := append(httpContactValues(form), draft.Name, draft.Email, draft.Phone, draft.Municipality,
+	private := append(httpContactValues(form), draft.Name, draft.Email, draft.Phone, draft.Municipality, draft.DateOfBirth,
 		entry.Token, entry.ID, httpUsername, "customer_submit_rejected")
 	rec := serveHTTPLogging(t, handler, http.MethodPost, "/customer/"+entry.Token, form, nil)
 	fixture.requireFailure(t, rec, httpFailure{
@@ -123,7 +124,7 @@ func TestCustomerCompletionFailureLogsOnceAndRetryIsSilent(t *testing.T) {
 	if err := fixture.db.WithContext(t.Context()).Find(&enrolled).Error; err != nil {
 		t.Fatal(err)
 	}
-	want := students.Details{Name: "Reject completion", Email: "Private+logging@example.com", Phone: "+12025550123", Municipality: "Bayamón"}
+	want := students.Details{Name: "Reject completion", Email: "Private+logging@example.com", Phone: "+12025550123", Municipality: "Bayamón", DateOfBirth: "2005-06-15"}
 	if completed.Details != want || completed.SubmittedAt == nil || completed.OpenedAt != nil ||
 		len(enrolled) != 1 || enrolled[0].Details != completed.Details || !bytes.Equal(enrolled[0].SourceLinkHash, completed.TokenHash) ||
 		!enrolled[0].CreatedAt.Equal(*completed.SubmittedAt) || completed.ExpiresAt.Sub(*completed.SubmittedAt) != 168*time.Hour {
@@ -331,12 +332,12 @@ func TestAgreementAndChoiceFailuresLogOnceWithoutContactData(t *testing.T) {
 }
 
 func httpContactDetails(name string) students.Details {
-	return students.Details{Name: name, Email: "Private+retained@example.com", Phone: "+17872345678", Municipality: "Río Grande"}
+	return students.Details{Name: name, Email: "Private+retained@example.com", Phone: "+17872345678", Municipality: "Río Grande", DateOfBirth: "2005-06-15"}
 }
 
 func httpContactForm(name string) url.Values {
 	return url.Values{"name": {name}, "email": {" Private+logging@EXAMPLE.COM "},
-		"email_confirm": {" Private+logging@example.com "}, "phone": {"(202) 555-0123"}, "municipality": {"Bayamón"}}
+		"email_confirm": {" Private+logging@example.com "}, "phone": {"(202) 555-0123"}, "municipality": {"Bayamón"}, "date_of_birth": {"2005-06-15"}}
 }
 
 func httpContactValues(form url.Values) []string {

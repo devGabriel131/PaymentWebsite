@@ -14,6 +14,7 @@ type Details struct {
 	Email        string `gorm:"not null;default:''"`
 	Phone        string `gorm:"not null;default:''"`
 	Municipality string `gorm:"not null;default:''"`
+	DateOfBirth  string `gorm:"type:text;not null;default:''"`
 }
 
 type Student struct {

@@ -3,11 +3,14 @@ package students
 import (
 	"net/mail"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/nyaruka/phonenumbers/v2"
 )
+
+var puertoRico = time.FixedZone("America/Puerto_Rico", -4*60*60)
 
 type Field struct {
 	Key, Label, InputType string
@@ -37,6 +40,11 @@ var fields = []Field{
 		Key: "municipality", Label: "Municipality", Required: true,
 		Value: func(s Student) string { return s.Municipality },
 		Parse: ParseMunicipality, Options: MunicipalityOptions(),
+	},
+	{
+		Key: "date_of_birth", Label: "Date of birth", InputType: "date", Required: true,
+		Value: func(s Student) string { return s.DateOfBirth },
+		Parse: ParseDateOfBirth,
 	},
 }
 
@@ -177,6 +185,37 @@ func ParsePhone(raw string, required bool) (string, error) {
 		return "", &ValidationError{Message: message}
 	}
 	return phonenumbers.Format(number, phonenumbers.E164), nil
+}
+
+// ParseDateOfBirth validates a calendar date formatted as YYYY-MM-DD.
+// The date must be strictly before today in Puerto Rico with age 0-100 inclusive.
+func ParseDateOfBirth(raw string, required bool) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		if required {
+			return "", &ValidationError{Message: "date of birth required"}
+		}
+		return "", nil
+	}
+	t, err := time.ParseInLocation(time.DateOnly, trimmed, puertoRico)
+	if err != nil {
+		return "", &ValidationError{Message: "invalid date format"}
+	}
+	nowYear, nowMonth, nowDay := time.Now().In(puertoRico).Date()
+	// Midnight today, so a birth date equal to today is not Before it.
+	today := time.Date(nowYear, nowMonth, nowDay, 0, 0, 0, 0, puertoRico)
+	if !t.Before(today) {
+		return "", &ValidationError{Message: "date of birth must be before today"}
+	}
+	birthYear, birthMonth, birthDay := t.Date()
+	age := nowYear - birthYear
+	if nowMonth < birthMonth || (nowMonth == birthMonth && nowDay < birthDay) {
+		age--
+	}
+	if age > 100 {
+		return "", &ValidationError{Message: "age must be between 0 and 100"}
+	}
+	return t.Format(time.DateOnly), nil
 }
 
 type ValidationError struct {

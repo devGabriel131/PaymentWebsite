@@ -1,37 +1,42 @@
 {{define "payments"}}
 <div class="payment-selection">
+  <a class="customer-back-link" href="{{.Path}}/agreement">{{template "icon-arrow-left"}}Volver al acuerdo</a>
   {{if and .Billing .Billing.Funded}}
   {{with .Billing}}
-  <header class="payment-page-heading">
+  <header class="customer-heading payment-confirmed">
+    <span class="payment-confirmed-icon">{{template "icon-check"}}</span>
     <h1>Tu plan de pago</h1>
     <p>Confirmamos tu pago inicial.{{if gt (len .Installments) 1}} Los pagos restantes se cobran automáticamente en las fechas indicadas.{{end}}</p>
   </header>
-  {{with $.Error}}<p id="payment-error" role="alert">{{.}}</p>{{end}}
-  <p class="payment-saved" role="status">
-    Plan: <strong>{{.PlanName}}</strong>.
-    Pagado: <strong>{{money64 .TuitionPaidCents}}</strong> de <strong>{{money64 .TotalCents}}</strong>.
-    Pendiente: <strong>{{money64 .RemainingTuitionCents}}</strong>.
-  </p>
-  <h2 class="payment-schedule-heading">Fechas y estado</h2>
-  <ol class="payment-schedule" role="list">
-    {{range .Installments}}
-    <li>
-      <span>{{if .DueAt}}{{billingDate .DueAt}}{{else}}Fecha por confirmar{{end}} —
-        {{if eq .Status "paid"}}Pagado{{if .PaidAt}} el {{billingDate .PaidAt}}{{end}}{{else if eq .Status "overdue"}}Vencido{{else if eq .Status "action_required"}}Requiere atención{{else}}Programado{{end}}</span>
-      <strong class="payment-installment-amount">{{money64 .AmountCents}}</strong>
-    </li>
-    {{end}}
-  </ol>
+  {{with $.Error}}<p id="payment-error" class="customer-callout" role="alert">{{template "icon-alert"}}<span>{{.}}</span></p>{{end}}
+  <div class="payment-progress customer-card" role="status">
+    <p class="payment-progress-plan">{{.PlanName}}</p>
+    <p class="payment-progress-paid"><strong>{{money64 .TuitionPaidCents}}</strong> pagados de {{money64 .TotalCents}}</p>
+    <progress max="{{.TotalCents}}" value="{{.TuitionPaidCents}}">{{money64 .TuitionPaidCents}} de {{money64 .TotalCents}}</progress>
+    <p class="payment-progress-left">Pendiente: <strong>{{money64 .RemainingTuitionCents}}</strong></p>
+  </div>
+  <section class="customer-card" aria-labelledby="payment-schedule-title">
+    <h2 id="payment-schedule-title" class="payment-schedule-heading">Fechas y estado</h2>
+    <ol class="payment-schedule" role="list">
+      {{range .Installments}}
+      <li data-status="{{.Status}}">
+        <span class="payment-installment-when">
+          <strong>{{if .DueAt}}{{billingDate .DueAt}}{{else}}Fecha por confirmar{{end}}</strong>
+          <span class="payment-installment-state">{{if eq .Status "paid"}}Pagado{{if .PaidAt}} el {{billingDate .PaidAt}}{{end}}{{else if eq .Status "overdue"}}Vencido{{else if eq .Status "action_required"}}Requiere atención{{else}}Programado{{end}}</span>
+        </span>
+        <strong class="payment-installment-amount">{{money64 .AmountCents}}</strong>
+      </li>
+      {{end}}
+    </ol>
+  </section>
   {{end}}
   {{else}}
-  <header class="payment-page-heading">
-    <h1>Selección del plan de pago</h1>
-    <p id="payment-schedule-note">Las fechas muestran el calendario si el primer pago se realiza hoy, en la zona horaria de Puerto Rico. Si pagas en otra fecha, el calendario cambiará.</p>
-    <p id="payment-choice-note">Elige tu plan para continuar al pago seguro con Stripe.</p>
-    <p id="payment-auto-note">En los planes a plazos, los pagos restantes se cobran automáticamente a la tarjeta usada en el primer pago.</p>
+  <header class="customer-heading">
+    <h1>Elige tu plan de pago</h1>
+    <p id="payment-choice-note">Elige cómo quieres pagar. Después te llevamos a Stripe para completar el pago de forma segura.</p>
   </header>
   {{if .Processing}}
-  <div id="payment-processing" role="status">
+  <div id="payment-processing" class="customer-callout" role="status">
     <p><strong>Estamos preparando tu pago seguro.</strong> Todavía no hemos confirmado ningún pago.</p>
     <p><a href="{{.Path}}/payments">Verificar estado</a> o usa «Continuar al pago seguro» para reanudar.</p>
   </div>
@@ -43,12 +48,12 @@
   <p class="payment-saved" role="status">Plan elegido: <strong>{{.}}</strong>. Todavía no hemos confirmado ningún pago. Puedes continuar o cambiar tu elección antes de pagar.</p>
   {{end}}
   {{end}}
-  {{with .Error}}<p id="payment-error" role="alert">{{.}}</p>{{end}}
+  {{with .Error}}<p id="payment-error" class="customer-callout" role="alert">{{template "icon-alert"}}<span>{{.}}</span></p>{{end}}
   {{if .Plans}}
   <form class="payment-plan-form" action="{{.Path}}/payments" method="post">
     <fieldset aria-describedby="payment-schedule-note payment-choice-note payment-auto-note{{if .Error}} payment-error{{end}}{{if index .FieldErrors "payment_plan"}} payment-plan-error{{end}}"{{if index .FieldErrors "payment_plan"}} aria-invalid="true"{{end}}>
-      <legend>Elige tu plan de pago</legend>
-      {{with index .FieldErrors "payment_plan"}}<p id="payment-plan-error" role="alert">{{.}}</p>{{end}}
+      <legend class="visually-hidden">Elige tu plan de pago</legend>
+      {{with index .FieldErrors "payment_plan"}}<p id="payment-plan-error" class="customer-callout" role="alert">{{template "icon-alert"}}<span>{{.}}</span></p>{{end}}
       <div class="payment-options">
         {{range .Plans}}
         <section class="payment-option" aria-labelledby="plan-title-{{.ID}}">
@@ -60,26 +65,39 @@
             </label>
           </h2>
           <div class="payment-plan-summary" id="plan-summary-{{.ID}}">
+            <p class="payment-plan-due"><span>Pagas hoy</span><strong>{{money (index .Schedule 0).AmountCents}}</strong></p>
+            {{if eq (len .Schedule) 1}}
+            <p>Un solo pago.</p>
+            {{else}}
             <p>Total a pagar: <strong>{{money .TotalCents}}</strong></p>
-            <p>{{len .Schedule}} {{if eq (len .Schedule) 1}}pago{{else}}pagos mensuales{{end}}</p>
-          </div>
-          <h3 class="payment-schedule-heading">Fechas y montos</h3>
-          <ol class="payment-schedule" role="list">
-            {{range $index, $installment := .Schedule}}
-            <li>
-              <span>{{if eq $index 0}}<strong>Hoy</strong> — {{end}}{{spanishDate .Date}}</span>
-              <strong class="payment-installment-amount">{{money .AmountCents}}</strong>
-            </li>
+            <p>{{len .Schedule}} pagos mensuales</p>
             {{end}}
-          </ol>
+          </div>
+          <div class="payment-schedule-wrap">
+            <h3 class="payment-schedule-heading">Fechas y montos</h3>
+            <ol class="payment-schedule" role="list">
+              {{range $index, $installment := .Schedule}}
+              <li>
+                <span>{{if eq $index 0}}<strong class="payment-today">Hoy</strong> {{end}}{{spanishDate .Date}}</span>
+                <strong class="payment-installment-amount">{{money .AmountCents}}</strong>
+              </li>
+              {{end}}
+            </ol>
+          </div>
         </section>
         {{end}}
       </div>
     </fieldset>
-    <button class="customer-primary" type="submit">Continuar al pago seguro</button>
+    <div class="payment-notes">
+      <p id="payment-auto-note" class="customer-callout">{{template "icon-refresh"}}<span>En los planes a plazos, los pagos restantes se cobran automáticamente a la tarjeta usada en el primer pago.</span></p>
+      <p id="payment-schedule-note" class="customer-hint">Las fechas muestran el calendario si el primer pago se realiza hoy, en la zona horaria de Puerto Rico. Si pagas en otra fecha, el calendario cambiará.</p>
+    </div>
+    <div class="payment-checkout">
+      <button class="customer-primary" type="submit">{{template "icon-lock"}}Continuar al pago seguro</button>
+      <p class="customer-hint">Pago seguro procesado por Stripe.</p>
+    </div>
   </form>
   {{end}}
   {{end}}
-  <p class="payment-review"><a href="{{.Path}}/agreement">Revisar el Acuerdo de Pago y los Términos y Condiciones</a></p>
 </div>
 {{end}}

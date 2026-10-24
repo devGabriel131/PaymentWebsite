@@ -56,7 +56,7 @@ type lease struct {
 	token string
 }
 
-// Run drains due webhook events, then due contracts, every workerTick until ctx ends.
+// Run drains due webhook events, then due contracts, every workerTick or as soon as a webhook is stored, until ctx ends.
 func (s *Service) Run(ctx context.Context) {
 	ctx = logging.WithOperation(ctx, "billing_worker")
 	s.drainEvents(ctx)
@@ -68,6 +68,10 @@ func (s *Service) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			s.drainEvents(ctx)
+			s.drainContracts(ctx)
+		case <-s.wake:
+			ticker.Reset(workerTick)
 			s.drainEvents(ctx)
 			s.drainContracts(ctx)
 		}

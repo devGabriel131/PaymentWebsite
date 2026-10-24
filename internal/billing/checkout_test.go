@@ -23,6 +23,8 @@ import (
 	"paymentwebsite/internal/testdb"
 )
 
+type customerUpdate struct{ ID, Name, Email string }
+
 type mockStripeServer struct {
 	server       *httptest.Server
 	customerReqs int64
@@ -40,6 +42,7 @@ type mockStripeServer struct {
 	customersCreated          map[string]string         // contractRef -> customerID
 	sessionsCreated           map[string]string         // attemptRef -> sessionID
 	sessions                  map[string]map[string]any // sessionID -> stored Session
+	customerUpdates           []customerUpdate          // guarded by mu
 }
 
 func newMockStripeServer() *mockStripeServer {
@@ -69,6 +72,14 @@ func newMockStripeServer() *mockStripeServer {
 			"livemode": false,
 		}
 		_ = json.NewEncoder(w).Encode(resp)
+	})
+
+	mux.HandleFunc("POST /v1/customers/{id}", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		m.mu.Lock()
+		m.customerUpdates = append(m.customerUpdates, customerUpdate{r.PathValue("id"), r.FormValue("name"), r.FormValue("email")})
+		m.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": r.PathValue("id"), "object": "customer", "livemode": false})
 	})
 
 	mux.HandleFunc("POST /v1/checkout/sessions", func(w http.ResponseWriter, r *http.Request) {

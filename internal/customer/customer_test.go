@@ -292,7 +292,7 @@ func TestSubmissionFailureRollsBackAndAllowsRetry(t *testing.T) {
 			requireAdvance(t, w, path+"/agreement", mode == "htmx", privateFormValues(form)...)
 			completed := stored(t, db)[0]
 			enrolled := studentRecords(t, db)
-			want := students.Details{Name: "Reject completion", Email: "Retry+private@example.com", Phone: "+12025550123", Municipality: "Bayamón"}
+			want := students.Details{Name: "Reject completion", Email: "Retry+private@example.com", Phone: "+12025550123", Municipality: "Bayamón", DateOfBirth: "2005-06-15"}
 			if completed.Details != want || completed.SubmittedAt == nil || completed.OpenedAt != nil ||
 				len(enrolled) != 1 || enrolled[0].Details != completed.Details ||
 				!enrolled[0].CreatedAt.Equal(*completed.SubmittedAt) ||
@@ -704,7 +704,7 @@ func TestFinalValidationAndEmailConfirmation(t *testing.T) {
 	valid.Set("municipality", " Bayamón ")
 	w := customerRequest(t, mux, http.MethodPost, path, valid.Encode(), false)
 	requireAdvance(t, w, path+"/agreement", false, privateFormValues(valid)...)
-	want := students.Details{Name: "María Pérez", Email: "Ada+private@example.com", Phone: "+12025550123", Municipality: "Bayamón"}
+	want := students.Details{Name: "María Pérez", Email: "Ada+private@example.com", Phone: "+12025550123", Municipality: "Bayamón", DateOfBirth: "2005-06-15"}
 	link, enrolled := stored(t, db)[0], studentRecords(t, db)
 	if link.Details != want || len(enrolled) != 1 || enrolled[0].Details != want {
 		t.Fatalf("completion did not copy all normalized fields: link %+v, students %+v", link, enrolled)
@@ -730,12 +730,12 @@ func TestHostilePersistedDetailsRemainEscaped(t *testing.T) {
 }
 
 func contactDetails(name string) students.Details {
-	return students.Details{Name: name, Email: "Ada+private@example.com", Phone: "+17872345678", Municipality: "San Juan"}
+	return students.Details{Name: name, Email: "Ada+private@example.com", Phone: "+17872345678", Municipality: "San Juan", DateOfBirth: "2005-06-15"}
 }
 
 func detailsForm(details students.Details) url.Values {
 	return url.Values{"name": {details.Name}, "email": {details.Email}, "email_confirm": {""},
-		"phone": {details.Phone}, "municipality": {details.Municipality}}
+		"phone": {details.Phone}, "municipality": {details.Municipality}, "date_of_birth": {details.DateOfBirth}}
 }
 
 func contactForm(name string) url.Values {
@@ -1079,4 +1079,212 @@ func head(t *testing.T, server *httptest.Server, path string, htmx bool) int {
 		}
 	}
 	return resp.StatusCode
+}
+
+func TestContactEditFlowAndBackNavigation(t *testing.T) {
+	db := customerDatabase(t)
+	store := links.New(db, nil)
+	entry, err := store.Create(t.Context(), "staff", later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := newMux(t, db, store)
+	path := "/customer/" + entry.Token
+
+	// 1. Unsubmitted link: GET /edit redirects to /forms
+	w := customerRequest(t, mux, http.MethodGet, path+"/edit", "", false)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != path+"/forms" {
+		t.Fatalf("unsubmitted /edit: status %d, location %q; want redirect to /forms", w.Code, w.Header().Get("Location"))
+	}
+
+	// Submit link
+	initial := contactDetails("Original Student")
+	initial.Email = "original@example.com"
+	initial.Phone = "+17875551111"
+	initial.Municipality = "Ponce"
+	res, err := store.Submit(t.Context(), entry.Token, initial)
+	if err != nil || res != links.Saved {
+		t.Fatalf("submit: %v, %v", res, err)
+	}
+
+	// 2. Submitted link:
+	// GET /edit renders prefilled form with back link to agreement and action=/edit
+	w = customerRequest(t, mux, http.MethodGet, path+"/edit", "", false)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /edit: status %d, body %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `value="Original Student"`) || !strings.Contains(body, `value="original@example.com"`) {
+		t.Fatalf("GET /edit missing prefilled values: %s", body)
+	}
+	if !strings.Contains(body, `href="`+path+`/agreement"`) || !strings.Contains(body, "Volver al acuerdo") {
+		t.Fatalf("GET /edit missing back link to agreement: %s", body)
+	}
+	if !strings.Contains(body, `action="`+path+`/edit"`) {
+		t.Fatalf("GET /edit missing action=/edit: %s", body)
+	}
+	if !strings.Contains(body, "Guardar información") {
+		t.Fatalf("GET /edit missing 'Guardar información' button: %s", body)
+	}
+	// Form inputs should not have hx-post autosave
+	if strings.Contains(body, `hx-post="`+path+`/draft/`) {
+		t.Fatalf("GET /edit should not have autosave hx-post: %s", body)
+	}
+
+	// Agreement page has "Editar información del estudiante"
+	w = customerRequest(t, mux, http.MethodGet, path+"/agreement", "", false)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), path+"/edit") || !strings.Contains(w.Body.String(), "Editar información del estudiante") {
+		t.Fatalf("unfunded agreement page missing edit back link: %s", w.Body.String())
+	}
+
+	// POST /edit with validation error returns 422
+	invalidForm := url.Values{
+		"name":          {"New Name"},
+		"email":         {"invalid-email"},
+		"email_confirm": {"invalid-email"},
+		"phone":         {"+17875551111"},
+		"municipality":  {"Ponce"},
+		"date_of_birth": {"2005-06-15"},
+	}
+	w = customerRequest(t, mux, http.MethodPost, path+"/edit", invalidForm.Encode(), false)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("POST /edit with invalid email: status %d, want 422", w.Code)
+	}
+
+	// POST /edit with valid update
+	validForm := url.Values{
+		"name":          {"Updated Student"},
+		"email":         {"updated@example.com"},
+		"email_confirm": {"updated@example.com"},
+		"phone":         {"+17875552222"},
+		"municipality":  {"San Juan"},
+		"date_of_birth": {"2004-05-14"},
+	}
+	w = customerRequest(t, mux, http.MethodPost, path+"/edit", validForm.Encode(), false)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != path+"/agreement" {
+		t.Fatalf("POST /edit: status %d, location %q; want redirect to /agreement", w.Code, w.Header().Get("Location"))
+	}
+
+	// Check DB updated for both links and students
+	link, err := store.Lookup(t.Context(), entry.Token)
+	if err != nil || link == nil {
+		t.Fatalf("lookup link: %v, %v", link, err)
+	}
+	if link.Name != "Updated Student" || link.Email != "updated@example.com" || link.Phone != "+17875552222" || link.Municipality != "San Juan" || link.DateOfBirth != "2004-05-14" {
+		t.Fatalf("link not updated: %+v", link)
+	}
+	var student students.Student
+	if err := db.WithContext(t.Context()).Where("source_link_hash = ?", link.TokenHash).Take(&student).Error; err != nil {
+		t.Fatalf("find student: %v", err)
+	}
+	if student.Name != "Updated Student" || student.Email != "updated@example.com" || student.Phone != "+17875552222" || student.Municipality != "San Juan" || student.DateOfBirth != "2004-05-14" {
+		t.Fatalf("student not updated: %+v", student)
+	}
+
+	// 3. Funded link:
+	// Create funded contract
+	fundedAt := time.Now().UTC()
+	contract := billing.Contract{
+		StudentID:        student.ID,
+		Reference:        rand.Text(),
+		PlanID:           "full",
+		PlanName:         "Pago Único",
+		InstallmentCount: 1,
+		Currency:         "usd",
+		TotalCents:       60000,
+		FundedAt:         &fundedAt,
+	}
+	if err := db.Create(&contract).Error; err != nil {
+		t.Fatalf("create funded contract: %v", err)
+	}
+
+	// GET /edit redirects to /payments
+	w = customerRequest(t, mux, http.MethodGet, path+"/edit", "", false)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != path+"/payments" {
+		t.Fatalf("funded GET /edit: status %d, location %q; want redirect to /payments", w.Code, w.Header().Get("Location"))
+	}
+
+	// POST /edit redirects to /payments
+	w = customerRequest(t, mux, http.MethodPost, path+"/edit", validForm.Encode(), false)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != path+"/payments" {
+		t.Fatalf("funded POST /edit: status %d, location %q; want redirect to /payments", w.Code, w.Header().Get("Location"))
+	}
+
+	// Agreement page does NOT have edit back link when funded
+	w = customerRequest(t, mux, http.MethodGet, path+"/agreement", "", false)
+	if strings.Contains(w.Body.String(), "Editar información del estudiante") {
+		t.Fatalf("funded agreement page should not show edit link: %s", w.Body.String())
+	}
+
+	// Accept terms so /payments does not redirect to /agreement
+	if err := db.WithContext(t.Context()).Model(&links.Link{}).
+		Where("token_hash = ?", link.TokenHash).
+		Updates(map[string]any{"terms_accepted_at": time.Now().UTC(), "program_start_date": "2026-11-01"}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// Payments page has top back link to agreement and no duplicate bottom link
+	w = customerRequest(t, mux, http.MethodGet, path+"/payments", "", false)
+	body = w.Body.String()
+	if !strings.Contains(body, `href="`+path+`/agreement"`) || !strings.Contains(body, "Volver al acuerdo") {
+		t.Fatalf("payments page missing top back link: %s", body)
+	}
+	if strings.Contains(body, "Revisar el Acuerdo de Pago") {
+		t.Fatalf("payments page still has duplicate review link: %s", body)
+	}
+}
+
+func TestCustomerDateOfBirthValidation(t *testing.T) {
+	db := customerDatabase(t)
+	store := links.New(db, nil)
+	entry, err := store.Create(t.Context(), "staff", later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := newMux(t, db, store)
+	path := "/customer/" + entry.Token
+
+	baseForm := func(dob string) url.Values {
+		f := contactForm("DOB Test Student")
+		if dob == "" {
+			f.Del("date_of_birth")
+		} else {
+			f.Set("date_of_birth", dob)
+		}
+		return f
+	}
+
+	// 1. Submit without DOB -> 422 with Spanish error
+	w := customerRequest(t, mux, http.MethodPost, path, baseForm("").Encode(), false)
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "Escribe una fecha de nacimiento válida.") {
+		t.Fatalf("submit without DOB: status %d, body %s", w.Code, w.Body.String())
+	}
+
+	// 2. Future date rejected (2099-01-01) -> 422 with Spanish error
+	w = customerRequest(t, mux, http.MethodPost, path, baseForm("2099-01-01").Encode(), false)
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "Escribe una fecha de nacimiento válida.") {
+		t.Fatalf("submit future DOB: status %d, body %s", w.Code, w.Body.String())
+	}
+
+	// 3. >100 years old rejected (1900-01-01) -> 422 with Spanish error
+	w = customerRequest(t, mux, http.MethodPost, path, baseForm("1900-01-01").Encode(), false)
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "Escribe una fecha de nacimiento válida.") {
+		t.Fatalf("submit old DOB: status %d, body %s", w.Code, w.Body.String())
+	}
+
+	// 4. Valid date accepted (2005-06-15) -> 303 to agreement
+	w = customerRequest(t, mux, http.MethodPost, path, baseForm("2005-06-15").Encode(), false)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != path+"/agreement" {
+		t.Fatalf("submit valid DOB: status %d, location %q; want redirect to /agreement", w.Code, w.Header().Get("Location"))
+	}
+
+	// Verify persisted to links and students
+	link, err := store.Lookup(t.Context(), entry.Token)
+	if err != nil || link == nil || link.DateOfBirth != "2005-06-15" {
+		t.Fatalf("persisted link DateOfBirth: %+v, %v", link, err)
+	}
+	var student students.Student
+	if err := db.WithContext(t.Context()).Where("source_link_hash = ?", link.TokenHash).Take(&student).Error; err != nil || student.DateOfBirth != "2005-06-15" {
+		t.Fatalf("persisted student DateOfBirth: %+v, %v", student, err)
+	}
 }

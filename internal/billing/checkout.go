@@ -377,7 +377,7 @@ func (s *Service) setAttempt(ctx context.Context, id uint64, from, to string, ex
 	return s.db.WithContext(ctx).Model(&CheckoutAttempt{}).Where("id = ? AND state = ?", id, from).Updates(updates).Error
 }
 
-// persistCtx outlives the request so a provider outcome is still recorded.
+// persistCtx outlives the request so work that follows a committed outcome (recording a provider result, syncing a provider update) still runs.
 func persistCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 }

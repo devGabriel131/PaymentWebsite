@@ -104,5 +104,9 @@ func (s *Service) Webhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
 	w.WriteHeader(http.StatusOK)
 }

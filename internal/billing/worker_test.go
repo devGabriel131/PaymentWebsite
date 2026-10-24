@@ -24,15 +24,15 @@ import (
 type workerMockServer struct {
 	server *httptest.Server
 
-	mu                     sync.Mutex
-	paidAtUnix             int64
-	initialAmount          int64
-	invoicesCreated        int64
-	invoiceItemsCreated    int64
-	invoicesUpdated        int64
-	disputesReturned       []map[string]any
-	earlyWarningsReturned  []map[string]any
-	invoicesByID           map[string]map[string]any
+	mu                    sync.Mutex
+	paidAtUnix            int64
+	initialAmount         int64
+	invoicesCreated       int64
+	invoiceItemsCreated   int64
+	invoicesUpdated       int64
+	disputesReturned      []map[string]any
+	earlyWarningsReturned []map[string]any
+	invoicesByID          map[string]map[string]any
 }
 
 func (wms *workerMockServer) getInitialAmount() int64 {

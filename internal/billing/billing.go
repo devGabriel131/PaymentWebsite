@@ -90,6 +90,8 @@ type Service struct {
 	catalog Catalog
 	changed func()
 	log     *slog.Logger
+	// wake nudges Run to drain now; buffered 1 so concurrent webhooks coalesce.
+	wake chan struct{}
 }
 
 // New creates a verified billing service.
@@ -116,6 +118,7 @@ func New(db *gorm.DB, client *stripe.Client, cfg Config, catalog Catalog, change
 		catalog: catalog,
 		changed: changed,
 		log:     log,
+		wake:    make(chan struct{}, 1),
 	}, nil
 }
 

@@ -1,0 +1,1062 @@
+/* Customer pages: a mobile-first, one-column journey (welcome, student, agreement, plan, payment).
+   Lit-bulb yellow marks whatever is current or chosen; everything else stays quiet teal and white.
+   This sheet is standalone: customer pages never load the management stylesheet. */
+
+.customer {
+  --ink: #1c3a40;
+  --muted: #4a666c;
+  --teal: #6a939b;
+  --teal-strong: #2c5961;
+  --teal-tint: #e0ebec;
+  --mist: #eef4f4;
+  --line: #d2e0e1;
+  --field-line: #6f8d93;
+  --bulb: #e4e78f;
+  --bulb-tint: #f6f8d3;
+  --bulb-edge: #d3d771;
+  --danger: #b42318;
+  --danger-tint: #fdecea;
+  --success: #1d6b45;
+  --success-tint: #e3f3ea;
+  --warn: #6e5100;
+  --warn-tint: #fbf0cf;
+  --radius-card: 1.25rem;
+  --radius-field: 0.75rem;
+  --gutter: max(1.25rem, env(safe-area-inset-left), env(safe-area-inset-right));
+  --column: 32rem;
+  --font-body: "Figtree", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-display: "Marcellus", Georgia, "Times New Roman", serif;
+
+  box-sizing: border-box;
+  min-height: 100svh;
+  margin: 0;
+  background: var(--mist);
+  color: var(--ink);
+  color-scheme: light;
+  font-family: var(--font-body);
+  font-size: 1rem;
+  line-height: 1.55;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+
+.customer-agreement {
+  --column: 38rem;
+}
+
+.customer-payments {
+  --column: 62rem;
+}
+
+.customer *,
+.customer *::before,
+.customer *::after {
+  box-sizing: border-box;
+}
+
+.customer :focus-visible {
+  outline: 3px solid var(--teal-strong);
+  outline-offset: 3px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.customer .icon {
+  flex: none;
+}
+
+/* Page frame */
+.customer-top,
+.customer main {
+  width: min(100%, var(--column));
+  margin-inline: auto;
+  padding-inline: var(--gutter);
+}
+
+.customer-top {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding-top: max(1rem, env(safe-area-inset-top));
+  padding-bottom: 0.5rem;
+}
+
+.customer main {
+  padding-top: 0.75rem;
+  padding-bottom: max(2rem, env(safe-area-inset-bottom));
+}
+
+.customer-mark {
+  display: block;
+  flex: none;
+  width: 2.75rem;
+  height: auto;
+}
+
+/* Progress: the three real steps of enrollment; the current one is lit. */
+.customer-steps {
+  display: grid;
+  flex: 1;
+  max-width: 28rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.375rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 500;
+  line-height: 1.2;
+}
+
+.customer-steps li {
+  display: grid;
+  gap: 0.375rem;
+}
+
+.customer-steps li::before {
+  content: "";
+  height: 0.5rem;
+  border-radius: 999px;
+  background: var(--line);
+}
+
+.customer-steps .is-done::before {
+  background: var(--teal-strong);
+}
+
+.customer-steps [aria-current="step"] {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.customer-steps [aria-current="step"]::before {
+  background: var(--bulb);
+  box-shadow: inset 0 0 0 1.5px var(--ink);
+}
+
+/* Type */
+.customer h1,
+.customer h2,
+.customer h3,
+.customer p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.customer h1 {
+  font-family: var(--font-display);
+  font-size: clamp(1.75rem, 7.5vw, 2.25rem);
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  text-wrap: balance;
+}
+
+.customer h2 {
+  font-family: var(--font-display);
+  font-size: 1.375rem;
+  font-weight: 400;
+  line-height: 1.2;
+}
+
+.customer p {
+  text-wrap: pretty;
+}
+
+.customer-lead {
+  font-size: 1.0625rem;
+}
+
+.customer-heading {
+  display: grid;
+  gap: 0.625rem;
+  margin: 0.25rem 0 1.25rem;
+}
+
+.customer-heading > p {
+  color: var(--muted);
+}
+
+.customer-hint {
+  color: var(--muted);
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+
+.customer-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+
+.customer-note .icon {
+  width: 1.125rem;
+  height: 1.125rem;
+  margin-top: 0.0625rem;
+  color: var(--success);
+}
+
+.customer-back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-height: 2.75rem;
+  margin-left: -0.375rem;
+  padding-right: 0.75rem;
+  color: var(--teal-strong);
+  font-weight: 600;
+  text-decoration: none;
+  touch-action: manipulation;
+}
+
+.customer-back-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+/* Surfaces */
+.customer-card {
+  display: grid;
+  gap: 1.25rem;
+  padding: 1.25rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: #ffffff;
+}
+
+.customer-card > h2 {
+  margin-bottom: -0.25rem;
+}
+
+/* Notices: info by default, danger for alerts, success when marked. */
+.customer-callout {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.875rem 1rem;
+  border-radius: var(--radius-field);
+  background: var(--teal-tint);
+  color: var(--ink);
+  font-size: 0.9375rem;
+  line-height: 1.45;
+}
+
+.customer-callout:has(> .icon) {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.customer-callout .icon {
+  width: 1.25rem;
+  height: 1.25rem;
+  margin-top: 0.0625rem;
+  color: var(--teal-strong);
+}
+
+.customer-callout[role="alert"] {
+  background: var(--danger-tint);
+  color: #7a1a12;
+  font-weight: 600;
+}
+
+.customer-callout[role="alert"] .icon {
+  color: var(--danger);
+}
+
+.customer-callout.is-success {
+  background: var(--success-tint);
+  color: #12442c;
+}
+
+.customer-callout.is-success .icon {
+  color: var(--success);
+}
+
+/* Buttons */
+.customer-primary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  width: 100%;
+  min-height: 3.5rem;
+  padding: 0.75rem 1.5rem;
+  border: 0;
+  border-radius: 999px;
+  background: var(--ink);
+  color: var(--bulb);
+  font: inherit;
+  font-size: 1.0625rem;
+  font-weight: 700;
+  text-align: center;
+  text-decoration: none;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.customer-primary:hover {
+  background: #264e56;
+}
+
+.customer-primary:active {
+  background: #12292e;
+}
+
+.customer-primary:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+
+.customer-primary:focus-visible {
+  outline-offset: 4px;
+}
+
+/* Welcome: the logo leads, then the road ahead and one clear action. */
+.customer-welcome main,
+.customer-not-found main {
+  display: grid;
+  align-content: center;
+  min-height: 100svh;
+}
+
+.welcome {
+  display: grid;
+  justify-items: center;
+  gap: 1rem;
+  padding-block: 1.5rem;
+  text-align: center;
+}
+
+.welcome-logo {
+  display: block;
+  width: clamp(7.5rem, 30vw, 10rem);
+  height: auto;
+}
+
+.welcome h1 {
+  margin-top: 0.25rem;
+}
+
+.welcome-roadmap {
+  width: 100%;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: #ffffff;
+  list-style: none;
+  text-align: left;
+}
+
+.welcome-roadmap li {
+  display: grid;
+  grid-template-columns: 2.75rem minmax(0, 1fr);
+  align-items: center;
+  gap: 1rem;
+  padding: 0.875rem 1.125rem;
+}
+
+.welcome-roadmap li + li {
+  border-top: 1px solid var(--line);
+}
+
+.welcome-roadmap-icon {
+  display: grid;
+  place-items: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: 50%;
+  background: var(--mist);
+  color: var(--teal-strong);
+}
+
+.welcome-roadmap div {
+  display: grid;
+  line-height: 1.35;
+}
+
+.welcome-roadmap span:not(.welcome-roadmap-icon) {
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.welcome .customer-primary {
+  margin-top: 0.5rem;
+}
+
+.welcome .customer-note {
+  max-width: 24rem;
+  text-align: left;
+}
+
+.welcome .customer-callout {
+  width: 100%;
+  text-align: left;
+}
+
+.customer-not-found main {
+  justify-items: center;
+  gap: 1rem;
+  text-align: center;
+}
+
+/* Student form */
+.customer form {
+  display: grid;
+  gap: 1rem;
+  margin: 0;
+}
+
+.customer-field {
+  display: grid;
+  gap: 0.375rem;
+  min-width: 0;
+}
+
+.customer-field label {
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.customer input:not([type="checkbox"], [type="radio"], [type="hidden"]),
+.customer select {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: 3.25rem;
+  padding: 0.75rem 0.875rem;
+  border: 1.5px solid var(--field-line);
+  border-radius: var(--radius-field);
+  background: #ffffff;
+  color: var(--ink);
+  font: inherit;
+  font-size: 1rem;
+  line-height: 1.3;
+  text-align: left;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.customer select {
+  padding-right: 2.75rem;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%231c3a40' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-position: right 0.875rem center;
+  background-repeat: no-repeat;
+  background-size: 1.25rem;
+}
+
+.customer input::-webkit-date-and-time-value {
+  text-align: left;
+}
+
+.customer input:focus-visible,
+.customer select:focus-visible {
+  border-color: var(--ink);
+  outline-offset: 2px;
+}
+
+.customer input[aria-invalid="true"],
+.customer select[aria-invalid="true"] {
+  border-color: var(--danger);
+  background-color: var(--danger-tint);
+}
+
+.customer-status {
+  font-size: 0.875rem;
+  line-height: 1.4;
+}
+
+.customer-status:not(:has(*)),
+.customer #form-error:not(:has(*)) {
+  display: none;
+}
+
+/* The status region says "Guardado." after each autosave; the tick keeps it from reading as an error. */
+.customer-status p:not([role="alert"]) {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  color: var(--success);
+  font-weight: 600;
+}
+
+.customer-status p:not([role="alert"])::before {
+  content: "✓";
+  font-weight: 700;
+}
+
+.customer [role="alert"]:not(.customer-callout) {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* Checkbox and radio: large, brand-inked targets. */
+.customer-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.875rem;
+  min-height: 2.75rem;
+  line-height: 1.45;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.customer-choice > span {
+  min-width: 0;
+}
+
+.customer input[type="checkbox"],
+.customer input[type="radio"] {
+  display: block;
+  flex: none;
+  width: 1.5rem;
+  height: 1.5rem;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 2px solid var(--ink);
+  background: #ffffff;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.customer input[type="checkbox"] {
+  margin-top: 0.0625rem;
+  border-radius: 0.4rem;
+}
+
+.customer input[type="checkbox"]:checked {
+  background: var(--ink) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23e4e78f' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5 12.5l4.5 4.5L19 7.5'/%3E%3C/svg%3E") center / 80% no-repeat;
+}
+
+.customer input[type="radio"] {
+  border-radius: 50%;
+}
+
+.customer input[type="radio"]:checked {
+  background: var(--ink);
+  box-shadow: inset 0 0 0 4px var(--bulb-tint);
+}
+
+.customer input[type="checkbox"][aria-invalid="true"],
+.customer input[type="radio"][aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+/* Agreement */
+.payment-agreement,
+.payment-selection {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.payment-agreement .customer-heading,
+.payment-selection .customer-heading {
+  margin-bottom: 0;
+}
+
+.agreement-start {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1rem 1.125rem;
+  border: 1.5px solid var(--bulb-edge);
+  border-radius: var(--radius-card);
+  background: var(--bulb-tint);
+}
+
+.agreement-start-icon {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--bulb);
+}
+
+.agreement-start p {
+  display: grid;
+  line-height: 1.3;
+}
+
+.agreement-start p span {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.agreement-start p strong {
+  font-size: 1.25rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.agreement-terms {
+  gap: 0.5rem;
+}
+
+.agreement-terms > h2 {
+  margin-bottom: 0;
+}
+
+.agreement-clauses {
+  margin: 0.75rem 0 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: clause;
+}
+
+.agreement-clauses li {
+  display: grid;
+  grid-template-columns: 2rem minmax(0, 1fr);
+  gap: 0.875rem;
+  padding-block: 1rem;
+  border-top: 1px solid var(--line);
+  counter-increment: clause;
+}
+
+.agreement-clauses li::before {
+  content: counter(clause);
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 50%;
+  background: var(--mist);
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+
+/* The financial-responsibility clause is the one people most need to see; the owner already sets it in capitals. */
+.agreement-clauses .is-key {
+  margin-inline: -1.25rem;
+  padding-inline: 1.25rem;
+  background: var(--bulb-tint);
+  border-top-color: var(--bulb-edge);
+  border-bottom: 1px solid var(--bulb-edge);
+}
+
+.agreement-clauses .is-key::before {
+  background: var(--ink);
+  color: var(--bulb);
+}
+
+.agreement-closing {
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.agreement-clauses .is-key + li {
+  border-top: 0;
+}
+
+.agreement-acceptance {
+  gap: 1rem;
+}
+
+/* Payment plans */
+.payment-plan-form {
+  gap: 1rem;
+}
+
+.payment-plan-form fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.payment-plan-form fieldset > .customer-callout {
+  margin-bottom: 1rem;
+}
+
+.payment-options {
+  display: grid;
+  gap: 0.875rem;
+  align-items: start;
+}
+
+.payment-option {
+  position: relative;
+  min-width: 0;
+  padding: 1rem 1.125rem 1.125rem;
+  border: 2px solid var(--line);
+  border-radius: var(--radius-card);
+  background: #ffffff;
+}
+
+.payment-option:has(input:checked) {
+  border-color: var(--ink);
+  background: var(--bulb-tint);
+}
+
+.payment-option:has(input:focus-visible) {
+  outline: 3px solid var(--teal-strong);
+  outline-offset: 3px;
+}
+
+.customer .payment-option-heading {
+  font-family: var(--font-body);
+  font-size: 1.0625rem;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.payment-option-heading label {
+  min-height: 0;
+  align-items: center;
+}
+
+/* The whole card is the tap target. */
+.payment-option-heading label::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: var(--radius-card);
+}
+
+.payment-plan-summary {
+  display: grid;
+  gap: 0.125rem;
+  margin-top: 0.75rem;
+  padding-left: 2.375rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.payment-plan-summary p:not(.payment-plan-due) {
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.payment-plan-summary p strong {
+  color: var(--ink);
+}
+
+.payment-plan-due {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.payment-plan-due span {
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.payment-plan-due strong {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.payment-schedule-wrap {
+  margin-top: 0.875rem;
+  padding: 0.5rem 0 0;
+  border-top: 1px solid var(--bulb-edge);
+}
+
+@supports selector(:has(*)) {
+  .payment-option:not(:has(input:checked)) .payment-schedule-wrap {
+    display: none;
+  }
+}
+
+.payment-schedule-heading {
+  font-family: var(--font-body);
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.customer h2.payment-schedule-heading {
+  color: var(--ink);
+  font-family: var(--font-display);
+  font-size: 1.375rem;
+  font-weight: 400;
+}
+
+.payment-schedule {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.payment-schedule li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 0.75rem;
+  padding-block: 0.5rem;
+}
+
+.payment-schedule li > span:not(.payment-installment-when) {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.payment-installment-amount {
+  white-space: nowrap;
+}
+
+.payment-today {
+  display: inline-block;
+  flex: none;
+  padding: 0.0625rem 0.5rem;
+  border-radius: 999px;
+  background: var(--ink);
+  color: var(--bulb);
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.payment-notes {
+  display: grid;
+  gap: 0.75rem;
+}
+
+/* Sticky so the next step stays in reach while people compare plans. */
+.payment-checkout {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: grid;
+  gap: 0.5rem;
+  margin-inline: calc(-1 * var(--gutter));
+  margin-bottom: calc(-1 * max(2rem, env(safe-area-inset-bottom)));
+  padding: 0.75rem var(--gutter) max(0.75rem, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+  background: #ffffff;
+}
+
+.payment-checkout .customer-hint {
+  font-size: 0.8125rem;
+  text-align: center;
+}
+
+.payment-selection > .payment-saved,
+.payment-saved:not([data-status]) {
+  padding: 0.875rem 1rem;
+  border-left: 4px solid var(--teal);
+  border-radius: var(--radius-field);
+  background: var(--teal-tint);
+  font-size: 0.9375rem;
+  line-height: 1.45;
+}
+
+/* Funded: a progress readout and the dated schedule. */
+.payment-confirmed {
+  justify-items: start;
+}
+
+.payment-confirmed-icon {
+  display: grid;
+  place-items: center;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 50%;
+  background: var(--success-tint);
+  color: var(--success);
+}
+
+.payment-progress {
+  gap: 0.5rem;
+}
+
+.payment-progress-plan {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.payment-progress-paid {
+  color: var(--muted);
+}
+
+.payment-progress-paid strong {
+  color: var(--ink);
+  font-size: 2.25rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.payment-progress progress {
+  display: block;
+  width: 100%;
+  height: 0.75rem;
+  border: 0;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.payment-progress progress::-webkit-progress-bar {
+  background: var(--line);
+}
+
+.payment-progress progress::-webkit-progress-value {
+  border-radius: 999px;
+  background: var(--teal-strong);
+}
+
+.payment-progress progress::-moz-progress-bar {
+  border-radius: 999px;
+  background: var(--teal-strong);
+}
+
+.payment-progress-left {
+  font-variant-numeric: tabular-nums;
+}
+
+.payment-schedule[role="list"] li + li {
+  border-top: 1px solid var(--line);
+}
+
+.payment-installment-when {
+  display: grid;
+  gap: 0.125rem;
+}
+
+.payment-installment-state {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.payment-schedule [data-status="paid"] .payment-installment-state {
+  color: var(--success);
+  font-weight: 600;
+}
+
+.payment-schedule :is([data-status="overdue"], [data-status="action_required"]) .payment-installment-state {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* Payment return: one status, centered. */
+.payment-return {
+  text-align: center;
+}
+
+.customer-payment-return .customer-top {
+  justify-content: center;
+}
+
+.customer-payment-return .customer-mark {
+  width: 4rem;
+}
+
+.payment-return [data-status] {
+  display: grid;
+  justify-items: center;
+  gap: 1rem;
+  margin: 0;
+  padding: 2rem 1.25rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: #ffffff;
+}
+
+.payment-return-icon,
+.payment-spinner {
+  display: grid;
+  place-items: center;
+  width: 3.5rem;
+  height: 3.5rem;
+  border-radius: 50%;
+}
+
+.payment-return-icon {
+  background: var(--teal-tint);
+  color: var(--teal-strong);
+}
+
+.payment-return-icon .icon {
+  width: 1.75rem;
+  height: 1.75rem;
+}
+
+.payment-return [data-status="paid"] .payment-return-icon {
+  background: var(--success-tint);
+  color: var(--success);
+}
+
+.payment-return [data-status="canceled"] .payment-return-icon {
+  background: var(--warn-tint);
+  color: var(--warn);
+}
+
+.payment-spinner {
+  border: 4px solid var(--teal-tint);
+  border-top-color: var(--teal-strong);
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* A still ring with one inked quarter reads as "waiting" without motion. */
+@media (prefers-reduced-motion: reduce) {
+  .payment-spinner {
+    animation: none;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .payment-option {
+    transition: border-color 0.15s, background-color 0.15s;
+  }
+}
+
+/* Wider screens: plans sit side by side and the checkout bar stops being a sheet. */
+@media (min-width: 56rem) {
+  .payment-options {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .payment-checkout {
+    position: static;
+    max-width: 26rem;
+    margin: 0 auto;
+    padding: 0;
+    border-top: 0;
+    background: none;
+  }
+}
+
+@media (min-width: 40rem) {
+  .customer-top {
+    padding-top: 1.5rem;
+  }
+
+  .customer main {
+    padding-top: 1.5rem;
+  }
+}

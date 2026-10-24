@@ -309,7 +309,7 @@ func requireRows(t *testing.T, html string, want []links.Entry) {
 		row := rows[i]
 		ok := strings.Contains(row, string(entry.Status)) && strings.Contains(row, entry.Name)
 		if entry.Phone != "" {
-			ok = ok && strings.Contains(row, `<p class="management-link-phone">`+escapedHTML(entry.Phone)+`</p>`)
+			ok = ok && strings.Contains(row, `<span class="management-link-phone">`+escapedHTML(entry.Phone)+`</span>`)
 		}
 		ok = ok && !strings.Contains(row, "tel:")
 		cancelable := strings.Contains(row, `action="/management/links/`+entry.ID+`/cancel"`)
@@ -319,8 +319,13 @@ func requireRows(t *testing.T, html string, want []links.Entry) {
 		ok = ok && strings.Contains(row, "</time> by "+entry.CreatedBy) == (entry.CreatedBy != "")
 		ok = ok && strings.Contains(row, "canceled by "+entry.CanceledBy) == (entry.CanceledBy != "")
 		if entry.SubmittedAt != nil {
-			ok = ok && strings.Contains(row, `datetime="`+entry.SubmittedAt.UTC().Format(time.RFC3339)+`"`) &&
-				strings.Contains(row, `datetime="`+entry.ExpiresAt.UTC().Format(time.RFC3339)+`"`)
+			ok = ok && strings.Contains(row, `datetime="`+entry.SubmittedAt.UTC().Format(time.RFC3339)+`"`)
+		}
+		if entry.PaidAt != nil {
+			ok = ok && strings.Contains(row, `datetime="`+entry.PaidAt.UTC().Format(time.RFC3339)+`"`)
+		}
+		if entry.Status != links.Finished && entry.Status != links.Canceled {
+			ok = ok && strings.Contains(row, `datetime="`+entry.ExpiresAt.UTC().Format(time.RFC3339)+`"`)
 		}
 		if entry.Token == "" {
 			ok = ok && strings.Contains(row, `<span id="link-url-`+entry.ID+`" hidden hx-preserve></span>`) &&
@@ -1296,4 +1301,66 @@ func TestManagementBillingRoutes(t *testing.T) {
 	requireText("active row", rowOf(active.ID), false, "status-suspended")
 	requireText("suspended row", rowOf(suspended.ID), true, `<span class="status-badge status-suspended">Suspended</span>`)
 	requireText("suspended row", rowOf(suspended.ID), false, "status-active")
+}
+
+func TestManagementRendersPaidTimeForFundedLink(t *testing.T) {
+	a := newApp(t)
+	staff := a.signIn(t, "staff")
+	now := time.Now().UTC()
+	tokenHash := make([]byte, 32)
+	rand.Read(tokenHash)
+
+	link := links.Link{
+		TokenHash: tokenHash,
+		Details: students.Details{
+			Name:         "Pagado Student",
+			Email:        "pagado@example.com",
+			Phone:        "+17875551234",
+			Municipality: "San Juan",
+		},
+		CreatedAt:        now,
+		SubmittedAt:      &now,
+		ProgramStartDate: "2026-11-01",
+		PaymentPlan:      "three",
+		ExpiresAt:        now.Add(7 * 24 * time.Hour),
+	}
+	if err := a.db.Create(&link).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	student := students.Student{
+		SourceLinkHash: tokenHash,
+		Details:        link.Details,
+		CreatedAt:      now,
+		IsActive:       true,
+	}
+	if err := a.db.Create(&student).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	fundedAt := time.Date(2026, 10, 23, 14, 30, 0, 0, time.UTC)
+	contract := billing.Contract{
+		StudentID:        student.ID,
+		Reference:        "ref-paid-123",
+		PlanID:           "three",
+		PlanName:         "Plan de 3 Pagos Mensuales",
+		InstallmentCount: 3,
+		Currency:         "usd",
+		TotalCents:       62500,
+		FundedAt:         &fundedAt,
+	}
+	if err := a.db.Create(&contract).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	res, html := a.send(t, staff, http.MethodGet, "/management/", nil, nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /management/: %d: %s", res.StatusCode, html)
+	}
+	if !strings.Contains(html, "· paid <time datetime=\"2026-10-23T14:30:00Z\">") {
+		t.Fatalf("expected paid timestamp in HTML, got:\n%s", html)
+	}
+	if strings.Contains(html, "enrollment access expires") {
+		t.Fatalf("Finished link should not render enrollment access expires, got:\n%s", html)
+	}
 }

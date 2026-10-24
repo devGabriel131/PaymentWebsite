@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"paymentwebsite/internal/students"
 )
@@ -12,7 +13,7 @@ import (
 func TestFieldsExposeOrderedRequiredDetails(t *testing.T) {
 	t.Parallel()
 	student := students.Student{Details: students.Details{
-		Name: "María Rivera", Email: "Maria@example.com", Phone: "+17872345678", Municipality: "Añasco",
+		Name: "María Rivera", Email: "Maria@example.com", Phone: "+17872345678", Municipality: "Añasco", DateOfBirth: "2005-06-15",
 	}}
 	want := []struct {
 		key, label, inputType, value string
@@ -21,6 +22,7 @@ func TestFieldsExposeOrderedRequiredDetails(t *testing.T) {
 		{"email", "Email", "email", student.Email},
 		{"phone", "Phone", "tel", student.Phone},
 		{"municipality", "Municipality", "", student.Municipality},
+		{"date_of_birth", "Date of birth", "date", student.DateOfBirth},
 	}
 	fields := students.Fields()
 	if len(fields) != len(want) {
@@ -70,6 +72,37 @@ func TestFieldParsersRespectNormalizationAndDraftBoundaries(t *testing.T) {
 		invalid  bool
 	}
 	local64 := strings.Repeat("a", 64)
+	puertoRico := time.FixedZone("America/Puerto_Rico", -4*60*60)
+	now := time.Now().In(puertoRico)
+	relative := func(years, days int) string { return now.AddDate(years, 0, days).Format("2006-01-02") }
+	dobCases := []parserCase{
+		{"valid date", "2005-06-15", true, "2005-06-15", false},
+		{"trimmed valid draft", " \t2005-06-15\u2003\n", false, "2005-06-15", false},
+		{"empty draft", "", false, "", false},
+		{"blank draft", " \t\u2003\n", false, "", false},
+		{"empty final", "", true, "", true},
+		{"blank final", " \t\u2003\n", true, "", true},
+		{"not a date", "not-a-date", true, "", true},
+		{"slashes", "2005/06/15", true, "", true},
+		{"US order", "06-15-2005", false, "", true},
+		{"unpadded", "2005-6-15", true, "", true},
+		{"impossible day", "2005-02-30", true, "", true},
+		{"time suffix", "2005-06-15T00:00:00Z", true, "", true},
+		{"NUL", "2005-06-15\x00", true, "", true},
+		{"future year", "2099-01-01", true, "", true},
+		{"future draft", "2099-01-01", false, "", true},
+		{"over 100", "1900-01-01", true, "", true},
+		{"yesterday", relative(0, -1), true, relative(0, -1), false},
+		{"today", relative(0, 0), true, "", true},
+		{"tomorrow", relative(0, 1), true, "", true},
+	}
+	// AddDate rolls Feb 29 back a century to Mar 1, which shifts the age boundary.
+	if now.Month() != time.February || now.Day() != 29 {
+		dobCases = append(dobCases,
+			parserCase{"turned 101 today", relative(-101, 0), true, "", true},
+			parserCase{"turns 101 tomorrow", relative(-101, 1), true, relative(-101, 1), false},
+		)
+	}
 	domain189 := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63) + "." + strings.Repeat("c", 61)
 	for _, parser := range []struct {
 		name  string
@@ -215,6 +248,7 @@ func TestFieldParsersRespectNormalizationAndDraftBoundaries(t *testing.T) {
 			{"NUL", "San Juan\x00", true, "", true},
 			{"invalid UTF8", "San Juan\xff", true, "", true},
 		}},
+		{"date of birth", students.ParseDateOfBirth, dobCases},
 	} {
 		t.Run(parser.name, func(t *testing.T) {
 			for _, tc := range parser.cases {
@@ -248,6 +282,7 @@ func TestParserErrorsNeverEchoSubmittedValues(t *testing.T) {
 		{"email", "PRIVATE_EMAIL_AT_PRIVATE_DOMAIN"},
 		{"phone", "PRIVATE_PHONE_VALUE"},
 		{"municipality", "PRIVATE_MUNICIPALITY_VALUE"},
+		{"date_of_birth", "PRIVATE_DOB_VALUE"},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
 			field, ok := students.FindField(tc.key)

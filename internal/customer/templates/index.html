@@ -2,22 +2,32 @@
 <html lang="es-PR">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{if eq .View "welcome"}}Bienvenidos{{else if eq .View "agreement"}}Acuerdo de Pago y Términos y Condiciones{{else if eq .View "payments"}}Selección del plan de pago{{else if eq .View "payment-return"}}Estado del pago{{else}}Información del estudiante{{end}} | Masterminds</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#eef4f4">
+  <title>{{if eq .View "welcome"}}Bienvenidos{{else if eq .View "agreement"}}Acuerdo de Pago y Términos y Condiciones{{else if eq .View "payments"}}Selección del plan de pago{{else if eq .View "payment-return"}}Estado del pago{{else if .Editing}}Edita la información del estudiante{{else}}Agrega la información del estudiante{{end}} | Masterminds</title>
   <link rel="icon" type="image/vnd.microsoft.icon" href="/favicon.ico" sizes="16x16 32x32 48x48">
   {{if eq .View "form"}}
   <meta name="htmx-config" content='{"reportValidityOfForms":true,"includeIndicatorStyles":false,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"422","swap":true,"error":false},{"code":"[45]..","swap":true,"error":true}]}'>
+  {{end}}
+  {{if or (eq .View "form") (eq .View "payment-return")}}
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js"
     integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg"
     crossorigin="anonymous" defer></script>
+  {{end}}
+  {{if eq .View "form"}}
   <script src="/static/customer.js" defer></script>
   {{end}}
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400..700&amp;display=swap">
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&amp;family=Marcellus&amp;display=swap">
+  <link rel="stylesheet" href="/static/customer.css">
 </head>
 <body class="customer customer-{{.View}}">
+  {{if ne .View "welcome"}}
+  <header class="customer-top">
+    <img class="customer-mark" src="/static/logo-mark.webp" alt="Masterminds Programa ASVAB" width="320" height="314">
+    {{template "customer-steps" .}}
+  </header>
+  {{end}}
   <main>
-    <img class="customer-logo" src="/static/logo.png" alt="Masterminds Programa ASVAB" width="784" height="769">
     {{template "customer-content" .}}
   </main>
 </body>
@@ -25,6 +35,18 @@
 
 {{define "customer-response"}}
 {{template "customer-content" .}}
+{{end}}
+
+{{/* The three-step journey. Only the steps a person actually walks (contact, agreement, plan and payment) appear. */}}
+{{define "customer-steps"}}
+{{$step := 0}}{{if eq .View "form"}}{{$step = 1}}{{else if eq .View "agreement"}}{{$step = 2}}{{else if eq .View "payments"}}{{$step = 3}}{{end}}
+{{if $step}}
+<ol class="customer-steps" aria-label="Progreso de la matrícula">
+  <li{{if lt 1 $step}} class="is-done"{{else if eq $step 1}} aria-current="step"{{end}}>{{if lt 1 $step}}<span class="visually-hidden">Completado: </span>{{end}}Estudiante</li>
+  <li{{if lt 2 $step}} class="is-done"{{else if eq $step 2}} aria-current="step"{{end}}>{{if lt 2 $step}}<span class="visually-hidden">Completado: </span>{{end}}Acuerdo</li>
+  <li{{if .Funded}} class="is-done"{{else if eq $step 3}} aria-current="step"{{end}}>{{if .Funded}}<span class="visually-hidden">Completado: </span>{{end}}Pago</li>
+</ol>
+{{end}}
 {{end}}
 
 {{define "customer-content"}}
@@ -36,84 +58,123 @@
 {{else if eq .View "payment-return"}}
 {{template "payment-return" .}}
 {{else if eq .View "welcome"}}
-<h1>¡Bienvenidos a Masterminds!</h1>
-<p class="customer-lead">Ya estás un paso más cerca de asegurar tu matrícula en nuestro programa.</p>
-<p class="customer-description">Te vamos a pedir la información del estudiante, la aceptación de nuestros acuerdos y el pago.</p>
-{{if .Error}}
-<p role="alert">{{.Error}}</p>
-<a class="customer-primary" href="{{.Path}}">Volver a intentar</a>
+<div class="welcome">
+  <img class="welcome-logo" src="/static/logo-mark.webp" alt="Masterminds Programa ASVAB" width="320" height="314">
+  <h1>¡Bienvenidos a Masterminds!</h1>
+  <p class="customer-lead">Ya estás un paso más cerca de asegurar tu matrícula en nuestro programa.</p>
+  <ol class="welcome-roadmap" aria-label="Lo que sigue">
+    <li>
+      <span class="welcome-roadmap-icon">{{template "icon-user"}}</span>
+      <div><strong>Información del estudiante</strong><span>Los datos de quien se va a matricular.</span></div>
+    </li>
+    <li>
+      <span class="welcome-roadmap-icon">{{template "icon-file"}}</span>
+      <div><strong>Acuerdo de pago</strong><span>Lee y acepta los términos del programa.</span></div>
+    </li>
+    <li>
+      <span class="welcome-roadmap-icon">{{template "icon-card"}}</span>
+      <div><strong>Plan y pago seguro</strong><span>Elige cómo pagar y completa el pago en Stripe.</span></div>
+    </li>
+  </ol>
+  {{if .Error}}
+  <p class="customer-callout" role="alert">{{template "icon-alert"}}<span>{{.Error}}</span></p>
+  <a class="customer-primary" href="{{.Path}}">Volver a intentar</a>
+  {{else}}
+  <a class="customer-primary" href="{{.Path}}/forms">Comenzar</a>
+  <p class="customer-note">{{template "icon-check"}}<span>Tu información se guarda automáticamente. Si sales, continúa con este mismo enlace.</span></p>
+  {{end}}
+</div>
 {{else}}
-<a class="customer-primary" href="{{.Path}}/forms">Próximo</a>
-{{end}}
-{{else}}
-<h1>Información del estudiante</h1>
+{{if .Editing}}<a class="customer-back-link" href="{{.Path}}/agreement">{{template "icon-arrow-left"}}Volver al acuerdo</a>{{end}}
+<header class="customer-heading">
+  <h1>{{if .Editing}}Edita la información del estudiante{{else}}Agrega la información del estudiante{{end}}</h1>
+  <p>{{if .Editing}}Corrige los datos de la persona que se va a matricular y guarda los cambios.{{else}}Escribe los datos de la persona que se va a matricular en el programa. Todos los campos son obligatorios.{{end}}</p>
+  {{if not .Editing}}<p class="customer-note">{{template "icon-check"}}<span>Se guarda automáticamente al completar cada campo.</span></p>{{end}}
+</header>
 {{/* hx-disinherit keeps the form's swap and disabling off the autosaving controls. */}}
-<form action="{{.Path}}" method="post" hx-post="{{.Path}}" hx-target="#customer-content"
-  hx-swap="outerHTML" hx-disabled-elt="button" hx-disinherit="*">
-  <div class="customer-field">
-    <label for="name">Nombre completo</label>
-    <input id="name" name="name" type="text" autocomplete="name" required value="{{.Name}}"
-      aria-describedby="name-hint save-status-name"{{if index .FieldErrors "name"}} aria-invalid="true"{{end}}
-      hx-post="{{.Path}}/draft/name" hx-params="name" hx-trigger="change" hx-sync="this:queue last"
-      hx-target="#save-status-name" hx-swap="innerHTML">
-    <p class="customer-hint" id="name-hint">Escribe tu nombre y apellidos. Solo letras y espacios.</p>
-    <div class="customer-status" id="save-status-name" role="status" aria-atomic="true">
-      {{with index .FieldErrors "name"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
+<form action="{{.Path}}{{if .Editing}}/edit{{end}}" method="post"{{if not .Editing}} hx-post="{{.Path}}" hx-target="#customer-content"
+  hx-swap="outerHTML" hx-disabled-elt="button" hx-disinherit="*"{{end}}>
+  <section class="customer-card" aria-labelledby="group-student">
+    <h2 id="group-student">Datos del estudiante</h2>
+    <div class="customer-field">
+      <label for="name">Nombre completo del estudiante</label>
+      <p class="customer-hint" id="name-hint">Nombre y apellidos. Solo letras y espacios.</p>
+      <input id="name" name="name" type="text" autocomplete="name" autocapitalize="words" enterkeyhint="next" required value="{{.Name}}"
+        aria-describedby="name-hint save-status-name"{{if index .FieldErrors "name"}} aria-invalid="true"{{end}}
+        {{if not .Editing}}hx-post="{{.Path}}/draft/name" hx-params="name" hx-trigger="change" hx-sync="this:queue last"
+        hx-target="#save-status-name" hx-swap="innerHTML"{{end}}>
+      <div class="customer-status" id="save-status-name" role="status" aria-atomic="true">
+        {{with index .FieldErrors "name"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
+      </div>
     </div>
-  </div>
-  <div class="customer-field">
-    <label for="email">Correo electrónico</label>
-    <input id="email" name="email" type="email" autocomplete="email" maxlength="254"
-      spellcheck="false" autocapitalize="none" required value="{{.Email}}"
-      aria-describedby="email-hint save-status-email"{{if index .FieldErrors "email"}} aria-invalid="true"{{end}}
-      hx-post="{{.Path}}/draft/email" hx-params="email" hx-trigger="change" hx-sync="this:queue last"
-      hx-target="#save-status-email" hx-swap="innerHTML">
-    <p class="customer-hint" id="email-hint">Usa el formato nombre@ejemplo.com.</p>
-    <div class="customer-status" id="save-status-email" role="status" aria-atomic="true">
-      {{with index .FieldErrors "email"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
+    <div class="customer-field">
+      <label for="date_of_birth">Fecha de nacimiento del estudiante</label>
+      <p class="customer-hint" id="date_of_birth-hint">Día, mes y año de nacimiento.</p>
+      <input id="date_of_birth" name="date_of_birth" type="date" autocomplete="bday" required value="{{.DateOfBirth}}"
+        aria-describedby="date_of_birth-hint save-status-date_of_birth"{{if index .FieldErrors "date_of_birth"}} aria-invalid="true"{{end}}
+        {{if not .Editing}}hx-post="{{.Path}}/draft/date_of_birth" hx-params="date_of_birth" hx-trigger="change" hx-sync="this:queue last"
+        hx-target="#save-status-date_of_birth" hx-swap="innerHTML"{{end}}>
+      <div class="customer-status" id="save-status-date_of_birth" role="status" aria-atomic="true">
+        {{with index .FieldErrors "date_of_birth"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
+      </div>
     </div>
-  </div>
-  <div class="customer-field">
-    <label for="email_confirm">Confirmar correo electrónico</label>
-    <input id="email_confirm" name="email_confirm" type="email" autocomplete="off" maxlength="254"
-      spellcheck="false" autocapitalize="none" required value="{{.EmailConfirm}}"
-      aria-describedby="email-confirm-hint save-status-email_confirm"{{if index .FieldErrors "email_confirm"}} aria-invalid="true"{{end}}>
-    <p class="customer-hint" id="email-confirm-hint">Vuelve a escribir tu correo electrónico.</p>
-    <div class="customer-status" id="save-status-email_confirm" role="status" aria-atomic="true">
-      {{with index .FieldErrors "email_confirm"}}<p role="alert" data-confirm-error="{{if $.EmailMismatch}}mismatch{{else}}syntax{{end}}">{{.}}</p>{{end}}
+  </section>
+  <section class="customer-card" aria-labelledby="group-contact">
+    <h2 id="group-contact">Contacto del estudiante</h2>
+    <div class="customer-field">
+      <label for="email">Correo electrónico del estudiante</label>
+      <p class="customer-hint" id="email-hint">Usa el formato nombre@ejemplo.com.</p>
+      <input id="email" name="email" type="email" autocomplete="email" maxlength="254"
+        spellcheck="false" autocapitalize="none" enterkeyhint="next" required value="{{.Email}}"
+        aria-describedby="email-hint save-status-email"{{if index .FieldErrors "email"}} aria-invalid="true"{{end}}
+        {{if not .Editing}}hx-post="{{.Path}}/draft/email" hx-params="email" hx-trigger="change" hx-sync="this:queue last"
+        hx-target="#save-status-email" hx-swap="innerHTML"{{end}}>
+      <div class="customer-status" id="save-status-email" role="status" aria-atomic="true">
+        {{with index .FieldErrors "email"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
+      </div>
     </div>
-  </div>
-  <div class="customer-field">
-    <label for="phone">Número de teléfono</label>
-    <input id="phone" name="phone" type="tel" inputmode="tel" autocomplete="tel" required value="{{.Phone}}"
-      aria-describedby="phone-hint save-status-phone"{{if index .FieldErrors "phone"}} aria-invalid="true"{{end}}
-      hx-post="{{.Path}}/draft/phone" hx-params="phone" hx-trigger="change" hx-sync="this:queue last"
-      hx-target="#save-status-phone" hx-swap="innerHTML">
-    <p class="customer-hint" id="phone-hint">Puerto Rico o Estados Unidos. Incluye el código de área.</p>
-    <div class="customer-status" id="save-status-phone" role="status" aria-atomic="true">
-      {{with index .FieldErrors "phone"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
+    <div class="customer-field">
+      <label for="email_confirm">Confirmar correo electrónico</label>
+      <p class="customer-hint" id="email-confirm-hint">Vuelve a escribir el correo electrónico para verificarlo.</p>
+      <input id="email_confirm" name="email_confirm" type="email" autocomplete="off" maxlength="254"
+        spellcheck="false" autocapitalize="none" enterkeyhint="next" required value="{{.EmailConfirm}}"
+        aria-describedby="email-confirm-hint save-status-email_confirm"{{if index .FieldErrors "email_confirm"}} aria-invalid="true"{{end}}>
+      <div class="customer-status" id="save-status-email_confirm" role="status" aria-atomic="true">
+        {{with index .FieldErrors "email_confirm"}}<p role="alert" data-confirm-error="{{if $.EmailMismatch}}mismatch{{else}}syntax{{end}}">{{.}}</p>{{end}}
+      </div>
     </div>
-  </div>
-  <div class="customer-field">
-    <label for="municipality">Municipio</label>
-    {{$municipality := trim .Municipality}}{{$knownMunicipality := false}}
-    {{range municipalities}}{{if eq . $municipality}}{{$knownMunicipality = true}}{{end}}{{end}}
-    <select id="municipality" name="municipality" required
-      aria-describedby="municipality-hint save-status-municipality"{{if index .FieldErrors "municipality"}} aria-invalid="true"{{end}}
-      hx-post="{{.Path}}/draft/municipality" hx-params="municipality" hx-trigger="change" hx-sync="this:queue last"
-      hx-target="#save-status-municipality" hx-swap="innerHTML">
-      <option value=""{{if not $knownMunicipality}} selected{{end}}>Selecciona tu municipio</option>
-      {{range municipalities}}<option value="{{.}}"{{if eq . $municipality}} selected{{end}}>{{.}}</option>{{end}}
-    </select>
-    <p class="customer-hint" id="municipality-hint">También puedes seleccionar “Fuera de Puerto Rico”.</p>
-    <div class="customer-status" id="save-status-municipality" role="status" aria-atomic="true">
-      {{with index .FieldErrors "municipality"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
+    <div class="customer-field">
+      <label for="phone">Número de teléfono del estudiante</label>
+      <p class="customer-hint" id="phone-hint">Puerto Rico o Estados Unidos. Incluye el código de área.</p>
+      <input id="phone" name="phone" type="tel" inputmode="tel" autocomplete="tel" enterkeyhint="next" required value="{{.Phone}}"
+        aria-describedby="phone-hint save-status-phone"{{if index .FieldErrors "phone"}} aria-invalid="true"{{end}}
+        {{if not .Editing}}hx-post="{{.Path}}/draft/phone" hx-params="phone" hx-trigger="change" hx-sync="this:queue last"
+        hx-target="#save-status-phone" hx-swap="innerHTML"{{end}}>
+      <div class="customer-status" id="save-status-phone" role="status" aria-atomic="true">
+        {{with index .FieldErrors "phone"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
+      </div>
     </div>
-  </div>
+    <div class="customer-field">
+      <label for="municipality">Municipio de residencia del estudiante</label>
+      <p class="customer-hint" id="municipality-hint">También puedes seleccionar “Fuera de Puerto Rico”.</p>
+      {{$municipality := trim .Municipality}}{{$knownMunicipality := false}}
+      {{range municipalities}}{{if eq . $municipality}}{{$knownMunicipality = true}}{{end}}{{end}}
+      <select id="municipality" name="municipality" required
+        aria-describedby="municipality-hint save-status-municipality"{{if index .FieldErrors "municipality"}} aria-invalid="true"{{end}}
+        {{if not .Editing}}hx-post="{{.Path}}/draft/municipality" hx-params="municipality" hx-trigger="change" hx-sync="this:queue last"
+        hx-target="#save-status-municipality" hx-swap="innerHTML"{{end}}>
+        <option value=""{{if not $knownMunicipality}} selected{{end}}>Selecciona el municipio</option>
+        {{range municipalities}}<option value="{{.}}"{{if eq . $municipality}} selected{{end}}>{{.}}</option>{{end}}
+      </select>
+      <div class="customer-status" id="save-status-municipality" role="status" aria-atomic="true">
+        {{with index .FieldErrors "municipality"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
+      </div>
+    </div>
+  </section>
   <div id="form-error" aria-live="assertive" aria-atomic="true">
-    {{with .Error}}<p role="alert">{{.}}</p>{{end}}
+    {{with .Error}}<p class="customer-callout" role="alert">{{template "icon-alert"}}<span>{{.}}</span></p>{{end}}
   </div>
-  <button class="customer-primary" type="submit">Enviar información</button>
+  <button class="customer-primary" type="submit">{{if .Editing}}Guardar información{{else}}Continuar al acuerdo{{end}}</button>
 </form>
 {{end}}
 </section>

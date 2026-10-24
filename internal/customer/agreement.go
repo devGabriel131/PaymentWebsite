@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"time"
 
+	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/payments"
@@ -73,7 +74,7 @@ func parseCustomerForm(w http.ResponseWriter, r *http.Request) int {
 	return http.StatusOK
 }
 
-func registerAgreementRoutes(mux *http.ServeMux, store *links.Store, configuration *settings.Store, page *template.Template) {
+func registerAgreementRoutes(mux *http.ServeMux, store *links.Store, configuration *settings.Store, biller *billing.Service, page *template.Template) {
 	handle := func(w http.ResponseWriter, r *http.Request) {
 		customerHeaders(w)
 		token := r.PathValue("token")
@@ -100,6 +101,14 @@ func registerAgreementRoutes(mux *http.ServeMux, store *links.Store, configurati
 			redirectCustomer(w, r, data.Path+"/payments", false)
 			return
 		}
+		funded, err := biller.IsFunded(ctx, link.TokenHash)
+		if err != nil {
+			logging.RecordError(r, "load", err)
+			data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
+			show(http.StatusInternalServerError)
+			return
+		}
+		data.Funded = funded
 
 		status := http.StatusOK
 		data.TermsAcceptedAt, data.ProgramStartDate = link.TermsAcceptedAt, link.ProgramStartDate

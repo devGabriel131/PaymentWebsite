@@ -1183,21 +1183,21 @@ func TestDraftFieldIsolationAndConcurrentClearing(t *testing.T) {
 	}{
 		{
 			name: "concurrent name and email", writes: []write{{"name", "Updated"}, {"email", "updated@example.com"}},
-			want:   students.Details{Name: "Updated", Email: "updated@example.com", Phone: initial.Phone, Municipality: initial.Municipality},
+			want:   students.Details{Name: "Updated", Email: "updated@example.com", Phone: initial.Phone, Municipality: initial.Municipality, DateOfBirth: initial.DateOfBirth},
 			status: InProgress,
 		},
 		{
 			name: "clear name while changing phone", writes: []write{{"name", ""}, {"phone", "+12025550123"}},
-			want:   students.Details{Email: "updated@example.com", Phone: "+12025550123", Municipality: initial.Municipality},
+			want:   students.Details{Email: "updated@example.com", Phone: "+12025550123", Municipality: initial.Municipality, DateOfBirth: initial.DateOfBirth},
 			status: InProgress,
 		},
 		{
 			name: "clear email while changing municipality", writes: []write{{"email", ""}, {"municipality", "Fuera de Puerto Rico"}},
-			want:   students.Details{Phone: "+12025550123", Municipality: "Fuera de Puerto Rico"},
+			want:   students.Details{Phone: "+12025550123", Municipality: "Fuera de Puerto Rico", DateOfBirth: initial.DateOfBirth},
 			status: InProgress,
 		},
 		{
-			name: "clear last two fields", writes: []write{{"phone", ""}, {"municipality", ""}},
+			name: "clear last fields", writes: []write{{"phone", ""}, {"municipality", ""}, {"date_of_birth", ""}},
 			want: students.Details{}, status: Opened,
 		},
 	} {
@@ -1827,6 +1827,89 @@ func studentsFor(t *testing.T, db *gorm.DB, ctx context.Context, token string) [
 
 func contactDetails(name string) students.Details {
 	return students.Details{
-		Name: name, Email: "student@example.com", Phone: "+17872345678", Municipality: "San Juan",
+		Name: name, Email: "student@example.com", Phone: "+17872345678", Municipality: "San Juan", DateOfBirth: "2005-06-15",
+	}
+}
+
+func TestUpdateContact(t *testing.T) {
+	db, store, ctx := testStore(t)
+	entry, err := store.Create(ctx, staff, later)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Unsubmitted link cannot be updated
+	res, err := store.UpdateContact(ctx, entry.Token, contactDetails("Unsubmitted"))
+	if err != nil || res != Unavailable {
+		t.Fatalf("unsubmitted update = %v, %v; want Unavailable, nil", res, err)
+	}
+
+	// 2. Submit link
+	initial := contactDetails("Initial Name")
+	res, err = store.Submit(ctx, entry.Token, initial)
+	if err != nil || res != Saved {
+		t.Fatalf("submit = %v, %v; want Saved, nil", res, err)
+	}
+
+	// Accept terms to verify terms acceptance is preserved
+	if err := settings.New(db).SetProgramStartDate(ctx, "2026-11-01", staff); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := store.AcceptTerms(ctx, entry.Token, "2026-11-01")
+	if err != nil || accepted.TermsAcceptedAt == nil {
+		t.Fatalf("accept terms: %v, %v", accepted, err)
+	}
+	acceptedTermsAt := *accepted.TermsAcceptedAt
+	submittedAt := *accepted.SubmittedAt
+	expiresAt := accepted.ExpiresAt
+
+	// 3. Update contact on submitted link
+	updated := students.Details{
+		Name:         "Updated Name",
+		Email:        "updated@example.com",
+		Phone:        "+17875559999",
+		Municipality: "Ponce",
+		DateOfBirth:  "2004-05-14",
+	}
+	res, err = store.UpdateContact(ctx, entry.Token, updated)
+	if err != nil || res != Saved {
+		t.Fatalf("update contact = %v, %v; want Saved, nil", res, err)
+	}
+
+	// Verify link row
+	current, err := store.Lookup(ctx, entry.Token)
+	if err != nil || current == nil {
+		t.Fatalf("lookup: %v, %v", current, err)
+	}
+	if current.Name != updated.Name || current.Email != updated.Email ||
+		current.Phone != updated.Phone || current.Municipality != updated.Municipality ||
+		current.DateOfBirth != updated.DateOfBirth {
+		t.Fatalf("link details = %+v, want %+v", current.Details, updated)
+	}
+	if !current.SubmittedAt.Equal(submittedAt) {
+		t.Fatalf("submitted_at changed: %v, want %v", current.SubmittedAt, submittedAt)
+	}
+	if !current.TermsAcceptedAt.Equal(acceptedTermsAt) {
+		t.Fatalf("terms_accepted_at changed: %v, want %v", current.TermsAcceptedAt, acceptedTermsAt)
+	}
+	if !current.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("expires_at changed: %v, want %v", current.ExpiresAt, expiresAt)
+	}
+
+	// Verify students row
+	enrolled := studentsFor(t, db, ctx, entry.Token)
+	if len(enrolled) != 1 {
+		t.Fatalf("enrolled students count = %d, want 1", len(enrolled))
+	}
+	if enrolled[0].Name != updated.Name || enrolled[0].Email != updated.Email ||
+		enrolled[0].Phone != updated.Phone || enrolled[0].Municipality != updated.Municipality ||
+		enrolled[0].DateOfBirth != updated.DateOfBirth {
+		t.Fatalf("student row = %+v, want %+v", enrolled[0].Details, updated)
+	}
+
+	// 4. Unknown or expired token returns Unavailable
+	res, err = store.UpdateContact(ctx, strings.Repeat("a", 43), updated)
+	if err != nil || res != Unavailable {
+		t.Fatalf("unknown token = %v, %v; want Unavailable, nil", res, err)
 	}
 }
