@@ -1071,6 +1071,9 @@ func (s *Service) createInvoice(ctx context.Context, l lease, c Contract, o *Obl
 		AutoAdvance:                 stripe.Bool(false),
 		PendingInvoiceItemsBehavior: stripe.String("exclude"),
 		Metadata:                    map[string]string{"tuition_contract": c.Reference, "tuition_obligation": o.Reference},
+		// Card covers Apple Pay and Google Pay; Klarna is for the single payment only, so the
+		// account's invoice defaults never add it here.
+		PaymentSettings: &stripe.InvoiceCreatePaymentSettingsParams{PaymentMethodTypes: stripe.StringSlice([]string{"card"})},
 	}
 	if o.Kind == "reinstatement" {
 		// The student pays a fee on Stripe's hosted page by the next day; it is never charged to a saved card.

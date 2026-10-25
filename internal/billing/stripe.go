@@ -22,6 +22,11 @@ const (
 	reinstatementKey      = "asvab_reinstatement_usd"
 )
 
+// stripeLocale is the language of every Stripe-rendered page, email and PDF. Stripe has no
+// Puerto Rico locale: "es" prints Spain-style amounts ("600,00 US$"), "es-419" prints "USD 600.00".
+// Only "en" prints a bare "$600.00", in English.
+const stripeLocale = "es-419"
+
 // Config carries server-mode Stripe configuration.
 type Config struct {
 	BaseURL                      string

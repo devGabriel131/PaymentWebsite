@@ -19,7 +19,7 @@ import (
 
 func TestListRetainsExpiredSourcesAndOrdersNewestFirst(t *testing.T) {
 	db, roster, sources, ctx := studentStores(t)
-	if listed, err := roster.List(ctx); err != nil || len(listed) != 0 {
+	if listed, err := roster.List(ctx, nil); err != nil || len(listed) != 0 {
 		t.Fatalf("empty roster = %+v, %v", listed, err)
 	}
 
@@ -64,7 +64,7 @@ func TestListRetainsExpiredSourcesAndOrdersNewestFirst(t *testing.T) {
 		t.Fatalf("inactive student changed retained source: before=%+v, after=%+v", sourceBefore, sourceAfter)
 	}
 
-	listed, err := roster.List(ctx)
+	listed, err := roster.List(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +79,20 @@ func TestListRetainsExpiredSourcesAndOrdersNewestFirst(t *testing.T) {
 		got, err := roster.Get(ctx, id)
 		if err != nil || got == nil || !reflect.DeepEqual(*got, listed[i]) {
 			t.Fatalf("Get(%d) = %+v, %v, want listed student %+v", id, got, err, listed[i])
+		}
+	}
+	for _, filter := range []struct {
+		active bool
+		want   []uint64
+	}{{true, wantIDs[:2]}, {false, wantIDs[2:]}} {
+		filtered, err := roster.List(ctx, &filter.active)
+		if err != nil || len(filtered) != len(filter.want) {
+			t.Fatalf("List(active=%t) = %+v, %v, want students %v", filter.active, filtered, err, filter.want)
+		}
+		for i, id := range filter.want {
+			if filtered[i].ID != id {
+				t.Fatalf("List(active=%t)[%d] = student %d, want %d", filter.active, i, filtered[i].ID, id)
+			}
 		}
 	}
 	entries, err := sources.List(ctx)
@@ -228,7 +242,7 @@ func TestUpdateFieldRejectsUnknownFieldsAndInvalidDetailsWithoutWrites(t *testin
 	if !reflect.DeepEqual(sourceBefore, sourceAfter) {
 		t.Fatalf("rejected edits changed source: before %+v, after %+v", sourceBefore, sourceAfter)
 	}
-	if listed, err := roster.List(ctx); err != nil || len(listed) != 2 {
+	if listed, err := roster.List(ctx, nil); err != nil || len(listed) != 2 {
 		t.Fatalf("rejected edits changed roster: %+v, %v", listed, err)
 	}
 	if writes != 0 {

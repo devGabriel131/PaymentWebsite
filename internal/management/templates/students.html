@@ -8,7 +8,7 @@
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js"
     integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg"
     crossorigin="anonymous" defer></script>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400..700&amp;display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&amp;family=Geist+Mono:wght@400..600&amp;family=Marcellus&amp;display=swap">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/management-time.js" defer></script>
   <script src="/static/management-live.js" defer></script>
@@ -37,7 +37,13 @@
         <h2 id="student-table-heading">Student records</h2>
         <p>Open a student to view or edit their information.</p>
       </div>
-      <div class="student-records" hx-get="/management/students" hx-trigger="management-changed from:body">{{template "student-records" .}}</div>
+      <nav class="student-filter" aria-label="Filter students by status">
+        <a href="/management/students"{{if not .Status}} aria-current="true"{{end}}>All</a>
+        <a href="/management/students?status=active"{{if eq .Status "active"}} aria-current="true"{{end}}>Active</a>
+        <a href="/management/students?status=suspended"{{if eq .Status "suspended"}} aria-current="true"{{end}}>Suspended</a>
+      </nav>
+      {{/* Live refreshes re-fetch with the shown filter so rows enter and leave it as statuses change. */}}
+      <div class="student-records" hx-get="/management/students{{with .Status}}?status={{.}}{{end}}" hx-trigger="management-changed from:body">{{template "student-records" .}}</div>
     </section>
     <dialog id="student-dialog" class="management-panel" aria-labelledby="student-heading">
       <div id="student-dialog-content"></div>
@@ -56,6 +62,11 @@
     </thead>
     <tbody>{{range .Students}}{{template "student-row" .}}{{end}}</tbody>
   </table>
+</div>
+{{else if .Status}}
+<div class="student-empty">
+  <h3>No {{.Status}} students</h3>
+  <p>No students match this filter. <a href="/management/students">Show all students</a></p>
 </div>
 {{else}}
 <div class="student-empty">

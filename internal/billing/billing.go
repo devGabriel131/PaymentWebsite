@@ -327,7 +327,7 @@ func (s *Service) PortalURL(ctx context.Context, studentID uint64) (string, erro
 	session, err := s.client.V1BillingPortalSessions.Create(ctx, &stripe.BillingPortalSessionCreateParams{
 		Customer:      stripe.String(*c.StripeCustomerID),
 		Configuration: stripe.String(s.cfg.PortalConfigurationID),
-		Locale:        stripe.String("es"),
+		Locale:        stripe.String(stripeLocale),
 		ReturnURL:     stripe.String(strings.TrimSuffix(s.cfg.BaseURL, "/") + "/management/students/" + strconv.FormatUint(studentID, 10)),
 	})
 	if err != nil {

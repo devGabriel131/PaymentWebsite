@@ -618,7 +618,7 @@ func TestRegistryArchivesCompletedSubmissions(t *testing.T) {
 	a.requireRegistry(t, all...)
 	res, body = a.send(t, staff, http.MethodGet, "/management/trash", nil, nil)
 	requirePage(t, res, body, nil)
-	retained, err := students.New(a.db, nil).List(t.Context())
+	retained, err := students.New(a.db, nil).List(t.Context(), nil)
 	if err != nil || len(retained) != 3 {
 		t.Fatalf("stale cancel lost retained students: students=%+v, err=%v", retained, err)
 	}

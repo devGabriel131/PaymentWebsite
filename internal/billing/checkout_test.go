@@ -36,13 +36,13 @@ type mockStripeServer struct {
 	createSessionLoseResponse bool // Stripe creates the Session, but the response never arrives
 	receivedCurrency          string
 	receivedCustomer          string
-	receivedLinkDisplay       string
-	receivedExcluded          []string
+	receivedPMC               string
+	receivedAllowed           []string
 	customersCreated          map[string]string         // contractRef -> customerID
 	sessionsCreated           map[string]string         // attemptRef -> sessionID
 	sessions                  map[string]map[string]any // sessionID -> stored Session
 	customerUpdateError       bool
-	customerUpdates           []customerUpdate          // guarded by mu
+	customerUpdates           []customerUpdate // guarded by mu
 }
 
 func newMockStripeServer() *mockStripeServer {
@@ -89,20 +89,20 @@ func newMockStripeServer() *mockStripeServer {
 	mux.HandleFunc("POST /v1/checkout/sessions", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&m.sessionReqs, 1)
 		m.mu.Lock()
+		_ = r.ParseForm()
+		m.receivedCurrency = r.FormValue("currency")
+		m.receivedCustomer = r.FormValue("customer")
+		m.receivedPMC = r.FormValue("payment_method_configuration")
+		m.receivedAllowed = m.receivedAllowed[:0]
+		for key, values := range r.Form {
+			if strings.HasPrefix(key, "allowed_payment_method_types[") {
+				m.receivedAllowed = append(m.receivedAllowed, values...)
+			}
+		}
 		if m.createSessionError {
 			m.mu.Unlock()
 			http.Error(w, `{"error":{"message":"internal error"}}`, http.StatusInternalServerError)
 			return
-		}
-		_ = r.ParseForm()
-		m.receivedCurrency = r.FormValue("currency")
-		m.receivedCustomer = r.FormValue("customer")
-		m.receivedLinkDisplay = r.FormValue("wallet_options[link][display]")
-		m.receivedExcluded = m.receivedExcluded[:0]
-		for key, values := range r.Form {
-			if strings.HasPrefix(key, "excluded_payment_method_types[") {
-				m.receivedExcluded = append(m.receivedExcluded, values...)
-			}
 		}
 
 		sessID := "cs_mock_" + rand.Text()[:8]
@@ -330,13 +330,8 @@ func TestCheckoutConcurrencyAndRecovery(t *testing.T) {
 		if mock.receivedCurrency != "usd" {
 			t.Errorf("expected Stripe currency 'usd', got %q", mock.receivedCurrency)
 		}
-		if mock.receivedLinkDisplay != "never" {
-			t.Errorf("expected wallet_options[link][display]='never', got %q", mock.receivedLinkDisplay)
-		}
-		for _, method := range []string{"klarna", "cashapp", "amazon_pay"} {
-			if !slices.Contains(mock.receivedExcluded, method) {
-				t.Errorf("installment Checkout must exclude %q, excluded %v", method, mock.receivedExcluded)
-			}
+		if mock.receivedPMC != "" || !slices.Equal(mock.receivedAllowed, []string{"card"}) {
+			t.Errorf("installment Checkout must allow only card and skip the payment method configuration, got pmc %q, allowed %v", mock.receivedPMC, mock.receivedAllowed)
 		}
 		mock.mu.Unlock()
 	})
@@ -394,6 +389,11 @@ func TestCheckoutConcurrencyAndRecovery(t *testing.T) {
 		if !res.Pending {
 			t.Fatal("expected Pending=true on provider failure")
 		}
+		mock.mu.Lock()
+		if mock.receivedPMC != "pmc_test" || len(mock.receivedAllowed) != 0 {
+			t.Errorf("single-payment Checkout must use the payment method configuration and no allow-list, got pmc %q, allowed %v", mock.receivedPMC, mock.receivedAllowed)
+		}
+		mock.mu.Unlock()
 
 		var failedAttempt billing.CheckoutAttempt
 		err = db.Where("plan_id = 'full'").First(&failedAttempt).Error

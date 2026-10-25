@@ -40,14 +40,34 @@ func New(db *gorm.DB, changed func()) *Store {
 	return &Store{db: db, changed: changed}
 }
 
-// List returns all retained students, newest first, regardless of source access.
+// List returns retained students, newest first, regardless of source access.
+// A non-nil active keeps only students whose is_active equals it.
 // ponytail: unbounded small mock history; paginate before sustained growth.
-func (s *Store) List(ctx context.Context) ([]Student, error) {
+func (s *Store) List(ctx context.Context, active *bool) ([]Student, error) {
+	query := s.db.WithContext(ctx).Order("created_at DESC, id DESC")
+	if active != nil {
+		query = query.Where("is_active = ?", *active)
+	}
 	var records []Student
-	if err := s.db.WithContext(ctx).Order("created_at DESC, id DESC").Find(&records).Error; err != nil {
+	if err := query.Find(&records).Error; err != nil {
 		return nil, err
 	}
 	return records, nil
+}
+
+// Counts is the roster's headcount.
+type Counts struct{ Active, Suspended, Recent int }
+
+// Total is every retained student, active or not.
+func (c Counts) Total() int { return c.Active + c.Suspended }
+
+// Count returns the active and suspended headcounts, and how many students enrolled at or after since.
+func (s *Store) Count(ctx context.Context, since time.Time) (Counts, error) {
+	var c Counts
+	err := s.db.WithContext(ctx).Model(&Student{}).Select(
+		"count(*) FILTER (WHERE is_active) AS active, count(*) FILTER (WHERE NOT is_active) AS suspended, count(*) FILTER (WHERE created_at >= ?) AS recent", since,
+	).Scan(&c).Error
+	return c, err
 }
 
 // Get returns nil for an absent student, including IDs outside PostgreSQL BIGINT.

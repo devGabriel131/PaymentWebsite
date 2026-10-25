@@ -116,15 +116,17 @@ Five contact fields come from one registry (`students.Field`, `internal/students
 
 | Route | Purpose |
 | --- | --- |
+| `GET /management/dashboard` | Business figures at a glance |
 | `GET /management/`, `GET /management/trash` | Customer links; Trash |
 | `POST /management/links`, `/management/links/{id}/cancel`, `/management/links/cancel` | Create; cancel one; cancel all unfinished |
 | `GET`/`POST /management/settings`, `POST /management/program-start-date` | Link lifetime; agreement start date |
-| `GET /management/students`, `/management/students/{id}`, `GET`/`POST …/{id}/fields/{field}` | List; detail dialog; per-field edit |
+| `GET /management/students` (`?status=active` or `suspended` filters by `is_active`; any other value lists everyone), `/management/students/{id}`, `GET`/`POST …/{id}/fields/{field}` | List; detail dialog; per-field edit |
 | `/management/students/{id}/billing` (GET), `…/billing/reconcile`, `…/reinstatement`, `…/portal` (POST), `…/invoices/{obligation}` (GET) | Billing fragment and staff billing actions |
 | `GET /management/events` | Server-sent change feed |
 
 - **Links:** create shows the URL once (only the digest is stored); a lost URL means a new link. Statuses: Not opened, Opened, In progress (any saved field), Finished. Only usable unfinished links cancel. Finished links leave the main list 24 h after submission and never enter Trash. Trash holds Canceled and Expired unfinished links, with drafts and audit kept; nothing is deleted.
 - **Settings:** link lifetime 2–14 days, default 7, applies to new links only. The program start date feeds new agreements; accepted agreements keep their snapshot.
+- **Dashboard:** read-only, refreshed live like the lists. Windows are fixed at 30 days (`dashboardWindow`): enrollment looks back, installments due looks ahead. Tuition figures count only funded contracts, because an abandoned Checkout leaves unpaid obligations nobody owes yet (`billing.Service.Overview`). Overdue, failed and in-review follow a student's billing rules, so totals add up to the student pages. Collected is cash received less refunds, before Stripe fees. Overdue-by-the-clock and the 30-day windows show only on the next load or refresh, like other time-based moves.
 - **Students:** one record per completed submission, not a deduplicated person; it outlives its link. An edit changes one column under a row lock; a normalized no-op skips the write and the live event; invalid input gives 422. The Link snapshot never changes. A saved edit marks the student's Stripe-bound contract due and wakes the billing worker, which pushes name and email to the Stripe customer. Unlike customer edits, staff edits are not locked by funding or in-flight payments.
 - **Privacy:** the link registry projection (`links.Entry`) exposes only name and phone, never email or municipality.
 - **Audit:** creator, canceler, and settings editor come from the verified session (`auth.Staff`), never from form input; stores refuse these writes without one.
@@ -139,7 +141,7 @@ The first payment is hosted Checkout. Each later installment is a one-off Stripe
 
 - One contract per student. A partial unique index allows one active Checkout attempt per contract. Repeat starts resume it; a timeout or 5xx leaves it `uncertain` for the worker, never a second Checkout.
 - Funding comes only from verified Stripe state read by the worker. `/payments/return` shows the stored attempt and never funds. The app never charges a card itself; Stripe retries failed invoices. An invoice with tax, a discount, a balance debit, another currency or an unexpected line is held (`auto_advance` off) for staff review.
-- Installment plans need a `card` first payment method; otherwise the contract is flagged `unsupported_payment_method` and no later invoice is armed. Checkout therefore hides the Link wallet and excludes the non-card methods listed in `installmentExcluded` (`internal/billing/checkout.go`) on installment plans; the single payment keeps whatever the payment-method configuration enables. Add any new non-card method you enable in the dashboard to that list.
+- Installment plans need a `card` first payment method; otherwise the contract is flagged `unsupported_payment_method` and no later invoice is armed. Checkout therefore sends installment plans `allowed_payment_method_types=[card]` and no payment-method configuration (Stripe rejects both together); Apple Pay, Google Pay and Link ride on card. The single payment uses the payment-method configuration. Every invoice the app creates is limited to `card`, so Klarna never appears on later installments or the reinstatement fee.
 - A tuition installment unpaid 14 days after its due date suspends the student (`is_active=false`); later invoices stay armed. Staff request the $25 reinstatement fee, a separate invoice paid on Stripe's hosted page. Reactivation is automatic once the fee and all due tuition are settled and no review is open. Suspension changes only `is_active`; staff end classroom access outside this app.
 - Overdue tuition never goes onto a new Checkout or fee invoice. The original invoices stay collectible; the payer settles them on Stripe's hosted invoice pages or a staff-issued portal link.
 - `POST /webhooks/stripe` sits outside staff auth and reads at most 1 MiB. `webhook.ConstructEvent` checks the signature, its tolerance and that the event's API version is on the SDK's release train (`2026-09-30.endive`). A bad signature, JSON, version or mode returns 400; an oversized body 413. An allowlisted event is stored by ID, without payload, before the 200; a DB error returns 500 so Stripe retries. Other types get 200 and no work.
@@ -150,8 +152,9 @@ Startup fails (`startup_failed`) without valid Stripe configuration or a loadabl
 - Environment: `STRIPE_API_KEY` (restricted; prefix must match mode), `STRIPE_MODE` (`sandbox` or `live`), `STRIPE_WEBHOOK_SECRET` (the registered endpoint's, not `stripe listen`'s), `PUBLIC_BASE_URL` (origin only; https except localhost in sandbox), `STRIPE_PAYMENT_METHOD_CONFIGURATION_ID`, `STRIPE_PORTAL_CONFIGURATION_ID`.
 - Prices: one-time, `per_unit`, USD, active, in the configured mode, found by lookup key and amounts from `internal/payments/plans.go`: `asvab_full_initial_usd`, `asvab_three_initial_usd`, `asvab_three_remaining_usd`, `asvab_six_initial_usd`, `asvab_six_remaining_usd`, `asvab_reinstatement_usd` (2500 cents). Any other state stops startup; there is no fallback price.
 - Webhook endpoint at `<PUBLIC_BASE_URL>/webhooks/stripe`, created with API version `2026-09-30.endive` and subscribed to the types in `webhookEvents` (`internal/billing/webhook.go`).
-- Payment-method configuration: cards and wallets only. Customer portal configuration: invoice history and card update only. Invoice default payment-method configuration: cards and wallets.
-- Adaptive Pricing off (also for Hosted Invoice Pages), Smart Retries on for one-off invoices, automatic tax off.
+- Payment-method configuration (used by the single payment only): Card, Apple Pay, Google Pay, Link and Klarna on, everything else off. Customer portal configuration: invoice history and card update only.
+- Adaptive Pricing off (also for Hosted Invoice Pages), automatic tax off. Smart Retries on for one-off invoices with a 2-week window, matching the 14-day suspension rule; the window is dashboard-only (Settings > Billing > Invoices > Advanced invoicing features), so the app cannot check it.
+- Stripe pages, emails and PDFs use locale `es-419` (`stripeLocale` in `internal/billing/stripe.go`): Spanish with US-style numbers, printed `USD 600.00`. `es` prints Spain-style `600,00 US$`; only `en` prints a bare `$600.00`, in English.
 
 ## Logging
 

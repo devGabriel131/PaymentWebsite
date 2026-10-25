@@ -8,7 +8,7 @@
   <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.11/dist/htmx.min.js"
     integrity="sha384-2OatzQy1H+Zd/IIrjr1TcuDGqLXeHhbooAyJY1KdQMKnr4LZ22k31GBLdYKHmVjg"
     crossorigin="anonymous" defer></script>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400..700&amp;display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&amp;family=Geist+Mono:wght@400..600&amp;family=Marcellus&amp;display=swap">
   <link rel="stylesheet" href="/static/styles.css">
   <script src="/static/management-time.js" defer></script>
   <script src="/static/management-live.js" defer></script>
@@ -164,6 +164,10 @@
 
 {{define "navigation"}}
 <nav class="management-menu" aria-label="Management">
+  <a class="management-nav-link" href="/management/dashboard"{{if eq . "dashboard"}} aria-current="page"{{end}}>
+    <svg aria-hidden="true" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16M7 20v-7M12 20V5M17 20v-10"/></svg>
+    Dashboard
+  </a>
   <a class="management-nav-link" href="/management/"{{if eq . "links"}} aria-current="page"{{end}}>
     {{template "link-icon"}}
     Customer links

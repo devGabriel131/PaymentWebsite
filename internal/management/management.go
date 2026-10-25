@@ -64,12 +64,14 @@ func htmx(r *http.Request) bool {
 // biller supplies each student's billing summary and the staff billing actions.
 func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Store, config *settings.Store, staff func(context.Context) string, biller *billing.Service) error {
 	page, err := template.New("management").Funcs(template.FuncMap{
-		"money": payments.Money,
+		"money":  payments.Money,
+		"plural": plural,
 	}).ParseFS(templates, "templates/*.html")
 	if err != nil {
 		return err
 	}
 	registerStudentRoutes(mux, roster, biller, staff, page)
+	registerDashboardRoutes(mux, store, roster, biller, staff, page)
 
 	// list renders a tab's registry as a full page, or as just its rows for an
 	// htmx refresh. created shows its one-time URL on its row after an

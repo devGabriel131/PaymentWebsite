@@ -37,6 +37,7 @@ type studentPageData struct {
 	Student  studentView
 	Field    *studentFieldView
 	Modal    bool
+	Status   string           // The roster's status filter: "", "active", or "suspended".
 	Billing  *billing.Summary // nil when the student has no billing contract.
 }
 
@@ -129,13 +130,22 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 	mux.Handle("GET /management/students", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		records, err := roster.List(ctx)
+		// Any other status shows everyone, so a stale link never hides the roster.
+		status := r.URL.Query().Get("status")
+		var active *bool
+		if status == "active" || status == "suspended" {
+			isActive := status == "active"
+			active = &isActive
+		} else {
+			status = ""
+		}
+		records, err := roster.List(ctx, active)
 		if err != nil {
 			logging.RecordError(r, "list", err)
 			http.Error(w, "Could not load students. Please try again.", http.StatusInternalServerError)
 			return
 		}
-		data := studentPageData{Staff: staff(r.Context()), Fields: students.Fields(), Students: make([]studentView, len(records))}
+		data := studentPageData{Staff: staff(r.Context()), Fields: students.Fields(), Status: status, Students: make([]studentView, len(records))}
 		for i, record := range records {
 			data.Students[i] = studentDisplay(record, false)
 		}

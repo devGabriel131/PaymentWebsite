@@ -29,12 +29,6 @@ const integrationIdentifier = "tuition_checkout"
 // activeAttemptStates are the nonterminal states guarded by idx_active_checkout_attempt.
 var activeAttemptStates = []string{"creating", "open", "processing", "expiring", "uncertain"}
 
-// installmentExcluded are the non-card methods Checkout hides on installment plans: later invoices
-// charge the saved card, and a first payment by anything else flags the contract for review. Stripe
-// cannot express "card only" next to a payment method configuration, so this is a deny list; extend
-// it when a new non-card method is enabled on the account.
-var installmentExcluded = []string{"affirm", "afterpay_clearpay", "alipay", "amazon_pay", "cashapp", "klarna", "pay_by_bank", "paypal", "revolut_pay", "us_bank_account", "wechat_pay", "zip"}
-
 // inFlightAttemptStates are the active states where money may be in transit, blocking contact edits.
 var inFlightAttemptStates = []string{"processing", "uncertain", "expiring"}
 
@@ -249,7 +243,7 @@ func (s *Service) beginCheckout(ctx context.Context, hash []byte, plan payments.
 			params := &stripe.CustomerCreateParams{
 				Name:             stripe.String(student.Name),
 				Email:            stripe.String(student.Email),
-				PreferredLocales: []*string{stripe.String("es")},
+				PreferredLocales: []*string{stripe.String(stripeLocale)},
 				Metadata:         map[string]string{"tuition_contract": contract.Reference},
 			}
 			params.SetIdempotencyKey(fmt.Sprintf("tuition:%s:customer", contract.Reference))
@@ -356,13 +350,12 @@ func (s *Service) sessionParams(contract Contract, first Obligation, attempt Che
 	}
 	base := strings.TrimSuffix(s.cfg.BaseURL, "/")
 	params := &stripe.CheckoutSessionCreateParams{
-		Mode:                       stripe.String(string(stripe.CheckoutSessionModePayment)),
-		Currency:                   stripe.String("usd"),
-		Customer:                   stripe.String(*contract.StripeCustomerID),
-		ClientReferenceID:          stripe.String(attempt.Reference),
-		IntegrationIdentifier:      stripe.String(integrationIdentifier),
-		Locale:                     stripe.String("es"),
-		PaymentMethodConfiguration: stripe.String(s.cfg.PaymentMethodConfigurationID),
+		Mode:                  stripe.String(string(stripe.CheckoutSessionModePayment)),
+		Currency:              stripe.String("usd"),
+		Customer:              stripe.String(*contract.StripeCustomerID),
+		ClientReferenceID:     stripe.String(attempt.Reference),
+		IntegrationIdentifier: stripe.String(integrationIdentifier),
+		Locale:                stripe.String(stripeLocale),
 		LineItems: []*stripe.CheckoutSessionCreateLineItemParams{{
 			Price:    stripe.String(attempt.StripePriceID),
 			Quantity: stripe.Int64(1),
@@ -376,7 +369,10 @@ func (s *Service) sessionParams(contract Contract, first Obligation, attempt Che
 		CancelURL:       stripe.String(base + "/payments/return?cancelled=1"),
 	}
 	if contract.InstallmentCount > 1 {
-		// Only installment plans have later invoices that need the saved card.
+		// Later invoices charge the saved card, so installment plans take cards only; Apple Pay,
+		// Google Pay and Link ride on card. Stripe rejects an allow-list next to a payment method
+		// configuration, so these Sessions skip it and the extra methods it enables (Klarna).
+		params.AllowedPaymentMethodTypes = stripe.StringSlice([]string{"card"})
 		params.PaymentIntentData = &stripe.CheckoutSessionCreatePaymentIntentDataParams{
 			SetupFutureUsage: stripe.String(string(stripe.PaymentIntentSetupFutureUsageOffSession)),
 			Metadata:         metadata,
@@ -386,12 +382,8 @@ func (s *Service) sessionParams(contract Contract, first Obligation, attempt Che
 				Message: stripe.String("Primer pago de matrícula. Los pagos restantes se procesarán automáticamente en las fechas acordadas."),
 			},
 		}
-		params.WalletOptions = &stripe.CheckoutSessionCreateWalletOptionsParams{
-			Link: &stripe.CheckoutSessionCreateWalletOptionsLinkParams{
-				Display: stripe.String(string(stripe.CheckoutSessionWalletOptionsLinkDisplayNever)),
-			},
-		}
-		params.ExcludedPaymentMethodTypes = stripe.StringSlice(installmentExcluded)
+	} else {
+		params.PaymentMethodConfiguration = stripe.String(s.cfg.PaymentMethodConfigurationID)
 	}
 	params.SetIdempotencyKey(fmt.Sprintf("tuition:%s:checkout", attempt.Reference))
 	return params

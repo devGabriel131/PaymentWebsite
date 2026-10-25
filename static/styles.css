@@ -1,6 +1,6 @@
 body {
   margin: 1rem;
-  font-family: "JetBrains Mono", monospace;
+  font-family: "Geist", ui-sans-serif, system-ui, sans-serif;
 }
 
 input,
@@ -19,17 +19,23 @@ a {
 }
 
 .management {
-  --canvas: #15232b;
-  --surface: #1c2d36;
-  --raised: #263e49;
-  --line: #3b535e;
-  --control: #6b8793;
-  --text: #edf3f5;
-  --muted: #afc0c7;
-  --accent: #9ccdd0;
-  --primary: #a9d7d7;
-  --on-primary: #16383e;
-  --danger: #f2b8b5;
+  --canvas: #0f171c;
+  --chrome: #131d23;
+  --surface: #17222a;
+  --raised: #1f2d36;
+  --line: #26353e;
+  --edge: #33454f;
+  --control: #5b727d;
+  --text: #e9eff1;
+  --muted: #93a7af;
+  --accent: #7ccdd2;
+  --primary: #dfe58f;
+  --on-primary: #1c2205;
+  --danger: #ff9b95;
+  --warn: #e6c872;
+  --ok: #86d4a4;
+  --font-mono: "Geist Mono", ui-monospace, monospace;
+  --font-brand: "Marcellus", serif;
   --gutter: clamp(1rem, 4vw, 2.5rem);
   --inset: clamp(1rem, 3vw, 1.5rem);
   margin: 0;
@@ -37,6 +43,7 @@ a {
   color: var(--text);
   font-size: 0.9375rem;
   line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
 }
 
 .management-workspace {
@@ -57,6 +64,24 @@ a {
 
 .management svg {
   flex: none;
+}
+
+.management ::selection {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+/* Quiet underlines until hover, so links stay identifiable without shouting. */
+.management a {
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+}
+
+.management a:hover {
+  text-decoration-color: currentColor;
+}
+
+.management code {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
 }
 
 .management-skip-link {
@@ -86,15 +111,17 @@ a {
   min-height: 5rem;
   padding: 0.75rem var(--gutter);
   border-bottom: 1px solid var(--line);
+  background: var(--chrome);
 }
 
 .management-brand {
   display: flex;
   align-items: center;
   gap: 0.75rem;
-  color: var(--accent);
+  color: var(--text);
+  font-family: var(--font-brand);
   font-size: 1.5rem;
-  letter-spacing: 0.01em;
+  letter-spacing: 0.02em;
   white-space: nowrap;
 }
 
@@ -125,6 +152,7 @@ a {
   gap: 0.25rem;
   padding: 1.5rem 0.75rem 1.5rem calc(var(--gutter) - 0.875rem);
   border-right: 1px solid var(--line);
+  background: var(--chrome);
 }
 
 .management-nav-link {
@@ -139,17 +167,18 @@ a {
   font-weight: 500;
   text-decoration: none;
   white-space: nowrap;
+  transition: background-color 0.15s, color 0.15s;
 }
 
 .management-nav-link:hover {
-  background: var(--surface);
+  background: color-mix(in srgb, var(--text) 6%, transparent);
   color: var(--text);
 }
 
 .management-nav-link[aria-current="page"] {
-  background: var(--raised);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
   color: var(--text);
-  box-shadow: inset 3px 0 0 var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 28%, transparent);
 }
 
 .management-nav-link[aria-current="page"] svg {
@@ -186,7 +215,7 @@ a {
   margin: 0;
   font-size: clamp(1.75rem, 1.1rem + 2vw, 2.375rem);
   font-weight: 600;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.03em;
   line-height: 1.15;
   text-wrap: balance;
 }
@@ -205,17 +234,19 @@ a {
   justify-content: center;
   gap: 0.5rem;
   padding: 0.5rem 1rem;
-  border: 1px solid var(--control);
+  border: 1px solid var(--edge);
   border-radius: 0.5rem;
-  background: transparent;
+  background: color-mix(in srgb, var(--text) 5%, transparent);
   color: var(--text);
   font-weight: 600;
   cursor: pointer;
   touch-action: manipulation;
+  transition: background-color 0.15s, border-color 0.15s;
 }
 
 .management button:enabled:hover {
-  background: var(--raised);
+  border-color: var(--control);
+  background: color-mix(in srgb, var(--text) 10%, transparent);
 }
 
 button.management-button-primary,
@@ -227,12 +258,13 @@ button.management-button-primary,
 
 button.management-button-primary:enabled:hover,
 .management-login button:enabled:hover {
-  border-color: var(--accent);
-  background: var(--accent);
+  border-color: color-mix(in srgb, var(--primary) 82%, white);
+  background: color-mix(in srgb, var(--primary) 82%, white);
 }
 
 button.management-button-danger {
   border-color: transparent;
+  background: transparent;
   color: var(--danger);
 }
 
@@ -249,8 +281,9 @@ button.management-button-danger:enabled:hover {
 
 .management-panel {
   border: 1px solid var(--line);
-  border-radius: 0.75rem;
+  border-radius: 1rem;
   background: var(--surface);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.03), 0 1px 2px rgb(0 0 0 / 0.3);
 }
 
 .management-panel-heading {
@@ -393,10 +426,13 @@ button.management-button-danger:enabled:hover {
 
 /* Status text always shows; color only reinforces it. */
 .management-link-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
   padding: 0 0.625rem;
-  border: 1px solid color-mix(in srgb, currentColor 45%, transparent);
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
   border-radius: 999px;
-  background: color-mix(in srgb, currentColor 12%, transparent);
+  background: color-mix(in srgb, currentColor 10%, transparent);
   color: var(--muted);
   font-size: 0.8125rem;
   font-weight: 600;
@@ -404,16 +440,24 @@ button.management-button-danger:enabled:hover {
   white-space: nowrap;
 }
 
+.management-link-status::before {
+  content: "";
+  width: 0.375rem;
+  height: 0.375rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+
 .management-link-status[data-status="Opened"] {
   color: var(--accent);
 }
 
 .management-link-status[data-status="In progress"] {
-  color: #d8dda3;
+  color: var(--warn);
 }
 
 .management-link-status[data-status="Finished"] {
-  color: #a8d8b0;
+  color: var(--ok);
 }
 
 .management-link-status[data-status="Expired"] {
@@ -448,6 +492,8 @@ button.management-button-danger:enabled:hover {
   background: var(--canvas);
   color: var(--accent);
   text-underline-offset: 0.2em;
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
 }
 
 .management-link-url:hover {
@@ -643,8 +689,9 @@ button.management-button-danger:enabled:hover {
   margin: clamp(2rem, 8vh, 5rem) auto 3rem;
   padding: clamp(1.5rem, 4vw, 2rem);
   border: 1px solid var(--line);
-  border-radius: 0.75rem;
+  border-radius: 1rem;
   background: var(--surface);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.03), 0 1.5rem 3rem rgb(0 0 0 / 0.35);
 }
 
 .management-login h1 {
@@ -704,6 +751,7 @@ button.management-button-danger:enabled:hover {
   color: var(--muted);
   font-size: 0.875rem;
   font-weight: 600;
+  background: color-mix(in srgb, var(--text) 3%, transparent);
 }
 
 .management .student-table tbody tr {
@@ -715,7 +763,7 @@ button.management-button-danger:enabled:hover {
 }
 
 .management .student-table tbody tr:is(:hover, :focus-within) {
-  background: var(--canvas);
+  background: color-mix(in srgb, var(--text) 4%, transparent);
 }
 
 .management .student-table [data-student-link] {
@@ -734,6 +782,38 @@ button.management-button-danger:enabled:hover {
   font-variant-numeric: tabular-nums;
 }
 
+/* Status filter: plain links, so a filtered roster is a bookmarkable URL.
+   Link text lines up with the panel heading at the inset. */
+.management .student-filter {
+  display: flex;
+  gap: 0.25rem;
+  padding-inline: calc(var(--inset) - 0.75rem);
+  border-bottom: 1px solid var(--line);
+}
+
+.management .student-filter a {
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  min-height: 44px;
+  margin-bottom: -1px;
+  padding-inline: 0.75rem;
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-weight: 500;
+  text-decoration: none;
+  transition: color 0.15s;
+}
+
+.management .student-filter a:hover {
+  color: var(--text);
+}
+
+.management .student-filter a[aria-current] {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+
 .management .student-empty {
   padding: 2.5rem var(--inset);
   color: var(--muted);
@@ -750,6 +830,11 @@ button.management-button-danger:enabled:hover {
   margin: 0.5rem 0 0;
 }
 
+.management .student-empty a {
+  color: var(--accent);
+  text-underline-offset: 0.2em;
+}
+
 .management #student-dialog {
   box-sizing: border-box;
   width: min(40rem, calc(100vw - 2rem));
@@ -759,10 +844,12 @@ button.management-button-danger:enabled:hover {
   padding: 0;
   overflow: auto;
   color: var(--text);
+  box-shadow: 0 2rem 4rem rgb(0 0 0 / 0.5);
 }
 
 .management #student-dialog::backdrop {
-  background: rgb(21 35 43 / 75%);
+  background: rgb(6 10 12 / 72%);
+  backdrop-filter: blur(3px);
 }
 
 .management .student-details {
@@ -809,7 +896,7 @@ button.management-button-danger:enabled:hover {
   min-width: 44px;
   min-height: 44px;
   padding: 0.5rem;
-  border: 1px solid var(--control);
+  border: 1px solid var(--edge);
   border-radius: 0.5rem;
   color: var(--accent);
 }
@@ -876,19 +963,18 @@ button.management-button-danger:enabled:hover {
 .management .status-badge {
   display: inline-block;
   padding: 0.125rem 0.625rem;
-  border: 1px solid var(--control);
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent);
   border-radius: 999px;
+  background: color-mix(in srgb, currentColor 10%, transparent);
   font-size: 0.875rem;
   font-weight: 600;
 }
 
 .management .status-active {
-  border-color: var(--accent);
-  color: var(--accent);
+  color: var(--ok);
 }
 
 .management .status-suspended {
-  border-color: var(--danger);
   color: var(--danger);
 }
 
@@ -953,6 +1039,95 @@ button.management-button-danger:enabled:hover {
 
 .management .student-billing-portal:not(:empty) {
   overflow-wrap: anywhere;
+}
+
+/* Dashboard: ledger rows, each label on the left and its figure on the right. */
+.dashboard {
+  display: grid;
+  gap: 1.5rem;
+}
+
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 19rem), 1fr));
+  gap: 1.5rem;
+}
+
+.dashboard-attention {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.dashboard-attention li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  box-sizing: border-box;
+  min-height: 3.5rem;
+  padding: 0.25rem var(--inset);
+}
+
+.dashboard-attention li + li {
+  border-top: 1px solid var(--line);
+}
+
+.dashboard-attention a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  margin-inline-start: auto;
+  color: var(--accent);
+  text-underline-offset: 0.2em;
+}
+
+.dashboard-count {
+  box-sizing: border-box;
+  min-width: 2rem;
+  padding: 0.125rem 0.5rem;
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--warn);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.dashboard-stats {
+  margin: 0;
+}
+
+.dashboard-stats > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem var(--inset);
+}
+
+.dashboard-stats > div + div {
+  border-top: 1px solid var(--line);
+}
+
+.dashboard-stats dt small {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.dashboard-stats dd {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+  text-align: end;
+}
+
+.dashboard-stats .dashboard-alert {
+  color: var(--danger);
 }
 
 @media (max-width: 960px) {

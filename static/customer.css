@@ -646,28 +646,10 @@
   font-weight: 700;
 }
 
-/* The financial-responsibility clause is the one people most need to see; it is set in bold on a highlighted band. */
-.agreement-clauses .is-key {
-  margin-inline: -1.25rem;
-  padding-inline: 1.25rem;
-  background: var(--bulb-tint);
-  border-top-color: var(--bulb-edge);
-  border-bottom: 1px solid var(--bulb-edge);
-}
-
-.agreement-clauses .is-key::before {
-  background: var(--ink);
-  color: var(--bulb);
-}
-
 .agreement-closing {
   padding-top: 1rem;
   border-top: 1px solid var(--line);
   color: var(--muted);
-}
-
-.agreement-clauses .is-key + li {
-  border-top: 0;
 }
 
 .agreement-acceptance {
