@@ -36,6 +36,7 @@ type pageData struct {
 	View              string
 	Error             string
 	EmailConfirm      string
+	Pin               string
 	EmailMismatch     bool
 	FieldErrors       map[string]string
 	ProgramStartDate  string
@@ -85,6 +86,7 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 	mux.Handle("GET /customer/{token}/forms", withHeaders(s.view("form")))
 	mux.Handle("POST /customer/{token}", withHeaders(s.submit))
 	mux.Handle("POST /customer/{token}/draft/{field}", withHeaders(s.draft))
+	mux.Handle("POST /customer/{token}/pin", withHeaders(s.checkPin))
 	mux.Handle("GET /customer/{token}/edit", withHeaders(s.edit))
 	mux.Handle("POST /customer/{token}/edit", withHeaders(s.edit))
 	mux.Handle("GET /customer/{token}/agreement", withHeaders(s.agreement))
@@ -182,7 +184,7 @@ func (s *site) view(name string) http.HandlerFunc {
 	}
 }
 
-// submit commits the final contact form and advances to the agreement. Valid input is written with
+// submit commits the final contact form and PIN and advances to the agreement. Valid input is written with
 // no prior lookup, so a database failure is recorded as a save failure; anything else observes
 // link usability and completion first. The HTMX request swaps in only the content section.
 func (s *site) submit(w http.ResponseWriter, r *http.Request) {
@@ -197,21 +199,27 @@ func (s *site) submit(w http.ResponseWriter, r *http.Request) {
 	status := parseCustomerForm(w, r)
 	if status != http.StatusOK {
 		data.Error = "No pudimos leer tu información. Intenta de nuevo."
-	} else if parsed, ok := readContact(r.PostForm, &data); !ok {
+	} else if parsed, pin, ok := readSubmission(r.PostForm, &data); !ok {
 		status = http.StatusUnprocessableEntity
 	} else {
-		result, err := s.links.Submit(ctx, token, parsed)
+		result, err := s.links.Submit(ctx, token, parsed, pin)
 		switch {
 		case err != nil:
 			logging.RecordError(r, "save", err)
 			data.Error = "No pudimos guardar tu información. Intenta de nuevo."
 			s.render(w, r, name, data, http.StatusInternalServerError)
+			return
 		case result == links.Saved, result == links.AlreadySubmitted:
 			redirectCustomer(w, r, data.Path+"/agreement")
+			return
+		case result == links.PinTaken:
+			// Another student won the PIN after the live check: redraw below with what was typed.
+			data.FieldErrors["pin"] = pinTakenMessage
+			status = http.StatusUnprocessableEntity
 		default:
 			s.render(w, r, name, data, http.StatusNotFound)
+			return
 		}
-		return
 	}
 
 	link, err := s.links.Lookup(ctx, token)
@@ -287,7 +295,7 @@ func locked(w http.ResponseWriter, r *http.Request) {
 }
 
 // edit reopens the contact form of a submitted link until payment is confirmed or in flight.
-// The edit has no autosave: one POST updates the canonical student, then returns to the agreement.
+// The edit has no autosave: one POST updates the link's contact snapshot, then returns to the agreement.
 // Submission time, expiry, link snapshot, and accepted terms never change.
 func (s *site) edit(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
@@ -313,26 +321,14 @@ func (s *site) edit(w http.ResponseWriter, r *http.Request) {
 		redirectCustomer(w, r, data.Path+"/payments")
 		return
 	}
-	student, err := s.roster.BySourceLinkHash(ctx, link.TokenHash)
-	if err != nil {
-		logging.RecordError(r, "load", err)
-		data.Error = "No pudimos abrir este enlace. Intenta de nuevo."
-		s.render(w, r, "index.html", data, http.StatusInternalServerError)
-		return
-	}
-	if student == nil {
-		s.render(w, r, "index.html", data, http.StatusNotFound)
-		return
-	}
-
 	status := http.StatusOK
-	data.Details = student.Details
+	data.Details = link.Details
 	if r.Method == http.MethodPost {
 		if status = parseCustomerForm(w, r); status != http.StatusOK {
 			data.Error = "No pudimos leer tu información. Intenta de nuevo."
 		} else if parsed, ok := readContact(r.PostForm, &data); !ok {
 			status = http.StatusUnprocessableEntity
-		} else if parsed == student.Details {
+		} else if parsed == link.Details {
 			// Nothing changed: skip the write, the management refresh and the provider sync.
 			redirectCustomer(w, r, data.Path+"/agreement")
 			return
@@ -376,11 +372,68 @@ func readContact(form url.Values, data *pageData) (parsed students.Details, ok b
 	data.Details = students.Details{
 		Name: form.Get("name"), Email: form.Get("email"),
 		Phone: form.Get("phone"), Municipality: form.Get("municipality"),
-		DateOfBirth: form.Get("date_of_birth"),
+		DateOfBirth: form.Get("date_of_birth"), Gender: form.Get("gender"),
 	}
 	data.EmailConfirm = form.Get("email_confirm")
 	parsed, data.FieldErrors, data.EmailMismatch = parseContact(form)
 	return parsed, len(data.FieldErrors) == 0
+}
+
+// readSubmission is readContact plus the PIN, which only the first submit takes: it is never
+// drafted and the edit form has no PIN.
+func readSubmission(form url.Values, data *pageData) (parsed students.Details, pin string, ok bool) {
+	parsed, ok = readContact(form, data)
+	data.Pin = form.Get("pin")
+	pin, err := students.ParsePin(data.Pin, true)
+	if err != nil {
+		data.FieldErrors["pin"] = fieldError("pin")
+		ok = false
+	}
+	return parsed, pin, ok
+}
+
+// checkPin tells the form whether a PIN is free before the final submit. It saves nothing:
+// it checks whether the PIN is held by a student or a submitted link, and the unique index decides at submit. It is a POST
+// so the PIN stays out of URLs and access logs.
+func (s *site) checkPin(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	data := pageData{View: "pin-status"}
+	ctx, cancel := context.WithTimeout(r.Context(), dbTimeout)
+	defer cancel()
+	link, err := s.links.Lookup(ctx, token)
+	if !s.found(w, r, "pin-status", &data, link, err) {
+		return
+	}
+	if link.SubmittedAt != nil {
+		locked(w, r)
+		return
+	}
+	status := parseCustomerForm(w, r)
+	if status == http.StatusOK && len(r.PostForm["pin"]) != 1 {
+		status = http.StatusBadRequest
+	}
+	if status != http.StatusOK {
+		data.Error = "No pudimos leer tu información. Intenta de nuevo."
+		s.render(w, r, "pin-status", data, status)
+		return
+	}
+	pin, err := students.ParsePin(r.PostForm.Get("pin"), true)
+	if err != nil {
+		data.FieldErrors = map[string]string{"pin": fieldError("pin")}
+		s.render(w, r, "pin-status", data, http.StatusUnprocessableEntity)
+		return
+	}
+	taken, err := s.roster.PinTaken(ctx, pin)
+	switch {
+	case err != nil:
+		logging.RecordError(r, "lookup", err)
+		data.Error = "No pudimos verificar el PIN. Intenta de nuevo."
+		status = http.StatusInternalServerError
+	case taken:
+		data.FieldErrors = map[string]string{"pin": pinTakenMessage}
+		status = http.StatusUnprocessableEntity
+	}
+	s.render(w, r, "pin-status", data, status)
 }
 
 // parseContact validates every contact field and the email confirmation, collecting all errors.
@@ -402,6 +455,8 @@ func parseContact(form url.Values) (parsed students.Details, fieldErrors map[str
 			parsed.Municipality = value
 		case "date_of_birth":
 			parsed.DateOfBirth = value
+		case "gender":
+			parsed.Gender = value
 		}
 	}
 	confirmation, err := students.ParseEmail(form.Get("email_confirm"), true)
@@ -426,6 +481,12 @@ func fieldError(key string) string {
 		return "Selecciona un municipio o “Fuera de Puerto Rico”."
 	case "date_of_birth":
 		return "Escribe una fecha de nacimiento válida."
+	case "gender":
+		return "Selecciona masculino o femenino."
+	case "pin":
+		return "Escribe un PIN de 4 a 6 dígitos."
 	}
 	return ""
 }
+
+const pinTakenMessage = "Este PIN ya está en uso. Elige otro."

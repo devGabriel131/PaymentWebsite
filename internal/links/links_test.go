@@ -90,7 +90,7 @@ func TestIssuedTokenBoundary(t *testing.T) {
 			if !tc.valid {
 				for _, save := range []func() (SaveResult, error){
 					func() (SaveResult, error) { return store.SaveDraft(ctx, tc.token, "name", "Must not save") },
-					func() (SaveResult, error) { return store.Submit(ctx, tc.token, contactDetails("Must not save")) },
+					func() (SaveResult, error) { return store.Submit(ctx, tc.token, contactDetails("Must not save"), "") },
 				} {
 					if result, err := save(); err != nil || result != Unavailable {
 						t.Fatalf("invalid token write: result=%v, err=%v", result, err)
@@ -110,7 +110,7 @@ func TestIssuedTokenBoundary(t *testing.T) {
 		for _, save := range []func() (SaveResult, error){
 			func() (SaveResult, error) { return store.SaveDraft(cancelled, first.Token, "name", "Must not save") },
 			func() (SaveResult, error) {
-				return store.Submit(cancelled, first.Token, contactDetails("Must not save"))
+				return store.Submit(cancelled, first.Token, contactDetails("Must not save"), "")
 			},
 		} {
 			if result, err := save(); err == nil || result != Unavailable {
@@ -182,13 +182,19 @@ func TestStatusFollowsCustomerProgress(t *testing.T) {
 		{"empty autosave", saved(func() (SaveResult, error) { return store.SaveDraft(ctx, link.Token, "name", "") }), Opened, ""},
 		{"autosaved", saved(func() (SaveResult, error) { return store.SaveDraft(ctx, link.Token, "name", "Ana") }), InProgress, "Ana"},
 		{"reopened draft", opened, InProgress, "Ana"},
-		{"submitted", saved(func() (SaveResult, error) { return store.Submit(ctx, link.Token, details) }), Finished, details.Name},
-		{"looked up after submit", lookedUp, Finished, details.Name},
-		{"autosave after submit is refused", refused(func() (SaveResult, error) { return store.SaveDraft(ctx, link.Token, "name", "Changed after submit") }), Finished, details.Name},
+		{"submitted", saved(func() (SaveResult, error) { return store.Submit(ctx, link.Token, details, "") }), AwaitingPayment, details.Name},
+		{"looked up after submit", lookedUp, AwaitingPayment, details.Name},
+		{"autosave after submit is refused", refused(func() (SaveResult, error) { return store.SaveDraft(ctx, link.Token, "name", "Changed after submit") }), AwaitingPayment, details.Name},
 		{"second submit is refused", refused(func() (SaveResult, error) {
-			return store.Submit(ctx, link.Token, contactDetails("Changed after submit"))
-		}), Finished, details.Name},
-		{"cancel cannot revoke completion", func() error { _, err := store.Cancel(ctx, link.ID, staff); return err }, Finished, details.Name},
+			return store.Submit(ctx, link.Token, contactDetails("Changed after submit"), "")
+		}), AwaitingPayment, details.Name},
+		{"cancel cannot revoke submitted link", func() error { _, err := store.Cancel(ctx, link.ID, staff); return err }, AwaitingPayment, details.Name},
+		{"agreement accepted", func() error { return acceptAgreement(ctx, db, store, link.Token, programStart) }, AwaitingPayment, details.Name},
+		{"enrolled on payment", func() error {
+			return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				return Enroll(tx, digestOf(link.Token), time.Now().UTC())
+			})
+		}, Finished, details.Name},
 		{"finished link still opens success", lookedUp, Finished, details.Name},
 	}
 	// The first visit is recorded once; no later step may move it.
@@ -215,10 +221,15 @@ func TestStatusFollowsCustomerProgress(t *testing.T) {
 			firstVisit = row.OpenedAt
 			enrolled := studentsFor(t, db, ctx, link.Token)
 			if step.status == Finished {
-				if len(enrolled) != 1 || enrolled[0].Details != details || row.Details != details || got.Phone != details.Phone || got.SubmittedAt == nil ||
-					!enrolled[0].CreatedAt.Equal(*got.SubmittedAt) || row.CanceledAt != nil || row.CanceledBy != "" ||
+				if len(enrolled) != 1 || enrolled[0].Details != details || row.Details != details || got.Phone != details.Phone || got.PaidAt == nil ||
+					!enrolled[0].CreatedAt.Equal(*got.PaidAt) || row.CanceledAt != nil || row.CanceledBy != "" ||
 					got.Cancelable() || got.Trashed() {
 					t.Fatalf("completion changed or lost enrollment: entry=%+v, row=%+v, students=%+v", got, row, enrolled)
+				}
+			} else if step.status == AwaitingPayment {
+				if len(enrolled) != 0 || row.Details != details || got.Phone != details.Phone || got.SubmittedAt == nil ||
+					got.PaidAt != nil || got.Cancelable() || got.Trashed() {
+					t.Fatalf("awaiting payment state invalid: entry=%+v, row=%+v, students=%+v", got, row, enrolled)
 				}
 			} else if len(enrolled) != 0 || row.SubmittedAt != nil {
 				t.Fatalf("unfinished form enrolled a student: row=%+v, students=%+v", row, enrolled)
@@ -318,7 +329,7 @@ func TestConcurrentSubmissionEnrollsOnce(t *testing.T) {
 	} {
 		go func() {
 			<-start
-			saved, err := store.Submit(ctx, issued.Token, details)
+			saved, err := store.Submit(ctx, issued.Token, details, "")
 			results <- result{details: details, saved: saved, err: err}
 		}()
 	}
@@ -348,9 +359,64 @@ func TestConcurrentSubmissionEnrollsOnce(t *testing.T) {
 	completed, err := store.Lookup(ctx, issued.Token)
 	enrolled := studentsFor(t, db, ctx, issued.Token)
 	if err != nil || winner == (students.Details{}) || completed == nil || completed.Details != winner || completed.SubmittedAt == nil ||
-		len(enrolled) != 1 || enrolled[0].Details != winner || !bytes.Equal(enrolled[0].SourceLinkHash, completed.TokenHash) ||
-		!enrolled[0].CreatedAt.Equal(*completed.SubmittedAt) || completed.ExpiresAt.Sub(*completed.SubmittedAt) != 168*time.Hour {
+		len(enrolled) != 0 || completed.ExpiresAt.Sub(*completed.SubmittedAt) != 168*time.Hour {
 		t.Fatalf("completion not atomic: winner=%+v, link=%+v, students=%+v, err=%v", winner, completed, enrolled, err)
+	}
+}
+
+// A PIN belongs to one enrolled student: of two links racing for it, one enrolls and the other
+// stays open with its draft, free to pick another PIN.
+func TestConcurrentSubmissionsCannotShareAPin(t *testing.T) {
+	db, store, ctx := testStore(t)
+	tokens := make([]string, 2)
+	for i := range tokens {
+		issued, err := store.Create(ctx, staff, later)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if saved, err := store.SaveDraft(ctx, issued.Token, "name", fmt.Sprintf("Draft %d", i)); err != nil || saved != Saved {
+			t.Fatalf("draft: saved=%v, err=%v", saved, err)
+		}
+		tokens[i] = issued.Token
+	}
+	start := make(chan struct{})
+	results := make(chan SaveResult, len(tokens))
+	for _, token := range tokens {
+		go func() {
+			<-start
+			saved, err := store.Submit(ctx, token, contactDetails("Final answer"), "012345")
+			if err != nil {
+				t.Error(err)
+			}
+			results <- saved
+		}()
+	}
+	close(start)
+	outcomes := map[SaveResult]int{}
+	for range tokens {
+		outcomes[<-results]++
+	}
+	if outcomes[Saved] != 1 || outcomes[PinTaken] != 1 {
+		t.Fatalf("outcomes = %v, want one Saved and one PinTaken", outcomes)
+	}
+	var holders int64
+	if err := db.WithContext(ctx).Model(&Link{}).Where("pin = ?", "012345").Count(&holders).Error; err != nil || holders != 1 {
+		t.Fatalf("links holding the PIN = %d, err=%v; want 1", holders, err)
+	}
+	for _, token := range tokens {
+		link, err := store.Lookup(ctx, token)
+		if err != nil || link == nil {
+			t.Fatalf("lookup: %v, %v", link, err)
+		}
+		if link.SubmittedAt != nil {
+			continue
+		}
+		if !strings.HasPrefix(link.Name, "Draft ") {
+			t.Fatalf("losing link lost its draft: %+v", link.Details)
+		}
+		if saved, err := store.Submit(ctx, token, contactDetails("Second try"), "543210"); err != nil || saved != Saved {
+			t.Fatalf("losing link could not take another PIN: saved=%v, err=%v", saved, err)
+		}
 	}
 }
 
@@ -360,7 +426,7 @@ func TestSubmissionFailureRollsBack(t *testing.T) {
 		conflict   bool
 		constraint string
 	}{
-		{"student INSERT check", false, "CHECK (name <> 'Rejected submission')"},
+		{"link UPDATE check", false, "CHECK (name <> 'Rejected submission')"},
 		{"deferred commit constraint", true, "UNIQUE (name) DEFERRABLE INITIALLY DEFERRED"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -371,7 +437,7 @@ func TestSubmissionFailureRollsBack(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if saved, err := store.Submit(ctx, existing.Token, details); err != nil || saved != Saved {
+				if saved, err := store.Submit(ctx, existing.Token, details, ""); err != nil || saved != Saved {
 					t.Fatalf("seed existing student: saved=%v, err=%v", saved, err)
 				}
 			}
@@ -383,7 +449,7 @@ func TestSubmissionFailureRollsBack(t *testing.T) {
 				Name: "Original draft", Email: "draft@example.com", Phone: "+12025550123", Municipality: "Ponce",
 			}}
 			for _, field := range students.Fields() {
-				if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(draft.Details)); err != nil || saved != Saved {
+				if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(draft)); err != nil || saved != Saved {
 					t.Fatalf("save %s draft: saved=%v, err=%v", field.Key, saved, err)
 				}
 			}
@@ -392,30 +458,29 @@ func TestSubmissionFailureRollsBack(t *testing.T) {
 				t.Fatalf("load draft: link=%+v, err=%v", before, err)
 			}
 			// Constraint SQL is fixed test data, scoped to this test's schema.
-			if err := db.WithContext(ctx).Exec("ALTER TABLE students ADD CONSTRAINT test_student_rejection " + tc.constraint).Error; err != nil {
+			if err := db.WithContext(ctx).Exec("ALTER TABLE links ADD CONSTRAINT test_link_rejection " + tc.constraint).Error; err != nil {
 				t.Fatal(err)
 			}
 			changes := 0
 			store = New(db, func() { changes++ })
-			if saved, err := store.Submit(ctx, issued.Token, details); err == nil || saved != Unavailable {
+			if saved, err := store.Submit(ctx, issued.Token, details, ""); err == nil || saved != Unavailable {
 				t.Fatalf("failed transaction reported success: saved=%v, err=%v", saved, err)
 			}
 			after, err := store.Lookup(ctx, issued.Token)
 			if err != nil || !reflect.DeepEqual(after, before) || len(studentsFor(t, db, ctx, issued.Token)) != 0 || changes != 0 {
 				t.Fatalf("failed transaction changed draft/submission/expiry: before=%+v, after=%+v, err=%v", before, after, err)
 			}
-			if err := db.WithContext(ctx).Exec("ALTER TABLE students DROP CONSTRAINT test_student_rejection").Error; err != nil {
+			if err := db.WithContext(ctx).Exec("ALTER TABLE links DROP CONSTRAINT test_link_rejection").Error; err != nil {
 				t.Fatal(err)
 			}
-			if saved, err := store.Submit(ctx, issued.Token, details); err != nil || saved != Saved {
+			if saved, err := store.Submit(ctx, issued.Token, details, ""); err != nil || saved != Saved {
 				t.Fatalf("retry failed: saved=%v, err=%v", saved, err)
 			}
 			completed, err := store.Lookup(ctx, issued.Token)
 			enrolled := studentsFor(t, db, ctx, issued.Token)
 			if err != nil || completed == nil || completed.Details != details || completed.SubmittedAt == nil || changes != 1 ||
-				len(enrolled) != 1 || enrolled[0].Details != details ||
-				!enrolled[0].CreatedAt.Equal(*completed.SubmittedAt) || completed.ExpiresAt.Sub(*completed.SubmittedAt) != 168*time.Hour {
-				t.Fatalf("retry did not commit completion and student: link=%+v, students=%+v, err=%v", completed, enrolled, err)
+				len(enrolled) != 0 || completed.ExpiresAt.Sub(*completed.SubmittedAt) != 168*time.Hour {
+				t.Fatalf("retry did not commit completion: link=%+v, students=%+v, err=%v", completed, enrolled, err)
 			}
 		})
 	}
@@ -432,7 +497,7 @@ func TestSubmissionCancellationRace(t *testing.T) {
 	}}
 	final := contactDetails("Final answer")
 	for _, field := range students.Fields() {
-		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(draft.Details)); err != nil || saved != Saved {
+		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(draft)); err != nil || saved != Saved {
 			t.Fatalf("draft %s: saved=%v, err=%v", field.Key, saved, err)
 		}
 	}
@@ -445,7 +510,7 @@ func TestSubmissionCancellationRace(t *testing.T) {
 	results := make(chan result, 2)
 	go func() {
 		<-start
-		saved, err := store.Submit(ctx, issued.Token, final)
+		saved, err := store.Submit(ctx, issued.Token, final, "")
 		results <- result{saved: saved, err: err}
 	}()
 	go func() {
@@ -478,8 +543,7 @@ func TestSubmissionCancellationRace(t *testing.T) {
 	switch {
 	case row.SubmittedAt != nil:
 		if submitted != Saved || row.CanceledAt != nil || row.CanceledBy != "" || row.Details != final ||
-			len(enrolled) != 1 || enrolled[0].Details != final || !enrolled[0].CreatedAt.Equal(*row.SubmittedAt) ||
-			canceled.Status != Finished || row.ExpiresAt.Sub(*row.SubmittedAt) != 168*time.Hour {
+			len(enrolled) != 0 || canceled.Status != AwaitingPayment || row.ExpiresAt.Sub(*row.SubmittedAt) != 168*time.Hour {
 			t.Fatalf("invalid submission-wins outcome: submitted=%v, row=%+v, students=%+v, cancel=%+v", submitted, row, enrolled, canceled)
 		}
 	case row.CanceledAt != nil:
@@ -645,8 +709,17 @@ func TestExpiredLinksStopWorking(t *testing.T) {
 	if saved, err := store.SaveDraft(ctx, midForm.Token, "name", "Half done"); err != nil || saved != Saved {
 		t.Fatalf("draft before expiry: saved=%v, err=%v", saved, err)
 	}
-	if saved, err := store.Submit(ctx, finished.Token, contactDetails("Done final")); err != nil || saved != Saved {
+	if saved, err := store.Submit(ctx, finished.Token, contactDetails("Done final"), ""); err != nil || saved != Saved {
 		t.Fatalf("submit before expiry: saved=%v, err=%v", saved, err)
+	}
+	if err := acceptAgreement(ctx, db, store, finished.Token, programStart); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return Enroll(tx, digestOf(finished.Token), now)
+	}); err != nil {
+		t.Fatal(err)
 	}
 	enrolled := studentsFor(t, db, ctx, finished.Token)
 	if len(enrolled) != 1 {
@@ -666,7 +739,7 @@ func TestExpiredLinksStopWorking(t *testing.T) {
 			if saved, err := store.SaveDraft(ctx, token, "name", "After expiry"); err != nil || saved != Unavailable {
 				t.Errorf("draft: saved=%v, err=%v; want refused", saved, err)
 			}
-			if saved, err := store.Submit(ctx, token, contactDetails("After expiry")); err != nil || saved != Unavailable {
+			if saved, err := store.Submit(ctx, token, contactDetails("After expiry"), ""); err != nil || saved != Unavailable {
 				t.Errorf("submit: saved=%v, err=%v; want refused", saved, err)
 			}
 		})
@@ -728,9 +801,9 @@ func TestCommittedWritesAnnounceChanges(t *testing.T) {
 	step("draft", 3, err)
 	_, err = store.SaveDraft(ctx, first.Token, "name", "Draft")
 	step("repeat draft", 3, err)
-	_, err = store.Submit(ctx, first.Token, contactDetails("Final answer"))
+	_, err = store.Submit(ctx, first.Token, contactDetails("Final answer"), "")
 	step("submit", 4, err)
-	_, err = store.Submit(ctx, first.Token, contactDetails("Replay answer"))
+	_, err = store.Submit(ctx, first.Token, contactDetails("Replay answer"), "")
 	step("replayed submit", 4, err)
 	_, err = store.Cancel(ctx, first.ID, staff)
 	step("cancel finished", 4, err)
@@ -758,7 +831,7 @@ func TestDraftFieldIsolationAndConcurrentClearing(t *testing.T) {
 	}
 	initial := students.Student{Details: contactDetails("Original draft")}
 	for _, field := range students.Fields() {
-		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(initial.Details)); err != nil || saved != Saved {
+		if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, field.Value(initial)); err != nil || saved != Saved {
 			t.Fatalf("seed %s: saved=%v, err=%v", field.Key, saved, err)
 		}
 	}
@@ -779,21 +852,21 @@ func TestDraftFieldIsolationAndConcurrentClearing(t *testing.T) {
 	}{
 		{
 			name: "concurrent name and email", writes: []write{{"name", "Updated"}, {"email", "updated@example.com"}},
-			want:   students.Details{Name: "Updated", Email: "updated@example.com", Phone: initial.Phone, Municipality: initial.Municipality, DateOfBirth: initial.DateOfBirth},
+			want:   students.Details{Name: "Updated", Email: "updated@example.com", Phone: initial.Phone, Municipality: initial.Municipality, DateOfBirth: initial.DateOfBirth, Gender: initial.Gender},
 			status: InProgress,
 		},
 		{
 			name: "clear name while changing phone", writes: []write{{"name", ""}, {"phone", "+12025550123"}},
-			want:   students.Details{Email: "updated@example.com", Phone: "+12025550123", Municipality: initial.Municipality, DateOfBirth: initial.DateOfBirth},
+			want:   students.Details{Email: "updated@example.com", Phone: "+12025550123", Municipality: initial.Municipality, DateOfBirth: initial.DateOfBirth, Gender: initial.Gender},
 			status: InProgress,
 		},
 		{
 			name: "clear email while changing municipality", writes: []write{{"email", ""}, {"municipality", "Fuera de Puerto Rico"}},
-			want:   students.Details{Phone: "+12025550123", Municipality: "Fuera de Puerto Rico", DateOfBirth: initial.DateOfBirth},
+			want:   students.Details{Phone: "+12025550123", Municipality: "Fuera de Puerto Rico", DateOfBirth: initial.DateOfBirth, Gender: initial.Gender},
 			status: InProgress,
 		},
 		{
-			name: "clear last fields", writes: []write{{"phone", ""}, {"municipality", ""}, {"date_of_birth", ""}},
+			name: "clear last fields", writes: []write{{"phone", ""}, {"municipality", ""}, {"date_of_birth", ""}, {"gender", ""}},
 			want: students.Details{}, status: Opened,
 		},
 	} {
@@ -875,7 +948,7 @@ func TestDraftSubmissionRaceKeepsFinalSnapshot(t *testing.T) {
 			}}
 			final := contactDetails("Final answer")
 			for _, seed := range students.Fields() {
-				if saved, err := store.SaveDraft(ctx, issued.Token, seed.Key, seed.Value(draft.Details)); err != nil || saved != Saved {
+				if saved, err := store.SaveDraft(ctx, issued.Token, seed.Key, seed.Value(draft)); err != nil || saved != Saved {
 					t.Fatalf("seed %s: result=%v, err=%v", seed.Key, saved, err)
 				}
 			}
@@ -893,7 +966,7 @@ func TestDraftSubmissionRaceKeepsFinalSnapshot(t *testing.T) {
 			}()
 			go func() {
 				<-start
-				saved, err := store.Submit(ctx, issued.Token, final)
+				saved, err := store.Submit(ctx, issued.Token, final, "")
 				results <- result{saved: saved, err: err}
 			}()
 			close(start)
@@ -911,14 +984,13 @@ func TestDraftSubmissionRaceKeepsFinalSnapshot(t *testing.T) {
 			enrolled := studentsFor(t, db, ctx, issued.Token)
 			if err != nil || completed == nil || completed.Details != final || completed.SubmittedAt == nil ||
 				completed.CanceledAt != nil || completed.ExpiresAt.Sub(*completed.SubmittedAt) != 168*time.Hour ||
-				len(enrolled) != 1 || enrolled[0].Details != final || !bytes.Equal(enrolled[0].SourceLinkHash, completed.TokenHash) ||
-				!enrolled[0].CreatedAt.Equal(*completed.SubmittedAt) {
+				len(enrolled) != 0 {
 				t.Fatalf("racing draft changed final snapshot: link=%+v, students=%+v, err=%v", completed, enrolled, err)
 			}
 			if saved, err := store.SaveDraft(ctx, issued.Token, field.Key, ""); err != nil || saved != AlreadySubmitted {
 				t.Fatalf("late clear: result=%v, err=%v", saved, err)
 			}
-			if saved, err := store.Submit(ctx, issued.Token, draft.Details); err != nil || saved != AlreadySubmitted {
+			if saved, err := store.Submit(ctx, issued.Token, draft.Details, ""); err != nil || saved != AlreadySubmitted {
 				t.Fatalf("final replay: result=%v, err=%v", saved, err)
 			}
 			after, err := store.Lookup(ctx, issued.Token)
@@ -960,7 +1032,7 @@ func TestAcceptTermsRequiresContactAndCurrentDisplayedDate(t *testing.T) {
 			}
 		})
 	}
-	if saved, err := store.Submit(ctx, entry.Token, contactDetails("Submitted contact")); err != nil || saved != Saved {
+	if saved, err := store.Submit(ctx, entry.Token, contactDetails("Submitted contact"), ""); err != nil || saved != Saved {
 		t.Fatalf("submit: saved=%v, err=%v", saved, err)
 	}
 	before, err := store.Lookup(ctx, entry.Token)
@@ -999,15 +1071,12 @@ func TestAcceptTermsRequiresContactAndCurrentDisplayedDate(t *testing.T) {
 	if err := options.SetProgramStartDate(ctx, "2027-01-05", staff); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := students.New(db, nil).UpdateField(ctx, enrolled[0].ID, "name", "Canonical contact"); err != nil {
-		t.Fatal(err)
-	}
 	for _, shown := range []string{currentDate, "2027-01-05", "", "invalid replay"} {
 		if got, err := store.AcceptTerms(ctx, entry.Token, shown); err != nil || !reflect.DeepEqual(got, accepted) || writes != 1 {
 			t.Fatalf("accepted replay changed agreement: link=%+v, writes=%d, err=%v", got, writes, err)
 		}
 	}
-	if saved, err := store.Submit(ctx, entry.Token, contactDetails("Replacement contact")); err != nil || saved != AlreadySubmitted {
+	if saved, err := store.Submit(ctx, entry.Token, contactDetails("Replacement contact"), ""); err != nil || saved != AlreadySubmitted {
 		t.Fatalf("submitted replay: saved=%v, err=%v", saved, err)
 	}
 	if saved, err := store.SaveDraft(ctx, entry.Token, "name", "Replacement draft"); err != nil || saved != AlreadySubmitted {
@@ -1024,7 +1093,7 @@ func TestAcceptTermsRejectsUnconfiguredStartDate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := store.Submit(ctx, entry.Token, contactDetails("Submitted contact")); err != nil || saved != Saved {
+	if saved, err := store.Submit(ctx, entry.Token, contactDetails("Submitted contact"), ""); err != nil || saved != Saved {
 		t.Fatalf("submit: saved=%v, err=%v", saved, err)
 	}
 	for _, stage := range []string{"missing settings row", "empty date"} {
@@ -1047,7 +1116,7 @@ func TestAcceptTermsObservesConcurrentStartDateChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := store.Submit(ctx, entry.Token, contactDetails("Submitted contact")); err != nil || saved != Saved {
+	if saved, err := store.Submit(ctx, entry.Token, contactDetails("Submitted contact"), ""); err != nil || saved != Saved {
 		t.Fatalf("submit: saved=%v, err=%v", saved, err)
 	}
 	if err := settings.New(db).SetProgramStartDate(ctx, "2026-11-10", staff); err != nil {
@@ -1104,7 +1173,7 @@ func TestAgreementWritesRejectUnusableTokens(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if saved, err := store.Submit(ctx, entry.Token, contactDetails("Submitted contact")); err != nil || saved != Saved {
+		if saved, err := store.Submit(ctx, entry.Token, contactDetails("Submitted contact"), ""); err != nil || saved != Saved {
 			t.Fatalf("submit: saved=%v, err=%v", saved, err)
 		}
 		if stage != "expired submission" {
@@ -1196,7 +1265,166 @@ func studentsFor(t *testing.T, db *gorm.DB, ctx context.Context, token string) [
 
 func contactDetails(name string) students.Details {
 	return students.Details{
-		Name: name, Email: "student@example.com", Phone: "+17872345678", Municipality: "San Juan", DateOfBirth: "2005-06-15",
+		Name: name, Email: "student@example.com", Phone: "+17872345678", Municipality: "San Juan", DateOfBirth: "2005-06-15", Gender: "Female",
 	}
 }
 
+// programStart is the agreement start date tests accept before Enroll.
+const programStart = "2026-11-10"
+
+// acceptAgreement configures date as the program start and accepts token's submitted agreement
+// at it, as checkout requires before payment can enroll the student.
+func acceptAgreement(ctx context.Context, db *gorm.DB, store *Store, token, date string) error {
+	if err := settings.New(db).SetProgramStartDate(ctx, date, staff); err != nil {
+		return err
+	}
+	if accepted, err := store.AcceptTerms(ctx, token, date); err != nil || accepted == nil {
+		return fmt.Errorf("accept agreement: link=%+v, err=%v", accepted, err)
+	}
+	return nil
+}
+
+func TestPayBeforeStudentInvariants(t *testing.T) {
+	db, store, ctx := testStore(t)
+
+	// (a) after Submit with a PIN, students has 0 rows, the link row holds details and PIN, List reports AwaitingPayment
+	issued1, err := store.Create(ctx, staff, later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	details1 := contactDetails("Customer One")
+	details1.Phone = "+17875551111"
+	const pin = "789012"
+	saved, err := store.Submit(ctx, issued1.Token, details1, pin)
+	if err != nil || saved != Saved {
+		t.Fatalf("submit link 1: saved=%v, err=%v", saved, err)
+	}
+	var count int64
+	db.Model(&students.Student{}).Count(&count)
+	if count != 0 {
+		t.Fatalf("expected 0 students after submit, got %d", count)
+	}
+	link1, err := store.Lookup(ctx, issued1.Token)
+	if err != nil || link1 == nil {
+		t.Fatalf("lookup link 1: %v, %v", link1, err)
+	}
+	if link1.Details != details1 || link1.Pin != pin || link1.PaidAt != nil || link1.SubmittedAt == nil {
+		t.Fatalf("link 1 state unexpected: %+v", link1)
+	}
+	entries, err := store.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry1 *Entry
+	for i := range entries {
+		if entries[i].ID == issued1.ID {
+			entry1 = &entries[i]
+		}
+	}
+	if entry1 == nil || entry1.Status != AwaitingPayment || entry1.Name != details1.Name || entry1.Phone != details1.Phone {
+		t.Fatalf("link 1 list entry unexpected: %+v", entry1)
+	}
+
+	// (b) a second link submitting the same PIN gets PinTaken and stays unsubmitted
+	issued2, err := store.Create(ctx, staff, later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	details2 := contactDetails("Customer Two")
+	saved2, err := store.Submit(ctx, issued2.Token, details2, pin)
+	if err != nil || saved2 != PinTaken {
+		t.Fatalf("submit link 2 with duplicate pin: saved=%v, err=%v; want PinTaken", saved2, err)
+	}
+	link2, err := store.Lookup(ctx, issued2.Token)
+	if err != nil || link2 == nil {
+		t.Fatalf("lookup link 2: %v, %v", link2, err)
+	}
+	if link2.SubmittedAt != nil || link2.Pin != "" {
+		t.Fatalf("link 2 should stay unsubmitted: %+v", link2)
+	}
+
+	// (c) Enroll in a tx creates exactly one student with details, PIN, created_at == paidAt, Básico,
+	// and the accepted start date's month as cohort even after staff move the date;
+	// sets links.paid_at, clears links.pin, status becomes Finished; second Enroll returns error
+	if err := acceptAgreement(ctx, db, store, issued1.Token, programStart); err != nil {
+		t.Fatal(err)
+	}
+	if err := settings.New(db).SetProgramStartDate(ctx, "2027-01-05", staff); err != nil {
+		t.Fatal(err)
+	}
+	paidAt := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return Enroll(tx, link1.TokenHash, paidAt)
+	}); err != nil {
+		t.Fatalf("first Enroll: %v", err)
+	}
+	var student students.Student
+	if err := db.Where("source_link_hash = ?", link1.TokenHash).Take(&student).Error; err != nil {
+		t.Fatalf("find enrolled student: %v", err)
+	}
+	if student.Details != details1 || student.Pin != pin || !student.CreatedAt.Equal(paidAt) ||
+		student.Group != "Básico" || student.Cohort != "2026-11" {
+		t.Fatalf("enrolled student mismatch: %+v", student)
+	}
+	link1After, err := store.Lookup(ctx, issued1.Token)
+	if err != nil || link1After == nil {
+		t.Fatal(err)
+	}
+	if link1After.Pin != "" || link1After.PaidAt == nil || !link1After.PaidAt.Equal(paidAt) {
+		t.Fatalf("link 1 after enroll: pin=%q, paid_at=%v", link1After.Pin, link1After.PaidAt)
+	}
+	entry1After := link1After.entry(time.Now())
+	if entry1After.Status != Finished {
+		t.Fatalf("entry status after enroll = %v; want Finished", entry1After.Status)
+	}
+	// Second Enroll returns error and still leaves 1 student
+	err = db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return Enroll(tx, link1.TokenHash, paidAt)
+	})
+	if err == nil {
+		t.Fatal("expected second Enroll to fail")
+	}
+	db.Model(&students.Student{}).Count(&count)
+	if count != 1 {
+		t.Fatalf("expected exactly 1 student after second enroll, got %d", count)
+	}
+
+	// (d) a submitted unpaid link past expires_at is Expired and Trashed(), but the same link with PaidAt set is Finished and not trashed; Archived flips 24 h after PaidAt, not after SubmittedAt.
+	issued3, err := store.Create(ctx, staff, later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved, err := store.Submit(ctx, issued3.Token, contactDetails("Customer Three"), "112233"); err != nil || saved != Saved {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	link3, _ := store.Lookup(ctx, issued3.Token)
+	link3.ExpiresAt = past
+	e3Unpaid := link3.entry(time.Now())
+	if e3Unpaid.Status != Expired || !e3Unpaid.Trashed() {
+		t.Fatalf("unpaid expired link status=%v, trashed=%v; want Expired, true", e3Unpaid.Status, e3Unpaid.Trashed())
+	}
+	// Same link with PaidAt set is Finished and not trashed
+	now := time.Now()
+	link3.PaidAt = &now
+	e3Paid := link3.entry(now)
+	if e3Paid.Status != Finished || e3Paid.Trashed() {
+		t.Fatalf("paid expired link status=%v, trashed=%v; want Finished, false", e3Paid.Status, e3Paid.Trashed())
+	}
+	// Archived flips 24 h after PaidAt
+	link3.PaidAt = &past
+	submittedOld := past.Add(-48 * time.Hour)
+	link3.SubmittedAt = &submittedOld
+	// Paid 1 hour ago: not archived yet
+	e3RecentPaid := link3.entry(now)
+	if e3RecentPaid.Archived(now) {
+		t.Fatalf("paid 1h ago should not be archived yet: %+v", e3RecentPaid)
+	}
+	// Paid 25 hours ago: archived
+	paidLongAgo := now.Add(-25 * time.Hour)
+	link3.PaidAt = &paidLongAgo
+	e3OldPaid := link3.entry(now)
+	if !e3OldPaid.Archived(now) {
+		t.Fatalf("paid 25h ago should be archived: %+v", e3OldPaid)
+	}
+}

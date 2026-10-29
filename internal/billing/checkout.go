@@ -90,15 +90,15 @@ func (s *Service) StartCheckout(ctx context.Context, sourceLinkHash []byte, plan
 	}
 }
 
-// UpdateContact updates only the canonical student row for an enrollment, guarded against
-// concurrent checkouts and blocked once funded or while payment is in flight.
+// UpdateContact updates the Link's contact snapshot, guarded against concurrent checkouts
+// and blocked once funded (the Student is then canonical and staff-edited) or while payment is in flight.
 func (s *Service) UpdateContact(ctx context.Context, sourceLinkHash []byte, details students.Details) error {
 	if len(sourceLinkHash) != sha256.Size {
 		return ErrUnavailable
 	}
 	contact := map[string]any{
 		"name": details.Name, "email": details.Email, "phone": details.Phone,
-		"municipality": details.Municipality, "date_of_birth": details.DateOfBirth,
+		"municipality": details.Municipality, "date_of_birth": details.DateOfBirth, "gender": details.Gender,
 	}
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var link links.Link
@@ -106,12 +106,8 @@ func (s *Service) UpdateContact(ctx context.Context, sourceLinkHash []byte, deta
 			"token_hash = ? AND submitted_at IS NOT NULL", sourceLinkHash)); err != nil {
 			return err
 		}
-		var student students.Student
-		if err := require(firstRow(tx, &student, "source_link_hash = ?", sourceLinkHash)); err != nil {
-			return err
-		}
 		var contract Contract
-		exists, err := firstRow(tx.Clauses(forUpdate), &contract, "student_id = ?", student.ID)
+		exists, err := firstRow(tx.Clauses(forUpdate), &contract, "source_link_hash = ?", sourceLinkHash)
 		if err != nil {
 			return err
 		}
@@ -129,10 +125,10 @@ func (s *Service) UpdateContact(ctx context.Context, sourceLinkHash []byte, deta
 				return ErrContactLocked
 			}
 		}
-		if err := touch(tx, student.ID); err != nil {
+		if err := touch(tx, sourceLinkHash); err != nil {
 			return err
 		}
-		return tx.Model(&students.Student{}).Where("id = ?", student.ID).Updates(contact).Error
+		return tx.Model(&links.Link{}).Where("token_hash = ?", sourceLinkHash).Updates(contact).Error
 	})
 	if err != nil {
 		return err
@@ -151,20 +147,15 @@ func (s *Service) beginCheckout(ctx context.Context, hash []byte, plan payments.
 			"token_hash = ? AND submitted_at IS NOT NULL AND terms_accepted_at IS NOT NULL", hash)); err != nil {
 			return err
 		}
-		var student students.Student
-		if err := require(firstRow(tx, &student, "source_link_hash = ?", hash)); err != nil {
-			return err
-		}
-
 		var contract Contract
-		exists, err := firstRow(tx.Clauses(forUpdate), &contract, "student_id = ?", student.ID)
+		exists, err := firstRow(tx.Clauses(forUpdate), &contract, "source_link_hash = ?", hash)
 		if err != nil {
 			return err
 		}
 		if !exists {
 			syncGrace := time.Now().UTC().Add(1 * time.Minute)
 			contract = Contract{
-				StudentID:        student.ID,
+				SourceLinkHash:   hash,
 				Reference:        rand.Text(),
 				PlanID:           plan.ID,
 				PlanName:         plan.Name,
@@ -241,8 +232,8 @@ func (s *Service) beginCheckout(ctx context.Context, hash []byte, plan payments.
 			// Stripe call so concurrent starts share one Customer; the stable key makes a retry
 			// safe, move it after commit if lock waits ever matter.
 			params := &stripe.CustomerCreateParams{
-				Name:             stripe.String(student.Name),
-				Email:            stripe.String(student.Email),
+				Name:             stripe.String(link.Name),
+				Email:            stripe.String(link.Email),
 				PreferredLocales: []*string{stripe.String(stripeLocale)},
 				Metadata:         map[string]string{"tuition_contract": contract.Reference},
 			}
@@ -252,11 +243,11 @@ func (s *Service) beginCheckout(ctx context.Context, hash []byte, plan payments.
 				return fmt.Errorf("billing: create stripe customer: %w", err)
 			}
 			contract.StripeCustomerID = &customer.ID
-			contract.SyncedCustomerName = student.Name
-			contract.SyncedCustomerEmail = student.Email
+			contract.SyncedCustomerName = link.Name
+			contract.SyncedCustomerEmail = link.Email
 			contractUpdates["stripe_customer_id"] = customer.ID
-			contractUpdates["synced_customer_name"] = student.Name
-			contractUpdates["synced_customer_email"] = student.Email
+			contractUpdates["synced_customer_name"] = link.Name
+			contractUpdates["synced_customer_email"] = link.Email
 		}
 
 		attempt := CheckoutAttempt{

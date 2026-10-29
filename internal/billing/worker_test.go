@@ -3,18 +3,22 @@
 package billing_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/stripe/stripe-go/v87"
 	"paymentwebsite/internal/billing"
 	"paymentwebsite/internal/billing/billingtest"
+	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
 )
@@ -388,27 +392,31 @@ func TestScheduledInvoiceCreationRecoversEveryBoundary(t *testing.T) {
 	paidAt := time.Date(2026, time.November, 15, 4, 0, 0, 0, time.UTC)
 	mock := newWorkerMockServer(paidAt, 20834)
 
-	allModels := append([]any{&students.Student{}}, billing.Models()...)
+	allModels := append([]any{&links.Link{}, &students.Student{}}, billing.Models()...)
 	db := testdb.Open(t, allModels...)
 
 	tokenHash := make([]byte, 32)
 	rand.Read(tokenHash)
 	now := time.Now().UTC()
-	student := students.Student{
-		SourceLinkHash: tokenHash,
+	link := links.Link{
+		TokenHash: tokenHash,
 		Details: students.Details{
 			Name:  "Test Student",
 			Email: "test@example.com",
+			Phone: "+17875551234",
 		},
-		IsActive: true,
+		CreatedAt:        now,
+		SubmittedAt:      &now,
+		ProgramStartDate: "2026-11-01",
+		ExpiresAt:        now.Add(7 * 24 * time.Hour),
 	}
-	if err := db.Create(&student).Error; err != nil {
-		t.Fatalf("create student: %v", err)
+	if err := db.Create(&link).Error; err != nil {
+		t.Fatalf("create link: %v", err)
 	}
 	contractRef := rand.Text()
 	cusID := "cus_worker_test"
 	contract := billing.Contract{
-		StudentID:        student.ID,
+		SourceLinkHash:   tokenHash,
 		Reference:        contractRef,
 		PlanID:           "three",
 		PlanName:         "Plan de 3 Pagos Mensuales",
@@ -417,7 +425,6 @@ func TestScheduledInvoiceCreationRecoversEveryBoundary(t *testing.T) {
 		StripeCustomerID: &cusID,
 	}
 	db.Create(&contract)
-
 	// Create 3 tuition obligations
 	obl1 := billing.Obligation{
 		ContractID:            contract.ID,
@@ -476,9 +483,25 @@ func TestScheduledInvoiceCreationRecoversEveryBoundary(t *testing.T) {
 	}
 	db.Create(&evt)
 
+	var studentCountBefore int64
+	db.Model(&students.Student{}).Count(&studentCountBefore)
+	if studentCountBefore != 0 {
+		t.Fatalf("expected 0 students before funding, got %d", studentCountBefore)
+	}
+
 	// One worker pass: the event funds the contract, then the same pass creates the later invoices
 	svc.DrainForTest(t.Context())
 
+	var enrolledStudent students.Student
+	if err := db.Where("source_link_hash = ?", tokenHash).Take(&enrolledStudent).Error; err != nil {
+		t.Fatalf("enrolled student: %v", err)
+	}
+	if enrolledStudent.Name != link.Name || enrolledStudent.Email != link.Email || enrolledStudent.Phone != link.Phone {
+		t.Fatalf("student details mismatch: %+v, want %+v", enrolledStudent.Details, link.Details)
+	}
+	if !enrolledStudent.CreatedAt.Equal(paidAt) {
+		t.Fatalf("expected student created_at %v, got %v", paidAt, enrolledStudent.CreatedAt)
+	}
 	// Verify contract is now funded
 	var updatedContract billing.Contract
 	db.First(&updatedContract, contract.ID)
@@ -528,29 +551,285 @@ func TestScheduledInvoiceCreationRecoversEveryBoundary(t *testing.T) {
 	}
 }
 
-func TestRefundsAndFraudSignalsSurfaceWithoutWebhook(t *testing.T) {
+func TestRecurringPaymentsWebhooks(t *testing.T) {
 	paidAt := time.Date(2026, time.November, 15, 4, 0, 0, 0, time.UTC)
-	mock := newWorkerMockServer(paidAt, 60000)
-	allModels := append([]any{&students.Student{}}, billing.Models()...)
+	mock := newWorkerMockServer(paidAt, 20834)
+	secret := billingtest.Config().WebhookSecret
+
+	allModels := append([]any{&links.Link{}, &students.Student{}}, billing.Models()...)
 	db := testdb.Open(t, allModels...)
 
 	tokenHash := make([]byte, 32)
 	rand.Read(tokenHash)
 	now := time.Now().UTC()
-	student := students.Student{
-		SourceLinkHash: tokenHash,
+	link := links.Link{
+		TokenHash: tokenHash,
+		Details: students.Details{
+			Name:  "Recurring Student",
+			Email: "recurring@example.com",
+			Phone: "+17875551234",
+		},
+		CreatedAt:        now,
+		SubmittedAt:      &now,
+		ProgramStartDate: "2026-11-01",
+		ExpiresAt:        now.Add(7 * 24 * time.Hour),
+	}
+	if err := db.Create(&link).Error; err != nil {
+		t.Fatalf("create link: %v", err)
+	}
+	contractRef := rand.Text()
+	cusID := "cus_worker_test"
+	contract := billing.Contract{
+		SourceLinkHash:   tokenHash,
+		Reference:        contractRef,
+		PlanID:           "three",
+		PlanName:         "Plan de 3 Pagos Mensuales",
+		InstallmentCount: 3,
+		TotalCents:       62500,
+		StripeCustomerID: &cusID,
+	}
+	db.Create(&contract)
+
+	obl1 := billing.Obligation{
+		ContractID:            contract.ID,
+		Reference:             "ref_rec_obl1",
+		Kind:                  "tuition",
+		Number:                1,
+		AmountCents:           20834,
+		AmountRemainingCents:  20834,
+		StripePriceID:         "pr_three_1",
+		CollectionDisposition: "collect",
+	}
+	obl2 := billing.Obligation{
+		ContractID:            contract.ID,
+		Reference:             "ref_rec_obl2",
+		Kind:                  "tuition",
+		Number:                2,
+		AmountCents:           20833,
+		AmountRemainingCents:  20833,
+		StripePriceID:         "pr_three_2",
+		CollectionDisposition: "collect",
+	}
+	obl3 := billing.Obligation{
+		ContractID:            contract.ID,
+		Reference:             "ref_rec_obl3",
+		Kind:                  "tuition",
+		Number:                3,
+		AmountCents:           20833,
+		AmountRemainingCents:  20833,
+		StripePriceID:         "pr_three_2",
+		CollectionDisposition: "collect",
+	}
+	db.Create(&obl1)
+	db.Create(&obl2)
+	db.Create(&obl3)
+
+	sessID := "cs_recurring_sess"
+	attempt := billing.CheckoutAttempt{
+		ContractID:        contract.ID,
+		Reference:         rand.Text(),
+		PlanID:            "three",
+		FirstAmountCents:  20834,
+		StripePriceID:     "pr_three_1",
+		CreationStartedAt: now,
+		StripeSessionID:   &sessID,
+		State:             "open",
+	}
+	db.Create(&attempt)
+
+	svc := billingtest.New(t, db, mock.mux)
+
+	postWebhook := func(evtID, evtType, resourceID string) {
+		payload := makeStripeEventJSON(evtID, evtType, resourceID, false, stripe.APIVersion)
+		sig := signWebhookPayload(t, payload, secret, time.Now())
+		req := httptest.NewRequest(http.MethodPost, "/webhooks/stripe", bytes.NewReader(payload))
+		req.Header.Set("Stripe-Signature", sig)
+		rec := httptest.NewRecorder()
+		svc.Webhook(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("webhook %s failed (%d): %s", evtType, rec.Code, rec.Body.String())
+		}
+	}
+
+	// 1. Initial checkout payment arrives via webhook
+	postWebhook("evt_checkout_done", "checkout.session.completed", sessID)
+	svc.DrainForTest(t.Context())
+
+	var c billing.Contract
+	db.First(&c, contract.ID)
+	if c.FundedAt == nil {
+		t.Fatal("expected contract to be funded")
+	}
+
+	var ob2, ob3 billing.Obligation
+	if err := db.Where("contract_id = ? AND number = 2", contract.ID).First(&ob2).Error; err != nil {
+		t.Fatalf("load obligation 2: %v", err)
+	}
+	if err := db.Where("contract_id = ? AND number = 3", contract.ID).First(&ob3).Error; err != nil {
+		t.Fatalf("load obligation 3: %v", err)
+	}
+
+	if ob2.DueAt == nil || ob3.DueAt == nil {
+		t.Fatalf("expected DueAt on ob2 and ob3, got ob2=%v, ob3=%v", ob2.DueAt, ob3.DueAt)
+	}
+
+	diff2 := ob2.DueAt.Sub(*c.FundedAt)
+	if diff2 < 27*24*time.Hour || diff2 > 32*24*time.Hour {
+		t.Fatalf("obligation 2 DueAt diff from FundedAt = %v, want ~1 month", diff2)
+	}
+	diff3 := ob3.DueAt.Sub(*c.FundedAt)
+	if diff3 < 57*24*time.Hour || diff3 > 63*24*time.Hour {
+		t.Fatalf("obligation 3 DueAt diff from FundedAt = %v, want ~2 months", diff3)
+	}
+
+	if ob2.StripeInvoiceID == nil {
+		t.Fatal("expected ob2 to have StripeInvoiceID")
+	}
+	invID2 := *ob2.StripeInvoiceID
+	if ob2.ScheduledFinalizationAt == nil || !ob2.ScheduledFinalizationAt.Equal(*ob2.DueAt) {
+		t.Fatalf("ob2 ScheduledFinalizationAt = %v, want %v", ob2.ScheduledFinalizationAt, ob2.DueAt)
+	}
+	if ob2.LatestStripeStatus == nil || *ob2.LatestStripeStatus != "draft" {
+		t.Fatalf("ob2 LatestStripeStatus = %v, want draft", ob2.LatestStripeStatus)
+	}
+
+	// 2. Stripe finalizes invoice 2 -> webhook invoice.finalized
+	mock.mu.Lock()
+	if inv, ok := mock.invoicesByID[invID2]; ok {
+		inv["status"] = "open"
+		inv["amount_remaining"] = int64(20833)
+	}
+	mock.mu.Unlock()
+
+	postWebhook("evt_inv2_finalized", "invoice.finalized", invID2)
+	svc.DrainForTest(t.Context())
+
+	db.First(&ob2, ob2.ID)
+	if ob2.LatestStripeStatus == nil || *ob2.LatestStripeStatus != "open" {
+		t.Fatalf("after invoice.finalized: ob2 status = %v, want open", ob2.LatestStripeStatus)
+	}
+	if ob2.AmountRemainingCents != 20833 {
+		t.Fatalf("after invoice.finalized: remaining = %d, want 20833", ob2.AmountRemainingCents)
+	}
+
+	// 3. Recurring payment succeeds -> webhook invoice.paid
+	paidTime := ob2.DueAt.Unix()
+	mock.mu.Lock()
+	if inv, ok := mock.invoicesByID[invID2]; ok {
+		inv["status"] = "paid"
+		inv["amount_paid"] = int64(20833)
+		inv["amount_remaining"] = int64(0)
+		inv["status_transitions"] = map[string]any{"paid_at": paidTime}
+	}
+	mock.mu.Unlock()
+
+	postWebhook("evt_inv2_paid", "invoice.paid", invID2)
+	svc.DrainForTest(t.Context())
+
+	db.First(&ob2, ob2.ID)
+	if ob2.LatestStripeStatus == nil || *ob2.LatestStripeStatus != "paid" {
+		t.Fatalf("after invoice.paid: ob2 status = %v, want paid", ob2.LatestStripeStatus)
+	}
+	if ob2.AmountRemainingCents != 0 {
+		t.Fatalf("after invoice.paid: remaining = %d, want 0", ob2.AmountRemainingCents)
+	}
+	if ob2.AmountPaidCents != 20833 {
+		t.Fatalf("after invoice.paid: paid = %d, want 20833", ob2.AmountPaidCents)
+	}
+	if ob2.FirstSettledAt == nil || ob2.FirstSettledAt.Unix() != paidTime {
+		t.Fatalf("after invoice.paid: FirstSettledAt = %v, want unix %d", ob2.FirstSettledAt, paidTime)
+	}
+
+	var payment billing.Payment
+	if err := db.Where("contract_id = ? AND id = ?", contract.ID, "pi_"+invID2).First(&payment).Error; err != nil {
+		t.Fatalf("expected billing_payment row for %s: %v", invID2, err)
+	}
+	if payment.ID != "pi_"+invID2 {
+		t.Fatalf("payment ID = %s, want %s", payment.ID, "pi_"+invID2)
+	}
+
+	// 4. Test idempotency: replay same invoice.paid webhook
+	postWebhook("evt_inv2_paid_replay", "invoice.paid", invID2)
+	svc.DrainForTest(t.Context())
+
+	var paymentCount int64
+	db.Model(&billing.Payment{}).Where("contract_id = ?", contract.ID).Count(&paymentCount)
+	if paymentCount != 2 { // 1 from checkout, 1 from recurring payment
+		t.Fatalf("replayed webhook changed payment count: count = %d, want 2", paymentCount)
+	}
+
+	// 5. Test recurring payment failure on installment 3
+	invID3 := *ob3.StripeInvoiceID
+	mock.mu.Lock()
+	if inv, ok := mock.invoicesByID[invID3]; ok {
+		inv["status"] = "open"
+		inv["attempted"] = true
+		inv["amount_remaining"] = int64(20833)
+	}
+	mock.mu.Unlock()
+
+	postWebhook("evt_inv3_failed", "invoice.payment_failed", invID3)
+	svc.DrainForTest(t.Context())
+
+	db.First(&ob3, ob3.ID)
+	if !ob3.FailureOrActionRequired {
+		t.Fatalf("after invoice.payment_failed: expected FailureOrActionRequired = true")
+	}
+	if ob3.LatestStripeStatus == nil || *ob3.LatestStripeStatus != "open" {
+		t.Fatalf("after invoice.payment_failed: status = %v, want open", ob3.LatestStripeStatus)
+	}
+
+	// 6. Verify Overview figures
+	overview, err := svc.Overview(t.Context(), now.Add(6*time.Minute), 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("Overview: %v", err)
+	}
+	if overview.CollectedCents != 41668 { // 20834 (checkout) + 20834 (mock pi #2)
+		t.Fatalf("CollectedCents = %d, want 41668", overview.CollectedCents)
+	}
+	if overview.OutstandingCents != 20833 { // installment #3 still remaining
+		t.Fatalf("OutstandingCents = %d, want 20833", overview.OutstandingCents)
+	}
+	if overview.FailedInstallments != 1 { // installment #3 failed
+		t.Fatalf("FailedInstallments = %d, want 1", overview.FailedInstallments)
+	}
+}
+
+func TestRefundsAndFraudSignalsSurfaceWithoutWebhook(t *testing.T) {
+	paidAt := time.Date(2026, time.November, 15, 4, 0, 0, 0, time.UTC)
+	mock := newWorkerMockServer(paidAt, 60000)
+	allModels := append([]any{&links.Link{}, &students.Student{}}, billing.Models()...)
+	db := testdb.Open(t, allModels...)
+
+	tokenHash := make([]byte, 32)
+	rand.Read(tokenHash)
+	now := time.Now().UTC()
+	link := links.Link{
+		TokenHash: tokenHash,
 		Details: students.Details{
 			Name:  "Financial Student",
 			Email: "fin@example.com",
 		},
-		IsActive: true,
+		CreatedAt:   now,
+		SubmittedAt: &now,
+		PaidAt:      &now,
+		ExpiresAt:   now.Add(7 * 24 * time.Hour),
+	}
+	if err := db.Create(&link).Error; err != nil {
+		t.Fatalf("create link: %v", err)
+	}
+	student := students.Student{
+		SourceLinkHash: tokenHash,
+		Details:        link.Details,
+		IsActive:       true,
+		Cohort:         "2026-11",
 	}
 	if err := db.Create(&student).Error; err != nil {
 		t.Fatalf("create student: %v", err)
 	}
 	cusID := "cus_worker_test"
 	contract := billing.Contract{
-		StudentID:        student.ID,
+		SourceLinkHash:   tokenHash,
 		Reference:        rand.Text(),
 		PlanID:           "full",
 		PlanName:         "Pago Único",
@@ -560,7 +839,6 @@ func TestRefundsAndFraudSignalsSurfaceWithoutWebhook(t *testing.T) {
 		StripeCustomerID: &cusID,
 	}
 	db.Create(&contract)
-
 	chID := "ch_mock_1"
 	payment := billing.Payment{
 		ID:                 "pi_worker_test",
@@ -665,31 +943,38 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 	paidAt := time.Date(2026, time.November, 15, 4, 0, 0, 0, time.UTC)
 	mock := newWorkerMockServer(paidAt, 20834)
 
-	allModels := append([]any{&students.Student{}}, billing.Models()...)
+	allModels := append([]any{&links.Link{}, &students.Student{}}, billing.Models()...)
 	db := testdb.Open(t, allModels...)
 
 	svc := billingtest.New(t, db, mock.mux)
 
 	now := time.Now().UTC()
 
-	// Helper to create student, contract
+	// Helper to create link, student, contract
 	setupStudent := func(name, email string) (students.Student, billing.Contract) {
 		tokenHash := make([]byte, 32)
 		rand.Read(tokenHash)
+		link := links.Link{
+			TokenHash: tokenHash,
+			Details:   students.Details{Name: name, Email: email},
+			CreatedAt: now, SubmittedAt: &now, PaidAt: &now,
+			ExpiresAt: now.Add(7 * 24 * time.Hour),
+		}
+		if err := db.Create(&link).Error; err != nil {
+			t.Fatal(err)
+		}
 		student := students.Student{
 			SourceLinkHash: tokenHash,
-			Details: students.Details{
-				Name:  name,
-				Email: email,
-			},
-			IsActive: true,
+			Details:        link.Details,
+			IsActive:       true,
+			Cohort:         "2026-11",
 		}
 		if err := db.Create(&student).Error; err != nil {
 			t.Fatal(err)
 		}
 		cusID := "cus_worker_" + rand.Text()[:8]
 		contract := billing.Contract{
-			StudentID:        student.ID,
+			SourceLinkHash:   tokenHash,
 			Reference:        rand.Text(),
 			PlanID:           "three",
 			PlanName:         "Plan de 3 Pagos Mensuales",
@@ -946,7 +1231,7 @@ func TestSuspensionAndReinstatement(t *testing.T) {
 
 func TestWorkerSyncsCustomerContact(t *testing.T) {
 	mock := newMockStripeServer()
-	db, svc, tokenHash, studentID := setupTestEnvironment(t, mock)
+	db, svc, tokenHash, _ := setupTestEnvironment(t, mock)
 	ctx := context.Background()
 
 	// Start checkout creates the customer in Stripe and stamps synced columns
@@ -959,7 +1244,7 @@ func TestWorkerSyncsCustomerContact(t *testing.T) {
 	}
 
 	var c billing.Contract
-	if err := db.Where("student_id = ?", studentID).Take(&c).Error; err != nil {
+	if err := db.Where("source_link_hash = ?", tokenHash).Take(&c).Error; err != nil {
 		t.Fatalf("take contract: %v", err)
 	}
 	if c.StripeCustomerID == nil || *c.StripeCustomerID == "" {
@@ -970,7 +1255,7 @@ func TestWorkerSyncsCustomerContact(t *testing.T) {
 	}
 
 	// 1. Unchanged student => drain produces 0 customer updates
-	svc.TouchContractForStudent(ctx, studentID)
+	svc.TouchContract(ctx, tokenHash)
 	svc.DrainForTest(ctx)
 	mock.with(func() {
 		if len(mock.customerUpdates) != 0 {
@@ -978,14 +1263,12 @@ func TestWorkerSyncsCustomerContact(t *testing.T) {
 		}
 	})
 
-	// 2. Staff changes student email through students.Store.UpdateField
-	// Contract is unfunded, but customer syncs durable to Stripe
-	roster := students.New(db, nil)
-	if _, err := roster.UpdateField(ctx, studentID, "email", "maria.updated@example.com"); err != nil {
-		t.Fatalf("UpdateField: %v", err)
+	// 2. Customer changes email on the link before funding
+	// Contract is unfunded, but customer syncs durable to Stripe from the Link
+	if err := db.Model(&links.Link{}).Where("token_hash = ?", tokenHash).Update("email", "maria.updated@example.com").Error; err != nil {
+		t.Fatalf("update link: %v", err)
 	}
-	svc.TouchContractForStudent(ctx, studentID)
-
+	svc.TouchContract(ctx, tokenHash)
 	// One worker drain records exactly one customer update with new email
 	svc.DrainForTest(ctx)
 	var updates []customerUpdate
@@ -1009,10 +1292,10 @@ func TestWorkerSyncsCustomerContact(t *testing.T) {
 	}
 
 	// 3. Mock fails update => contract stamp stays old and next drain succeeds
-	if _, err := roster.UpdateField(ctx, studentID, "name", "Maria Rivera"); err != nil {
-		t.Fatalf("UpdateField name: %v", err)
+	if err := db.Model(&links.Link{}).Where("token_hash = ?", tokenHash).Update("name", "Maria Rivera").Error; err != nil {
+		t.Fatalf("update link name: %v", err)
 	}
-	svc.TouchContractForStudent(ctx, studentID)
+	svc.TouchContract(ctx, tokenHash)
 	mock.with(func() {
 		mock.customerUpdateError = true
 	})
@@ -1030,7 +1313,7 @@ func TestWorkerSyncsCustomerContact(t *testing.T) {
 	mock.with(func() {
 		mock.customerUpdateError = false
 	})
-	svc.TouchContractForStudent(ctx, studentID)
+	svc.TouchContract(ctx, tokenHash)
 	svc.DrainForTest(ctx)
 
 	// Next drain succeeded

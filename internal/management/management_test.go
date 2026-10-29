@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -191,7 +192,7 @@ func (a *app) list(t *testing.T) []links.Entry {
 
 func contactDetails(name string) students.Details {
 	return students.Details{
-		Name: name, Email: "private.student@example.com", Phone: "+12025550123", Municipality: "San Juan",
+		Name: name, Email: "private.student@example.com", Phone: "+12025550123", Municipality: "San Juan", Gender: "Female",
 	}
 }
 
@@ -334,9 +335,22 @@ func TestUnauthorizedRequestsCannotUseManagement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := a.store.Submit(t.Context(), existing.Token, contactDetails("Private student")); err != nil || saved != links.Saved {
+	if saved, err := a.store.Submit(t.Context(), existing.Token, contactDetails("Private student"), ""); err != nil || saved != links.Saved {
 		t.Fatalf("submit private student: saved=%v, err=%v", saved, err)
 	}
+	acceptAgreement(t, a, existing.Token)
+	seeded, err := settings.New(a.db).Current(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, _ := hex.DecodeString(existing.ID)
+	now := time.Now().UTC()
+	if err := a.db.WithContext(t.Context()).Transaction(func(tx *gorm.DB) error {
+		return links.Enroll(tx, hash, now)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	existing.PaidAt = &now
 	existing.Name, existing.Phone, existing.Status = "Private student", contactDetails("").Phone, links.Finished
 	expired := a.signIn(t, "staff")
 	// Expiry is enforced from the session row, so moving it into the past needs no sleep.
@@ -417,8 +431,9 @@ func TestUnauthorizedRequestsCannotUseManagement(t *testing.T) {
 		}
 	}
 	current, err := settings.New(a.db).Current(t.Context())
-	if err != nil || current.ProgramStartDate != "" || current.LinkLifetimeDays != settings.DefaultLinkLifetimeDays {
-		t.Fatalf("unauthorized request changed settings: current=%+v, err=%v", current, err)
+	if err != nil || current.ProgramStartDate != seeded.ProgramStartDate || !current.UpdatedAt.Equal(seeded.UpdatedAt) ||
+		current.LinkLifetimeDays != settings.DefaultLinkLifetimeDays {
+		t.Fatalf("unauthorized request changed settings: current=%+v, seeded=%+v, err=%v", current, seeded, err)
 	}
 }
 
@@ -436,7 +451,7 @@ func TestRegistrySeparatesTrash(t *testing.T) {
 		{"not opened", links.Link{ExpiresAt: later}, links.NotOpened, false},
 		{"opened", links.Link{ExpiresAt: later, OpenedAt: &past}, links.Opened, false},
 		{"in progress", links.Link{ExpiresAt: later, Details: contactDetails("Draft")}, links.InProgress, false},
-		{"completed", links.Link{ExpiresAt: past.Add(7 * 24 * time.Hour), Details: contactDetails("Completed student"), SubmittedAt: &past}, links.Finished, false},
+		{"completed", links.Link{ExpiresAt: past.Add(7 * 24 * time.Hour), Details: contactDetails("Completed student"), SubmittedAt: &past, PaidAt: &past}, links.Finished, false},
 		{"expired draft", links.Link{ExpiresAt: past, Details: contactDetails("Expired draft")}, links.Expired, true},
 		{"canceled draft", links.Link{ExpiresAt: later, Details: contactDetails("Canceled draft"), CanceledAt: &past, CanceledBy: "staff"}, links.Canceled, true},
 	} {
@@ -446,14 +461,14 @@ func TestRegistrySeparatesTrash(t *testing.T) {
 			t.Fatal(err)
 		}
 		if tc.row.SubmittedAt != nil {
-			student := students.Student{SourceLinkHash: digest[:], Details: tc.row.Details, CreatedAt: *tc.row.SubmittedAt}
+			student := students.Student{SourceLinkHash: digest[:], Details: tc.row.Details, CreatedAt: *tc.row.SubmittedAt, Cohort: "2026-11"}
 			if err := a.db.WithContext(t.Context()).Create(&student).Error; err != nil {
 				t.Fatal(err)
 			}
 		}
 		entry := links.Entry{
 			ID: fmt.Sprintf("%x", digest), Name: tc.row.Name, Phone: tc.row.Phone, Status: tc.status,
-			ExpiresAt: tc.row.ExpiresAt, SubmittedAt: tc.row.SubmittedAt, CreatedBy: tc.row.CreatedBy, CanceledBy: tc.row.CanceledBy,
+			ExpiresAt: tc.row.ExpiresAt, SubmittedAt: tc.row.SubmittedAt, PaidAt: tc.row.PaidAt, CreatedBy: tc.row.CreatedBy, CanceledBy: tc.row.CanceledBy,
 		}
 		all = append(all, entry)
 		if tc.trash {
@@ -494,7 +509,7 @@ func TestRegistryProjectsNewAndRefreshedRows(t *testing.T) {
 	details := contactDetails("Registry student")
 	details.Email, details.Municipality = "private.registry@example.com", "Loíza"
 	for _, field := range students.Fields() {
-		if saved, err := a.store.SaveDraft(t.Context(), created.Token, field.Key, field.Value(details)); err != nil || saved != links.Saved {
+		if saved, err := a.store.SaveDraft(t.Context(), created.Token, field.Key, valueOf(field, details)); err != nil || saved != links.Saved {
 			t.Fatalf("save registry fixture %s: saved=%v, err=%v", field.Key, saved, err)
 		}
 	}
@@ -556,20 +571,22 @@ func TestRegistryArchivesCompletedSubmissions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if saved, err := a.store.Submit(t.Context(), created.Token, contactDetails(fixture.name)); err != nil || saved != links.Saved {
+		if saved, err := a.store.Submit(t.Context(), created.Token, contactDetails(fixture.name), ""); err != nil || saved != links.Saved {
 			t.Fatalf("submit %s: saved=%v, err=%v", fixture.name, saved, err)
 		}
+		acceptAgreement(t, a, created.Token)
 		submitted := now.Add(-fixture.submittedAge)
+		digest, _ := hex.DecodeString(created.ID)
 		if err := a.db.WithContext(t.Context()).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Model(&links.Link{}).Where("token_hash = decode(?, 'hex')", created.ID).
-				Updates(map[string]any{
-					"created_at": now.Add(-fixture.createdAge), "submitted_at": submitted,
-					"expires_at": submitted.Add(7 * 24 * time.Hour),
-				}).Error; err != nil {
+			if err := links.Enroll(tx, digest, submitted); err != nil {
 				return err
 			}
-			return tx.Model(&students.Student{}).Where("source_link_hash = decode(?, 'hex')", created.ID).
-				Update("created_at", submitted).Error
+			return tx.Model(&links.Link{}).Where("token_hash = ?", digest).
+				Updates(map[string]any{
+					"created_at": now.Add(-fixture.createdAge), "submitted_at": submitted,
+					"paid_at": submitted,
+					"expires_at": submitted.Add(7 * 24 * time.Hour),
+				}).Error
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -656,14 +673,14 @@ func TestStaffShareLinkStatuses(t *testing.T) {
 	}
 
 	if !t.Run("shared customer statuses", func(t *testing.T) {
-		if saved, err := a.store.Submit(t.Context(), firstToken, contactDetails("Ana Pérez")); err != nil || saved != links.Saved {
+		if saved, err := a.store.Submit(t.Context(), firstToken, contactDetails("Ana Pérez"), ""); err != nil || saved != links.Saved {
 			t.Fatalf("submit name: saved=%v, err=%v", saved, err)
 		}
 		if link, err := a.store.Open(t.Context(), secondToken); err != nil || link == nil {
 			t.Fatalf("open link: link=%v, err=%v", link, err)
 		}
 		entries = a.list(t)
-		if entries[0].Status != links.Finished || entries[0].Name != "Ana Pérez" || entries[1].Status != links.Opened {
+		if entries[0].Status != links.AwaitingPayment || entries[0].Name != "Ana Pérez" || entries[1].Status != links.Opened {
 			t.Fatalf("submitted and opened customer statuses: %+v", entries)
 		}
 		for name, browser := range map[string]*http.Client{"admin": admin, "worker": worker} {
@@ -942,7 +959,7 @@ func TestProgramStartDateSavesWithoutChangingExistingEnrollment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := a.store.Submit(t.Context(), enrolled.Token, contactDetails("Accepted student")); err != nil || saved != links.Saved {
+	if saved, err := a.store.Submit(t.Context(), enrolled.Token, contactDetails("Accepted student"), ""); err != nil || saved != links.Saved {
 		t.Fatalf("submit: saved=%v, err=%v", saved, err)
 	}
 	accepted, err := a.store.AcceptTerms(t.Context(), enrolled.Token, "2026-12-01")
@@ -1078,7 +1095,7 @@ func TestManagementBillingRoutes(t *testing.T) {
 	seedContract := func(student students.Student, funded *time.Time) billing.Contract {
 		t.Helper()
 		contract := billing.Contract{
-			StudentID: student.ID, Reference: rand.Text(), PlanID: "three", PlanName: planName,
+			SourceLinkHash: student.SourceLinkHash, Reference: rand.Text(), PlanID: "three", PlanName: planName,
 			InstallmentCount: 3, TotalCents: 62500, FundedAt: funded,
 			StripeCustomerID:    ptr(fmt.Sprintf("cus_%d", student.ID)),
 			SyncedCustomerName:  student.Name,

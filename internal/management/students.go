@@ -44,11 +44,11 @@ type studentPageData struct {
 // studentDisplay evaluates the field registry once for each rendered student.
 // The same values feed table rows, detail fields, and saved-field responses.
 func studentDisplay(record students.Student, modal bool) studentView {
-	fields := students.Fields()
+	fields := students.StaffFields()
 	view := studentView{Student: record, Fields: make([]studentFieldView, len(fields))}
 	for i, field := range fields {
 		view.Fields[i] = studentFieldView{
-			Field: field, StudentID: record.ID, Value: field.Value(record.Details), Modal: modal,
+			Field: field, StudentID: record.ID, Value: field.Value(record), Modal: modal,
 		}
 	}
 	return view
@@ -145,7 +145,7 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 			http.Error(w, "Could not load students. Please try again.", http.StatusInternalServerError)
 			return
 		}
-		data := studentPageData{Staff: staff(r.Context()), Fields: students.Fields(), Status: status, Students: make([]studentView, len(records))}
+		data := studentPageData{Staff: staff(r.Context()), Fields: students.StaffFields(), Status: status, Students: make([]studentView, len(records))}
 		for i, record := range records {
 			data.Students[i] = studentDisplay(record, false)
 		}
@@ -181,7 +181,7 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 	fieldHandler := func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		field, ok := students.FindField(r.PathValue("field"))
+		field, ok := students.FindStaffField(r.PathValue("field"))
 		if !ok {
 			notFound(w)
 			return
@@ -224,7 +224,7 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 				notFound(w)
 				return
 			default:
-				biller.TouchContractForStudent(ctx, record.ID)
+				biller.TouchContract(ctx, record.SourceLinkHash)
 				if !partial {
 					path := "/management/students/" + strconv.FormatUint(record.ID, 10) + "?saved=" + url.QueryEscape(field.Key)
 					http.Redirect(w, r, path, http.StatusSeeOther)

@@ -456,6 +456,10 @@ button.management-button-danger:enabled:hover {
   color: var(--warn);
 }
 
+.management-link-status[data-status="Awaiting payment"] {
+  color: var(--warn);
+}
+
 .management-link-status[data-status="Finished"] {
   color: var(--ok);
 }

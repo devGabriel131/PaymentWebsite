@@ -10,8 +10,9 @@ export const intEnv = (key, fallback) => (__ENV[key] ? parseInt(__ENV[key], 10) 
 export const OFFSET = intEnv('OFFSET', 0);
 export const COUNT = intEnv('COUNT', Infinity);
 
-// Field order of the form; keys match students.Fields() and the /draft/{field} route.
-export const FIELDS = ['name', 'date_of_birth', 'email', 'phone', 'municipality'];
+// Draftable fields in form order; keys match students.Fields() and the /draft/{field} route.
+// The PIN is not one: it is never autosaved, only sent with the final submit.
+export const FIELDS = ['name', 'date_of_birth', 'gender', 'email', 'phone', 'municipality'];
 export const PLANS = ['full', 'three', 'six']; // internal/payments/plans.go IDs
 
 export const baseOptions = {
@@ -28,14 +29,17 @@ export const tokenAt = (tokens, i) => (i < COUNT ? tokens[OFFSET + i] : undefine
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
 export const randomToken = () => Array.from({ length: 43 }, () => B64[Math.floor(Math.random() * 64)]).join('');
 
-// All values are valid per internal/students/fields.go; email_confirm is only used by the final submit.
+// All values are valid per internal/students/fields.go; email_confirm and pin are only used by the final submit.
+// PINs must be unique across the database, so the token index makes each one: keep OFFSET slices disjoint.
 export const formValues = (idx) => ({
   name: 'María José Pérez Rivera',
   date_of_birth: '2000-01-15',
+  gender: 'Female',
   email: `k6.${idx}@example.com`,
   email_confirm: `k6.${idx}@example.com`,
   phone: '(787) 234-5678',
   municipality: 'Río Grande',
+  pin: String(100000 + idx),
 });
 
 // application/x-www-form-urlencoded; an array value repeats the key.

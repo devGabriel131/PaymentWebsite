@@ -3,7 +3,6 @@ package management
 import (
 	"context"
 	"embed"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"html/template"
@@ -87,26 +86,6 @@ func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Sto
 		data.Links = slices.DeleteFunc(data.Links, func(e links.Entry) bool {
 			return e.Trashed() != data.Trash || !data.Trash && e.Archived(now)
 		})
-		hashes := make([][]byte, 0, len(data.Links))
-		for _, e := range data.Links {
-			if e.SubmittedAt == nil {
-				continue
-			}
-			if hash, err := hex.DecodeString(e.ID); err == nil {
-				hashes = append(hashes, hash)
-			}
-		}
-		if len(hashes) > 0 {
-			if times, err := biller.FundedTimes(ctx, hashes); err != nil {
-				logging.RecordError(r, "load", err) // paid times are optional; the registry still renders
-			} else {
-				for i := range data.Links {
-					if t, ok := times[data.Links[i].ID]; ok {
-						data.Links[i].PaidAt = &t
-					}
-				}
-			}
-		}
 		if created != nil {
 			for i := range data.Links {
 				if data.Links[i].ID == created.ID {

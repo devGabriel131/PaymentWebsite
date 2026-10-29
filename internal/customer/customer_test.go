@@ -111,20 +111,23 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 		{"email normalization", "email", " Ada+draft@EXAMPLE.com ", "Ada+draft@example.com", http.StatusOK},
 		{"phone normalization", "phone", "(787) 234-5678", "+17872345678", http.StatusOK},
 		{"municipality", "municipality", " Bayamón ", "Bayamón", http.StatusOK},
+		{"gender", "gender", " Female ", "Female", http.StatusOK},
 		{"invalid name", "name", "<script>alert(1)</script>", "Ana", http.StatusUnprocessableEntity},
 		{"invalid email", "email", "invalid", "Ada+draft@example.com", http.StatusUnprocessableEntity},
 		{"invalid phone", "phone", "123", "+17872345678", http.StatusUnprocessableEntity},
 		{"forged municipality", "municipality", "Atlantis", "Bayamón", http.StatusUnprocessableEntity},
+		{"forged gender", "gender", "Other", "Female", http.StatusUnprocessableEntity},
 		{"clear name", "name", "", "", http.StatusOK},
 		{"clear email", "email", "", "", http.StatusOK},
 		{"clear phone", "phone", "", "", http.StatusOK},
 		{"clear municipality", "municipality", "", "", http.StatusOK},
+		{"clear gender", "gender", "", "", http.StatusOK},
 	}
 	for i, step := range steps {
 		t.Run(step.name, func(t *testing.T) {
 			// Unrelated parameters must not be parsed or written by this draft.
 			form := url.Values{"name": {"Bad <name>"}, "email": {"invalid"}, "phone": {"invalid"},
-				"municipality": {"invalid"}, "email_confirm": {"never persisted"}}
+				"municipality": {"invalid"}, "gender": {"invalid"}, "pin": {"invalid"}, "email_confirm": {"never persisted"}}
 			form.Set(step.key, step.raw)
 			w := customerRequest(t, f.mux, http.MethodPost, f.path+"/draft/"+step.key, form.Encode(), true)
 			if w.Code != step.code || strings.Contains(w.Body.String(), "<input") {
@@ -142,6 +145,8 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 				want.Phone = step.value
 			case "municipality":
 				want.Municipality = step.value
+			case "gender":
+				want.Gender = step.value
 			}
 			link := stored(t, f.db)[0]
 			if link.Details != want || link.SubmittedAt != nil || len(studentRecords(t, f.db)) != 0 {
@@ -172,11 +177,11 @@ func TestAutosaveKeepsDraftWithoutFinishing(t *testing.T) {
 		t.Fatalf("submit: status = %d, body %q", w.Code, w.Body.String())
 	}
 	requireAdvance(t, w, f.path+"/agreement", true, privateFormValues(final)...)
-	if enrolled := studentRecords(t, f.db); len(enrolled) != 1 || enrolled[0].Details != contactDetails("Ana Pérez") {
-		t.Fatalf("submit students = %+v", enrolled)
+	if enrolled := studentRecords(t, f.db); len(enrolled) != 0 {
+		t.Fatalf("submit students = %+v, want none", enrolled)
 	}
 	before := stored(t, f.db)
-	for _, suffix := range []string{"/draft/name", "/draft/email", "/draft/phone", "/draft/municipality"} {
+	for _, suffix := range []string{"/draft/name", "/draft/email", "/draft/phone", "/draft/municipality", "/draft/gender"} {
 		key := strings.TrimPrefix(suffix, "/draft/")
 		w := customerRequest(t, f.mux, http.MethodPost, f.path+suffix, url.Values{key: {""}}.Encode(), true)
 		if w.Code != http.StatusConflict || w.Header().Get("HX-Refresh") != "true" {
@@ -251,15 +256,11 @@ func TestCompletedAccessAndReplay(t *testing.T) {
 	const submittedName = "Submission snapshot"
 	const canonicalName = "Edited student name"
 	// Submit directly so replay must not even fill in the absent first-visit time.
-	if saved, err := f.store.Submit(t.Context(), f.entry.Token, contactDetails(submittedName)); err != nil || saved != links.Saved {
+	if saved, err := f.store.Submit(t.Context(), f.entry.Token, contactDetails(submittedName), ""); err != nil || saved != links.Saved {
 		t.Fatalf("submit: saved=%v, err=%v", saved, err)
 	}
-	enrolled := studentRecords(t, f.db)
-	if len(enrolled) != 1 {
-		t.Fatalf("students = %+v, want one", enrolled)
-	}
-	if _, err := students.New(f.db, nil).UpdateField(t.Context(), enrolled[0].ID, "name", canonicalName); err != nil {
-		t.Fatal(err)
+	if enrolled := studentRecords(t, f.db); len(enrolled) != 0 {
+		t.Fatalf("students = %+v, want none", enrolled)
 	}
 	before, studentsBefore := stored(t, f.db), studentRecords(t, f.db)
 	replay := contactForm("Replacement private")
@@ -404,7 +405,7 @@ func TestHeadChecksLinkWithoutChangingIt(t *testing.T) {
 	}
 
 	// A submitted link still opens read-only: HEAD answers 200, not the 409 that locks edits.
-	if saved, err := f.store.Submit(t.Context(), f.entry.Token, contactDetails("Ana Pérez")); err != nil || saved != links.Saved {
+	if saved, err := f.store.Submit(t.Context(), f.entry.Token, contactDetails("Ana Pérez"), ""); err != nil || saved != links.Saved {
 		t.Fatalf("submit: saved=%v, err=%v", saved, err)
 	}
 	headKeeps(t, f.db, server, f.path, http.StatusOK)
@@ -573,25 +574,26 @@ func TestFinalValidationAndEmailConfirmation(t *testing.T) {
 	valid.Set("municipality", " Bayamón ")
 	w := customerRequest(t, f.mux, http.MethodPost, f.path, valid.Encode(), false)
 	requireAdvance(t, w, f.path+"/agreement", false, privateFormValues(valid)...)
-	want := students.Details{Name: "María Pérez", Email: "Ada+private@example.com", Phone: "+12025550123", Municipality: "Bayamón", DateOfBirth: "2005-06-15"}
+	want := students.Details{Name: "María Pérez", Email: "Ada+private@example.com", Phone: "+12025550123", Municipality: "Bayamón", DateOfBirth: "2005-06-15", Gender: "Female"}
 	link, enrolled := stored(t, f.db)[0], studentRecords(t, f.db)
-	if link.Details != want || len(enrolled) != 1 || enrolled[0].Details != want {
+	if link.Details != want || len(enrolled) != 0 {
 		t.Fatalf("completion did not copy all normalized fields: link %+v, students %+v", link, enrolled)
 	}
 }
 
 func contactDetails(name string) students.Details {
-	return students.Details{Name: name, Email: "Ada+private@example.com", Phone: "+17872345678", Municipality: "San Juan", DateOfBirth: "2005-06-15"}
+	return students.Details{Name: name, Email: "Ada+private@example.com", Phone: "+17872345678", Municipality: "San Juan", DateOfBirth: "2005-06-15", Gender: "Female"}
 }
 
 func detailsForm(details students.Details) url.Values {
 	return url.Values{"name": {details.Name}, "email": {details.Email}, "email_confirm": {""},
-		"phone": {details.Phone}, "municipality": {details.Municipality}, "date_of_birth": {details.DateOfBirth}}
+		"phone": {details.Phone}, "municipality": {details.Municipality}, "date_of_birth": {details.DateOfBirth}, "gender": {details.Gender}}
 }
 
 func contactForm(name string) url.Values {
 	form := detailsForm(contactDetails(name))
 	form.Set("email_confirm", form.Get("email"))
+	form.Set("pin", "123456")
 	return form
 }
 
@@ -917,7 +919,7 @@ func TestContactEditFlowAndBackNavigation(t *testing.T) {
 	initial.Email = "original@example.com"
 	initial.Phone = "+17875551111"
 	initial.Municipality = "Ponce"
-	res, err := f.store.Submit(t.Context(), f.entry.Token, initial)
+	res, err := f.store.Submit(t.Context(), f.entry.Token, initial, "")
 	if err != nil || res != links.Saved {
 		t.Fatalf("submit: %v, %v", res, err)
 	}
@@ -964,6 +966,7 @@ func TestContactEditFlowAndBackNavigation(t *testing.T) {
 		"phone":         {"+17875551111"},
 		"municipality":  {"Ponce"},
 		"date_of_birth": {"2005-06-15"},
+		"gender":        {"Female"},
 	}
 	w = customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", invalidForm.Encode(), false)
 	if w.Code != http.StatusUnprocessableEntity {
@@ -978,33 +981,34 @@ func TestContactEditFlowAndBackNavigation(t *testing.T) {
 		"phone":         {"+17875552222"},
 		"municipality":  {"San Juan"},
 		"date_of_birth": {"2004-05-14"},
+		"gender":        {"Female"},
 	}
 	w = customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", validForm.Encode(), false)
 	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != f.path+"/agreement" {
 		t.Fatalf("POST /edit: status %d, location %q; want redirect to /agreement", w.Code, w.Header().Get("Location"))
 	}
 
-	// Check DB: link row stays frozen at submission snapshot; only students row is updated
+	// Check DB: link row is updated with new contact details; no students row exists
 	link, err := f.store.Lookup(t.Context(), f.entry.Token)
 	if err != nil || link == nil {
 		t.Fatalf("lookup link: %v, %v", link, err)
 	}
-	if link.Name != "Original Student" || link.Email != "original@example.com" || link.Phone != "+17875551111" || link.Municipality != "Ponce" {
-		t.Fatalf("link snapshot should remain unchanged, got: %+v", link)
+	if link.Name != "Updated Student" || link.Email != "updated@example.com" || link.Phone != "+17875552222" || link.Municipality != "San Juan" {
+		t.Fatalf("link snapshot should be updated, got: %+v", link)
 	}
-	var student students.Student
-	if err := f.db.WithContext(t.Context()).Where("source_link_hash = ?", link.TokenHash).Take(&student).Error; err != nil {
-		t.Fatalf("find student: %v", err)
+	var studentCount int64
+	if err := f.db.Model(&students.Student{}).Count(&studentCount).Error; err != nil {
+		t.Fatalf("count students: %v", err)
 	}
-	if student.Name != "Updated Student" || student.Email != "updated@example.com" || student.Phone != "+17875552222" || student.Municipality != "San Juan" || student.DateOfBirth != "2004-05-14" {
-		t.Fatalf("student not updated: %+v", student)
+	if studentCount != 0 {
+		t.Fatalf("expected 0 students, got %d", studentCount)
 	}
 
 	// 3. Funded link:
 	// Create funded contract
 	fundedAt := time.Now().UTC()
 	contract := billing.Contract{
-		StudentID:        student.ID,
+		SourceLinkHash:   link.TokenHash,
 		Reference:        rand.Text(),
 		PlanID:           "full",
 		PlanName:         "Pago Único",
@@ -1061,7 +1065,7 @@ func TestContactEditGuardAndStaffPrecedence(t *testing.T) {
 	initial.Email = "staffixed@example.com"
 	initial.Municipality = "San Juan"
 	initial.DateOfBirth = "2005-06-15"
-	res, err := f.store.Submit(t.Context(), f.entry.Token, initial)
+	res, err := f.store.Submit(t.Context(), f.entry.Token, initial, "")
 	if err != nil || res != links.Saved {
 		t.Fatalf("submit: %v, %v", res, err)
 	}
@@ -1070,65 +1074,32 @@ func TestContactEditGuardAndStaffPrecedence(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var student students.Student
-	if err := f.db.WithContext(t.Context()).Where("source_link_hash = ?", link.TokenHash).Take(&student).Error; err != nil {
-		t.Fatalf("find student: %v", err)
-	}
-
-	// Staff updates student's phone in management roster
-	if _, err := students.New(f.db, nil).UpdateField(t.Context(), student.ID, "phone", "+17875559999"); err != nil {
-		t.Fatalf("roster update phone: %v", err)
-	}
-
-	// GET /edit displays the staff-updated phone (+17875559999) and blank email_confirm
-	w := customerRequest(t, f.mux, http.MethodGet, f.path+"/edit", "", false)
-	if w.Code != http.StatusOK {
-		t.Fatalf("GET /edit: %d", w.Code)
-	}
-	body := w.Body.String()
-	if !strings.Contains(body, "17875559999") {
-		t.Fatalf("GET /edit should show staff-updated phone: %s", body)
-	}
-	if !strings.Contains(body, `id="email_confirm"`) || !strings.Contains(body, `value=""`) {
-		t.Fatalf("GET /edit should have blank email_confirm value: %s", body)
-	}
-
 	// Customer submits POST /edit changing only date_of_birth
 	editForm := url.Values{
 		"name":          {"Staff Fixed"},
 		"email":         {"staffixed@example.com"},
 		"email_confirm": {"staffixed@example.com"},
-		"phone":         {"+17875559999"},
+		"phone":         {"+17875551111"},
 		"municipality":  {"San Juan"},
 		"date_of_birth": {"2004-01-01"},
+		"gender":        {"Female"},
 	}
-	w = customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", editForm.Encode(), false)
+	w := customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", editForm.Encode(), false)
 	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != f.path+"/agreement" {
 		t.Fatalf("POST /edit: %d, loc %s", w.Code, w.Header().Get("Location"))
 	}
 
-	// Verify student: phone is STILL staff's fix (+17875559999), DOB changed to 2004-01-01
-	if err := f.db.WithContext(t.Context()).Where("id = ?", student.ID).Take(&student).Error; err != nil {
-		t.Fatal(err)
-	}
-	if student.Phone != "+17875559999" {
-		t.Fatalf("student phone overwritten: %s, want +17875559999", student.Phone)
-	}
-	if student.DateOfBirth != "2004-01-01" {
-		t.Fatalf("student dob not updated: %s, want 2004-01-01", student.DateOfBirth)
-	}
-	// Link submission snapshot phone is STILL original (+17875551111)
 	link, err = f.store.Lookup(t.Context(), f.entry.Token)
 	if err != nil || link == nil {
 		t.Fatal(err)
 	}
-	if link.Phone != "+17875551111" {
-		t.Fatalf("link snapshot changed: %s, want +17875551111", link.Phone)
+	if link.DateOfBirth != "2004-01-01" {
+		t.Fatalf("link dob not updated: %s, want 2004-01-01", link.DateOfBirth)
 	}
 
 	// 2. In-flight and active attempt gate checks
 	contract := billing.Contract{
-		StudentID:        student.ID,
+		SourceLinkHash:   link.TokenHash,
 		Reference:        rand.Text(),
 		PlanID:           "full",
 		PlanName:         "Pago Único",
@@ -1178,15 +1149,16 @@ func TestContactEditGuardAndStaffPrecedence(t *testing.T) {
 			"phone":         {"+17875559999"},
 			"municipality":  {"San Juan"},
 			"date_of_birth": {"2000-01-01"},
+			"gender":        {"Female"},
 		}
 		w = customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", attemptForm.Encode(), false)
 		if w.Code != http.StatusSeeOther || w.Header().Get("Location") != f.path+"/payments" {
 			t.Fatalf("POST /edit in %s: %d, loc %s; want redirect to /payments", blockedState, w.Code, w.Header().Get("Location"))
 		}
-		var checkStudent students.Student
-		f.db.Where("id = ?", student.ID).Take(&checkStudent)
-		if checkStudent.Name != "Staff Fixed" || checkStudent.DateOfBirth != "2004-01-01" {
-			t.Fatalf("POST /edit during %s mutated student: %+v", blockedState, checkStudent)
+		var checkLink links.Link
+		f.db.Where("token_hash = ?", link.TokenHash).Take(&checkLink)
+		if checkLink.Name != "Staff Fixed" || checkLink.DateOfBirth != "2004-01-01" {
+			t.Fatalf("POST /edit during %s mutated link: %+v", blockedState, checkLink)
 		}
 	}
 
@@ -1227,6 +1199,7 @@ func TestContactEditGuardAndStaffPrecedence(t *testing.T) {
 			"phone":         {"+17875559999"},
 			"municipality":  {"San Juan"},
 			"date_of_birth": {"2002-02-02"},
+			"gender":        {"Female"},
 		}
 		cw := customerRequest(t, f.mux, http.MethodPost, f.path+"/edit", concurrentForm.Encode(), false)
 		editDone <- cw.Code
@@ -1247,8 +1220,8 @@ func TestContactEditGuardAndStaffPrecedence(t *testing.T) {
 	if code != http.StatusSeeOther {
 		t.Fatalf("concurrent POST /edit after unlock: %d; want 303", code)
 	}
-	f.db.Where("id = ?", student.ID).Take(&student)
-	if student.DateOfBirth != "2002-02-02" {
-		t.Fatalf("concurrent edit did not persist: %s", student.DateOfBirth)
+	f.db.Where("token_hash = ?", link.TokenHash).Take(&link)
+	if link.DateOfBirth != "2002-02-02" {
+		t.Fatalf("concurrent edit did not persist: %s", link.DateOfBirth)
 	}
 }

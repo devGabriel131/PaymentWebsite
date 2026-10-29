@@ -10,11 +10,19 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"gorm.io/gorm"
 
 	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
 )
+
+// pinSeq hands each enrolled test student its own PIN: the roster refuses duplicates.
+var pinSeq atomic.Int32
 
 func enrollStudent(t *testing.T, a *app, name string) (students.Student, links.Link) {
 	t.Helper()
@@ -22,12 +30,20 @@ func enrollStudent(t *testing.T, a *app, name string) (students.Student, links.L
 	if err != nil {
 		t.Fatal(err)
 	}
-	if saved, err := a.store.Submit(t.Context(), entry.Token, contactDetails(name)); err != nil || saved != links.Saved {
+	pin := fmt.Sprintf("%06d", 100000+pinSeq.Add(1))
+	if saved, err := a.store.Submit(t.Context(), entry.Token, contactDetails(name), pin); err != nil || saved != links.Saved {
 		t.Fatalf("enroll student: submitted = %v, error = %v", saved, err)
 	}
+	acceptAgreement(t, a, entry.Token)
 	hash, err := hex.DecodeString(entry.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := a.db.WithContext(t.Context()).Transaction(func(tx *gorm.DB) error {
+		return links.Enroll(tx, hash, now)
+	}); err != nil {
+		t.Fatalf("enroll student: %v", err)
 	}
 	var record students.Student
 	if err := a.db.WithContext(t.Context()).Where("source_link_hash = ?", hash).Take(&record).Error; err != nil {
@@ -38,6 +54,19 @@ func enrollStudent(t *testing.T, a *app, name string) (students.Student, links.L
 		t.Fatal(err)
 	}
 	return record, source
+}
+
+// acceptAgreement accepts token's submitted agreement, as checkout requires before Enroll;
+// the start date's month becomes the student's cohort.
+func acceptAgreement(t *testing.T, a *app, token string) {
+	t.Helper()
+	const programStart = "2026-11-10"
+	if err := settings.New(a.db).SetProgramStartDate(t.Context(), programStart, "staff"); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := a.store.AcceptTerms(t.Context(), token, programStart); err != nil || accepted == nil {
+		t.Fatalf("accept agreement: link=%+v, err=%v", accepted, err)
+	}
 }
 
 func requireStudentState(t *testing.T, a *app, original students.Student, source links.Link, other students.Student, details students.Details) {
@@ -73,8 +102,8 @@ func requireStudentRow(t *testing.T, body string, record students.Student) {
 		t.Fatalf("missing canonical student row %d: %s", record.ID, body)
 	}
 	previous := -1
-	for i, field := range students.Fields() {
-		cell := "<td>" + escapedHTML(field.Value(record.Details)) + "</td>"
+	for i, field := range students.StaffFields() {
+		cell := "<td>" + escapedHTML(field.Value(record)) + "</td>"
 		if i == 0 {
 			cell = ">" + escapedHTML(record.Name) + "</a>"
 		}
@@ -91,10 +120,15 @@ func requireStudentDetails(t *testing.T, body string, details students.Details) 
 	for _, field := range students.Fields() {
 		_, section, found := strings.Cut(body, "<h2>"+field.Label+"</h2>")
 		section, _, _ = strings.Cut(section, `<div class="student-field"`)
-		if !found || !strings.Contains(section, `<p class="student-field-value">`+escapedHTML(field.Value(details))+`</p>`) {
+		if !found || !strings.Contains(section, `<p class="student-field-value">`+escapedHTML(valueOf(field, details))+`</p>`) {
 			t.Fatalf("details omitted or misplaced canonical %s: %s", field.Key, body)
 		}
 	}
+}
+
+// valueOf reads a contact field from details alone: those fields need no other Student column.
+func valueOf(field students.Field, details students.Details) string {
+	return field.Value(students.Student{Details: details})
 }
 
 func requireStudentEditor(t *testing.T, body string, id uint64, key, value string) {
@@ -117,7 +151,7 @@ func requireStudentEditor(t *testing.T, body string, id uint64, key, value strin
 	}
 	if !strings.Contains(body, `<select id="`+inputID+`" name="value" required`) ||
 		strings.Contains(body, `<input id="`+inputID+`"`) ||
-		!strings.Contains(body, `<option value=""`) || !strings.Contains(body, ">Select a municipality</option>") ||
+		!strings.Contains(body, `<option value=""`) || !strings.Contains(body, ">Select an option</option>") ||
 		!strings.Contains(body, `<option value="`+escapedHTML(selected)+`" selected>`) ||
 		strings.Count(body, " selected") != 1 || strings.Count(body, "<option ") != len(field.Options)+1 {
 		t.Fatalf("native select lost stored/attempted selection: %s", body)
@@ -162,7 +196,7 @@ func TestStudentReadValidateSaveReload(t *testing.T) {
 		t.Fatalf("student archive: status = %d: %s", res.StatusCode, body)
 	}
 	previous := -1
-	for _, label := range []string{"Name", "Email", "Phone", "Municipality", "Submitted"} {
+	for _, label := range []string{"Name", "Email", "Phone", "Municipality", "Enrolled"} {
 		at := strings.Index(body, `<th scope="col">`+label+`</th>`)
 		if at < 0 || at <= previous {
 			t.Fatalf("missing or misplaced %s column: %s", label, body)
@@ -197,7 +231,7 @@ func TestStudentReadValidateSaveReload(t *testing.T) {
 				!strings.Contains(body, `hx-target="closest .student-field" hx-swap="outerHTML"`) {
 				t.Fatalf("standalone editor: status = %d: %s", res.StatusCode, body)
 			}
-			requireStudentEditor(t, body, original.ID, edit.key, field.Value(expected))
+			requireStudentEditor(t, body, original.ID, edit.key, valueOf(field, expected))
 			requireStudentState(t, a, original, source, other, expected)
 			res, body = a.send(t, staff, http.MethodGet, fieldPath, nil, nil)
 			if res.StatusCode != http.StatusOK || !strings.HasPrefix(body, "<!doctype html>") ||
@@ -278,7 +312,7 @@ func TestStudentValidationPreservesAttemptedValues(t *testing.T) {
 				}
 				if !partial {
 					for _, field := range students.Fields() {
-						if field.Key != tc.key && !strings.Contains(body, `<p class="student-field-value">`+escapedHTML(field.Value(original.Details))+`</p>`) {
+						if field.Key != tc.key && !strings.Contains(body, `<p class="student-field-value">`+escapedHTML(field.Value(original))+`</p>`) {
 							t.Fatalf("invalid %s lost canonical %s: %s", tc.key, field.Key, body)
 						}
 					}
@@ -324,10 +358,10 @@ func TestStudentHTMXFragmentsModalAndEscaping(t *testing.T) {
 					!strings.Contains(body, `href="`+cancel+`"`) || !strings.Contains(body, `hx-get="`+cancel+`"`) {
 					t.Fatalf("single editor modal=%t: status = %d: %s", modal, res.StatusCode, body)
 				}
-				requireStudentEditor(t, body, original.ID, edit.key, field.Value(expected))
+				requireStudentEditor(t, body, original.ID, edit.key, valueOf(field, expected))
 				res, body = a.send(t, staff, http.MethodGet, cancel, nil, htmxHeader)
 				if res.StatusCode != http.StatusOK || !strings.Contains(body, fieldID) ||
-					!strings.Contains(body, `<p class="student-field-value">`+escapedHTML(field.Value(expected))+`</p>`) ||
+					!strings.Contains(body, `<p class="student-field-value">`+escapedHTML(valueOf(field, expected))+`</p>`) ||
 					strings.Contains(body, "student-field-editor") || strings.Contains(body, "hx-swap-oob") || strings.Contains(body, "student-heading") {
 					t.Fatalf("cancel field modal=%t: status = %d: %s", modal, res.StatusCode, body)
 				}
@@ -341,7 +375,7 @@ func TestStudentHTMXFragmentsModalAndEscaping(t *testing.T) {
 				}
 				res, body = a.send(t, staff, http.MethodPost, fieldPath+query, form, htmxHeader)
 				if res.StatusCode != http.StatusOK || !strings.Contains(body, fieldID) ||
-					!strings.Contains(body, `<p class="student-field-value">`+escapedHTML(field.Value(edit.want))+`</p>`) ||
+					!strings.Contains(body, `<p class="student-field-value">`+escapedHTML(valueOf(field, edit.want))+`</p>`) ||
 					!strings.Contains(body, `role="status">Saved.`) || strings.Contains(body, "<!doctype html>") ||
 					strings.Contains(body, "student-heading") || strings.Contains(body, "student-field-editor") {
 					t.Fatalf("HTMX save modal=%t: status = %d: %s", modal, res.StatusCode, body)
@@ -366,7 +400,7 @@ func TestStudentHTMXFragmentsModalAndEscaping(t *testing.T) {
 				!strings.Contains(body, "Back to students") {
 				t.Fatalf("presentation flag must not turn fallback into dialog: status = %d: %s", res.StatusCode, body)
 			}
-			requireStudentEditor(t, body, original.ID, edit.key, field.Value(expected))
+			requireStudentEditor(t, body, original.ID, edit.key, valueOf(field, expected))
 		})
 	}
 	res, body = a.send(t, staff, http.MethodGet, path, nil, nil)
@@ -522,5 +556,96 @@ func TestStudentEmptyAndDatabaseFailures(t *testing.T) {
 				t.Fatalf("failed database read %s %s: status = %d: %s", tc.method, tc.path, res.StatusCode, body)
 			}
 		}
+	}
+}
+
+// Staff see a student's PIN and may change it, but never onto another student's.
+func TestStudentPinEditKeepsPinsUnique(t *testing.T) {
+	a := newApp(t)
+	staff := a.signIn(t, "staff")
+	first, _ := enrollStudent(t, a, "First student")
+	second, _ := enrollStudent(t, a, "Second student")
+	path := fmt.Sprintf("/management/students/%d", second.ID)
+	stored := func() string {
+		got, err := students.New(a.db, nil).Get(t.Context(), second.ID)
+		if err != nil || got == nil {
+			t.Fatalf("reload: %+v, %v", got, err)
+		}
+		return got.Pin
+	}
+
+	res, body := a.send(t, staff, http.MethodGet, path, nil, nil)
+	if res.StatusCode != http.StatusOK || !strings.Contains(body, `<p class="student-field-value">`+second.Pin+`</p>`) {
+		t.Fatalf("staff cannot see the PIN: status = %d: %s", res.StatusCode, body)
+	}
+	res, body = a.send(t, staff, http.MethodPost, path+"/fields/pin", url.Values{"value": {first.Pin}}, htmxHeader)
+	if res.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(body, "That PIN is already in use.") || stored() != second.Pin {
+		t.Fatalf("duplicate PIN: status = %d, stored %q: %s", res.StatusCode, stored(), body)
+	}
+	res, body = a.send(t, staff, http.MethodPost, path+"/fields/pin", url.Values{"value": {"000999"}}, htmxHeader)
+	if res.StatusCode != http.StatusOK || stored() != "000999" {
+		t.Fatalf("free PIN: status = %d, stored %q: %s", res.StatusCode, stored(), body)
+	}
+}
+
+func TestOnlyPaidCustomersAppearInStudentsTab(t *testing.T) {
+	a := newApp(t)
+	staff := a.signIn(t, "staff")
+
+	// Customer 1: submits form, unpaid (Awaiting payment)
+	entry1, err := a.store.Create(t.Context(), "staff", later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	details1 := contactDetails("Unpaid Customer")
+	details1.Email = "unpaid.secret@example.com"
+	details1.Phone = "+17875551111"
+	if saved, err := a.store.Submit(t.Context(), entry1.Token, details1, "123456"); err != nil || saved != links.Saved {
+		t.Fatalf("submit customer 1: %v, %v", saved, err)
+	}
+
+	// Customer 2: submits form and pays (enrolled via links.Enroll)
+	entry2, err := a.store.Create(t.Context(), "staff", later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	details2 := contactDetails("Paid Customer")
+	details2.Email = "paid.student@example.com"
+	details2.Phone = "+17875552222"
+	if saved, err := a.store.Submit(t.Context(), entry2.Token, details2, "654321"); err != nil || saved != links.Saved {
+		t.Fatalf("submit customer 2: %v, %v", saved, err)
+	}
+	acceptAgreement(t, a, entry2.Token)
+	hash2, _ := hex.DecodeString(entry2.ID)
+	now := time.Now().UTC()
+	if err := a.db.WithContext(t.Context()).Transaction(func(tx *gorm.DB) error {
+		return links.Enroll(tx, hash2, now)
+	}); err != nil {
+		t.Fatalf("enroll customer 2: %v", err)
+	}
+
+	// GET /management/students: lists ONLY the paid one
+	res, body := a.send(t, staff, http.MethodGet, "/management/students", nil, nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /management/students: %d", res.StatusCode)
+	}
+	if !strings.Contains(body, "Paid Customer") {
+		t.Fatalf("students tab missing paid student: %s", body)
+	}
+	if strings.Contains(body, "Unpaid Customer") {
+		t.Fatalf("students tab leaked unpaid customer: %s", body)
+	}
+
+	// GET /management/: lists the unpaid one with "Awaiting payment", name, phone, NO email
+	res, body = a.send(t, staff, http.MethodGet, "/management/", nil, nil)
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("GET /management/: %d", res.StatusCode)
+	}
+	if !strings.Contains(body, "Unpaid Customer") || !strings.Contains(body, "Awaiting payment") ||
+		!strings.Contains(body, "17875551111") {
+		t.Fatalf("links page missing unpaid customer name/phone/status: %s", body)
+	}
+	if strings.Contains(body, "unpaid.secret@example.com") {
+		t.Fatalf("links page leaked customer email: %s", body)
 	}
 }

@@ -3,7 +3,7 @@ package billing
 import (
 	"time"
 
-	"paymentwebsite/internal/students"
+	"paymentwebsite/internal/links"
 )
 
 // TableName overrides for billing models.
@@ -14,12 +14,12 @@ func (Payment) TableName() string         { return "billing_payments" }
 func (Suspension) TableName() string      { return "billing_suspensions" }
 func (WebhookEvent) TableName() string    { return "billing_webhook_events" }
 
-// Contract represents the financial agreement and durable Stripe customer binding for an enrollment.
+// Contract is the financial agreement for an enrollment; it belongs to the Link, and the Student exists only once it is funded.
 type Contract struct {
-	ID                  uint64            `gorm:"primaryKey"`
-	StudentID           uint64            `gorm:"not null;uniqueIndex;check:contract_student_id,student_id > 0"`
-	Student             *students.Student `gorm:"foreignKey:StudentID;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
-	Reference           string            `gorm:"not null;uniqueIndex"`
+	ID                  uint64      `gorm:"primaryKey"`
+	SourceLinkHash      []byte      `gorm:"not null;uniqueIndex;check:contract_source_link_hash_size,octet_length(source_link_hash) = 32"`
+	Link                *links.Link `gorm:"foreignKey:SourceLinkHash;references:TokenHash;constraint:OnUpdate:RESTRICT,OnDelete:RESTRICT"`
+	Reference           string      `gorm:"not null;uniqueIndex"`
 	PlanID              string            `gorm:"not null"`
 	PlanName            string            `gorm:"not null"`
 	InstallmentCount    int               `gorm:"not null;check:contract_installment_count,installment_count > 0"`

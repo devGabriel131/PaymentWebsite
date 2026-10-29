@@ -196,6 +196,31 @@ func TestFieldParsersRespectNormalizationAndDraftBoundaries(t *testing.T) {
 			{"invalid UTF8", "San Juan\xff", true, "", true},
 		}},
 		{"date of birth", students.ParseDateOfBirth, dobCases},
+		{"gender", students.ParseGender, []parserCase{
+			{"male", "Male", true, "Male", false},
+			{"trimmed female", " \tFemale\u2003", true, "Female", false},
+			{"empty draft", "", false, "", false},
+			{"empty final", "", true, "", true},
+			{"alternate case", "male", true, "", true},
+			{"other value", "Other", true, "", true},
+			{"forged draft", "PRIVATE_FORGED_GENDER", false, "", true},
+		}},
+		{"pin", students.ParsePin, []parserCase{
+			{"shortest", "1234", true, "1234", false},
+			{"longest", "123456", true, "123456", false},
+			{"leading zeros kept", "000042", true, "000042", false},
+			{"trimmed", " \t4321\u2003", true, "4321", false},
+			{"empty draft", "", false, "", false},
+			{"empty final", "", true, "", true},
+			{"too short", "123", true, "", true},
+			{"too long", "1234567", true, "", true},
+			{"letters", "12a45", true, "", true},
+			{"internal space", "12 34", true, "", true},
+			{"sign", "+1234", true, "", true},
+			{"fullwidth digits", "１２３４", true, "", true},
+			{"arabic-indic digits", "١٢٣٤", true, "", true},
+			{"NUL", "1234\x00", true, "", true},
+		}},
 	} {
 		t.Run(parser.name, func(t *testing.T) {
 			for _, tc := range parser.cases {
@@ -230,6 +255,7 @@ func TestParserErrorsNeverEchoSubmittedValues(t *testing.T) {
 		{"phone", "PRIVATE_PHONE_VALUE"},
 		{"municipality", "PRIVATE_MUNICIPALITY_VALUE"},
 		{"date_of_birth", "PRIVATE_DOB_VALUE"},
+		{"gender", "PRIVATE_GENDER_VALUE"},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
 			field, ok := students.FindField(tc.key)

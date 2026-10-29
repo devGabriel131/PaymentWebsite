@@ -16,6 +16,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/logging"
 	"paymentwebsite/internal/payments"
 	"paymentwebsite/internal/students"
@@ -328,12 +329,16 @@ func (s *Service) renew(ctx context.Context, l lease) error {
 	return nil
 }
 
-// leased runs fn in a transaction holding the Contract row lock, only while l still owns
+// leased runs fn in a transaction holding the Link then the Contract row lock, only while l still owns
 // the lease. It outlives ctx so a provider outcome already obtained is still recorded.
 func (s *Service) leased(ctx context.Context, l lease, fn func(tx *gorm.DB, c *Contract) error) error {
 	ctx, cancel := persistCtx(ctx)
 	defer cancel()
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Link before Contract, the order checkout and contact edits take; funding writes the Link.
+		if err := tx.Exec("SELECT 1 FROM links WHERE token_hash = (SELECT source_link_hash FROM billing_contracts WHERE id = ?) FOR UPDATE", l.id).Error; err != nil {
+			return err
+		}
 		var c Contract
 		found, err := firstRow(tx.Clauses(forUpdate), &c, "id = ? AND lease_token = ? AND lease_expires_at > now()", l.id, l.token)
 		if err != nil {
@@ -346,12 +351,11 @@ func (s *Service) leased(ctx context.Context, l lease, fn func(tx *gorm.DB, c *C
 	})
 }
 
-// leasedStudent is leased plus the Student row lock, always taken after the Contract's so
-// every writer of student state orders its locks the same way.
+// leasedStudent is leased plus the Student row lock, ordered Link, Contract, then Student.
 func (s *Service) leasedStudent(ctx context.Context, l lease, fn func(tx *gorm.DB, c *Contract, student *students.Student) error) error {
 	return s.leased(ctx, l, func(tx *gorm.DB, c *Contract) error {
 		var student students.Student
-		if err := require(firstRow(tx.Clauses(forUpdate), &student, "id = ?", c.StudentID)); err != nil {
+		if err := require(firstRow(tx.Clauses(forUpdate), &student, "source_link_hash = ?", c.SourceLinkHash)); err != nil {
 			return err
 		}
 		return fn(tx, c, &student)
@@ -632,6 +636,9 @@ func (s *Service) fund(ctx context.Context, l lease, c Contract, a CheckoutAttem
 			if _, err := markContract(tx, cur, reason, false); err != nil {
 				return err
 			}
+		}
+		if err := links.Enroll(tx, cur.SourceLinkHash, fundedAt); err != nil {
+			return err
 		}
 		funded = true
 		return tx.Model(&Contract{}).Where("id = ?", cur.ID).Updates(map[string]any{"funded_at": fundedAt, "next_sync_at": nil}).Error
@@ -1400,32 +1407,44 @@ func (s *Service) reconcileContract(ctx context.Context, l lease) error {
 	return s.evaluateReactivation(ctx, l)
 }
 
+// contactOf returns the details a contract bills against: the Link's until payment is confirmed, the Student's after.
+func contactOf(db *gorm.DB, c Contract) (students.Details, error) {
+	if c.FundedAt == nil {
+		var link links.Link
+		err := require(firstRow(db, &link, "token_hash = ?", c.SourceLinkHash))
+		return link.Details, err
+	}
+	var student students.Student
+	err := require(firstRow(db, &student, "source_link_hash = ?", c.SourceLinkHash))
+	return student.Details, err
+}
+
 // syncCustomerContact updates Stripe's customer name and email when they differ from the last synced stamp.
 func (s *Service) syncCustomerContact(ctx context.Context, l lease, c Contract) error {
 	if c.StripeCustomerID == nil {
 		return nil
 	}
-	var student students.Student
-	if err := require(firstRow(s.db.WithContext(ctx), &student, "id = ?", c.StudentID)); err != nil {
+	contact, err := contactOf(s.db.WithContext(ctx), c)
+	if err != nil {
 		return err
 	}
-	if student.Name == c.SyncedCustomerName && student.Email == c.SyncedCustomerEmail {
+	if contact.Name == c.SyncedCustomerName && contact.Email == c.SyncedCustomerEmail {
 		return nil
 	}
 	if err := s.renew(ctx, l); err != nil {
 		return err
 	}
-	_, err := s.client.V1Customers.Update(ctx, *c.StripeCustomerID, &stripe.CustomerUpdateParams{
-		Name:  stripe.String(student.Name),
-		Email: stripe.String(student.Email),
+	_, err = s.client.V1Customers.Update(ctx, *c.StripeCustomerID, &stripe.CustomerUpdateParams{
+		Name:  stripe.String(contact.Name),
+		Email: stripe.String(contact.Email),
 	})
 	if err != nil {
 		return err
 	}
 	return s.leased(ctx, l, func(tx *gorm.DB, cur *Contract) error {
 		return tx.Model(&Contract{}).Where("id = ?", cur.ID).Updates(map[string]any{
-			"synced_customer_name":  student.Name,
-			"synced_customer_email": student.Email,
+			"synced_customer_name":  contact.Name,
+			"synced_customer_email": contact.Email,
 		}).Error
 	})
 }

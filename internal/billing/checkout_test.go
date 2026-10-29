@@ -243,6 +243,7 @@ func setupTestEnvironment(t *testing.T, mock *mockStripeServer) (*gorm.DB, *bill
 		Details:        link.Details,
 		CreatedAt:      now,
 		IsActive:       true,
+		Cohort:         "2026-11",
 	}
 	if err := db.Create(&student).Error; err != nil {
 		t.Fatalf("create test student: %v", err)
@@ -256,7 +257,7 @@ func setupTestEnvironment(t *testing.T, mock *mockStripeServer) (*gorm.DB, *bill
 func TestCheckoutConcurrencyAndRecovery(t *testing.T) {
 	mock := newMockStripeServer()
 
-	db, svc, tokenHash, studentID := setupTestEnvironment(t, mock)
+	db, svc, tokenHash, _ := setupTestEnvironment(t, mock)
 
 	// 1. Invalid or expired source/consent cannot start payment
 	t.Run("invalid_source_rejected", func(t *testing.T) {
@@ -308,7 +309,7 @@ func TestCheckoutConcurrencyAndRecovery(t *testing.T) {
 
 		// Verify database state: exactly 1 contract, 1 active attempt, 3 obligations
 		var contractCount int64
-		db.Model(&billing.Contract{}).Where("student_id = ?", studentID).Count(&contractCount)
+		db.Model(&billing.Contract{}).Where("source_link_hash = ?", tokenHash).Count(&contractCount)
 		if contractCount != 1 {
 			t.Fatalf("expected 1 contract, got %d", contractCount)
 		}
@@ -375,6 +376,7 @@ func TestCheckoutConcurrencyAndRecovery(t *testing.T) {
 			SourceLinkHash: otherHash,
 			Details:        link.Details,
 			IsActive:       true,
+			Cohort:         "2026-11",
 		}
 		db.Create(&student)
 
@@ -408,8 +410,7 @@ func TestCheckoutConcurrencyAndRecovery(t *testing.T) {
 	// 5. Funded contract cannot pay first installment twice
 	t.Run("funded_cannot_repay", func(t *testing.T) {
 		now := time.Now().UTC()
-		db.Model(&billing.Contract{}).Where("student_id = ?", studentID).Update("funded_at", &now)
-
+		db.Model(&billing.Contract{}).Where("source_link_hash = ?", tokenHash).Update("funded_at", &now)
 		// Same plan -> returns Funded: true without creating attempts
 		res, err := svc.StartCheckout(context.Background(), tokenHash, "three")
 		if err != nil {
@@ -430,7 +431,7 @@ func TestCheckoutConcurrencyAndRecovery(t *testing.T) {
 func TestPlanChangeExpiresPreviousSession(t *testing.T) {
 	mock := newMockStripeServer()
 
-	db, svc, tokenHash, studentID := setupTestEnvironment(t, mock)
+	db, svc, tokenHash, _ := setupTestEnvironment(t, mock)
 
 	// 1. Initial checkout with "three" plan
 	res1, err := svc.StartCheckout(context.Background(), tokenHash, "three")
@@ -457,7 +458,7 @@ func TestPlanChangeExpiresPreviousSession(t *testing.T) {
 
 	// Verify contract updated to six
 	var contract billing.Contract
-	if err := db.Where("student_id = ?", studentID).First(&contract).Error; err != nil {
+	if err := db.Where("source_link_hash = ?", tokenHash).First(&contract).Error; err != nil {
 		t.Fatalf("find contract: %v", err)
 	}
 	if contract.PlanID != "six" || contract.InstallmentCount != 6 {
@@ -496,7 +497,7 @@ func TestPlanChangeExpiresPreviousSession(t *testing.T) {
 		}
 
 		// Verify contract remains on "six"
-		db.Where("student_id = ?", studentID).First(&contract)
+		db.Where("source_link_hash = ?", tokenHash).First(&contract)
 		if contract.PlanID != "six" {
 			t.Fatalf("expected contract to remain 'six', got %s", contract.PlanID)
 		}

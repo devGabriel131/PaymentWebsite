@@ -8,27 +8,39 @@ import (
 	"time"
 
 	"paymentwebsite/internal/billing"
+	"paymentwebsite/internal/links"
 	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
 )
 
 func TestBillingModelsMigration(t *testing.T) {
-	allModels := append([]any{&students.Student{}}, billing.Models()...)
+	allModels := append([]any{&links.Link{}, &students.Student{}}, billing.Models()...)
 	db := testdb.Open(t, allModels...)
 
 	// Verify we can insert a student and contract
-	student := students.Student{
-		SourceLinkHash: make([]byte, 32),
-		Details: students.Details{
-			Name:         "Juan del Pueblo",
-			Email:        "juan@example.com",
-			Phone:        "+17875551234",
-			Municipality: "San Juan",
-		},
-		IsActive: true,
+	hash := make([]byte, 32)
+	for i := range hash {
+		hash[i] = byte(i + 1)
 	}
-	for i := range student.SourceLinkHash {
-		student.SourceLinkHash[i] = byte(i + 1)
+	details := students.Details{
+		Name:         "Juan del Pueblo",
+		Email:        "juan@example.com",
+		Phone:        "+17875551234",
+		Municipality: "San Juan",
+	}
+	link := links.Link{
+		TokenHash: hash,
+		Details:   details,
+		ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
+	}
+	if err := db.Create(&link).Error; err != nil {
+		t.Fatalf("create link: %v", err)
+	}
+	student := students.Student{
+		SourceLinkHash: hash,
+		Details:        details,
+		IsActive:       true,
+		Cohort:         "2026-11",
 	}
 	if err := db.Create(&student).Error; err != nil {
 		t.Fatalf("create student: %v", err)
@@ -36,7 +48,7 @@ func TestBillingModelsMigration(t *testing.T) {
 
 	contractRef := rand.Text()
 	contract := billing.Contract{
-		StudentID:        student.ID,
+		SourceLinkHash:   hash,
 		Reference:        contractRef,
 		PlanID:           "three",
 		PlanName:         "Plan de 3 Pagos Mensuales",

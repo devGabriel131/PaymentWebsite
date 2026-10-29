@@ -20,9 +20,10 @@ type dashboardData struct {
 	Staff        string
 	Days         int // The window, in days, for headings.
 	Students     students.Counts
-	LinksSent    int // Links created within the window, whatever became of them.
-	LinksWaiting int // Links a customer can still fill in.
-	Billing      billing.Overview
+	LinksSent      int // Links created within the window, whatever became of them.
+	FormsCompleted int // Links whose customer submitted the form within the window, paid or not.
+	LinksWaiting   int // Links a customer can still fill in.
+	Billing        billing.Overview
 }
 
 // NeedsAttention reports whether anything on the dashboard calls for staff action.
@@ -48,7 +49,7 @@ func registerDashboardRoutes(mux *http.ServeMux, store *links.Store, roster *stu
 		data := dashboardData{Staff: staff(r.Context()), Days: int(dashboardWindow / (24 * time.Hour))}
 		entries, err := store.List(ctx)
 		if err == nil {
-			data.Students, err = roster.Count(ctx, since)
+			data.Students, err = roster.Count(ctx)
 		}
 		if err == nil {
 			data.Billing, err = biller.Overview(ctx, now, dashboardWindow)
@@ -64,6 +65,9 @@ func registerDashboardRoutes(mux *http.ServeMux, store *links.Store, roster *stu
 			}
 			if !entry.CreatedAt.Before(since) {
 				data.LinksSent++
+			}
+			if entry.SubmittedAt != nil && !entry.SubmittedAt.Before(since) {
+				data.FormsCompleted++
 			}
 		}
 		name := "dashboard.html"

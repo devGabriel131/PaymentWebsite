@@ -63,12 +63,13 @@ func TestPaymentReturnRoute(t *testing.T) {
 		SourceLinkHash: tokenHash,
 		Details:        link.Details,
 		IsActive:       true,
+		Cohort:         "2026-11",
 	}
 	if err := db.Create(&student).Error; err != nil {
 		t.Fatalf("create student: %v", err)
 	}
 	contract := billing.Contract{
-		StudentID:        student.ID,
+		SourceLinkHash:   tokenHash,
 		Reference:        rand.Text(),
 		PlanID:           "full",
 		PlanName:         "Pago Único",

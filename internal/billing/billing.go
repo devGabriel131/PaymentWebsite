@@ -128,15 +128,15 @@ func (s *Service) wakeWorker() {
 	}
 }
 
-// touch marks the student's Stripe-bound contract due for sync now.
-func touch(db *gorm.DB, studentID uint64) error {
-	return db.Model(&Contract{}).Where("student_id = ? AND stripe_customer_id IS NOT NULL", studentID).Update("next_sync_at", time.Now().UTC()).Error
+// touch marks the contract due for sync now.
+func touch(db *gorm.DB, sourceLinkHash []byte) error {
+	return db.Model(&Contract{}).Where("source_link_hash = ? AND stripe_customer_id IS NOT NULL", sourceLinkHash).Update("next_sync_at", time.Now().UTC()).Error
 }
 
-// TouchContractForStudent marks the student's Stripe-bound contract due now and wakes the
+// TouchContract marks the contract behind sourceLinkHash due now and wakes the
 // billing worker so contact updates sync promptly.
-func (s *Service) TouchContractForStudent(ctx context.Context, studentID uint64) {
-	_ = touch(s.db.WithContext(ctx), studentID)
+func (s *Service) TouchContract(ctx context.Context, sourceLinkHash []byte) {
+	_ = touch(s.db.WithContext(ctx), sourceLinkHash)
 	s.wakeWorker()
 }
 
@@ -146,7 +146,7 @@ func (s *Service) contractFor(ctx context.Context, studentID uint64) (Contract, 
 	if studentID == 0 || studentID > 1<<63-1 {
 		return c, ErrUnavailable
 	}
-	err := require(firstRow(s.db.WithContext(ctx), &c, "student_id = ?", studentID))
+	err := require(firstRow(s.db.WithContext(ctx), &c, "source_link_hash = (SELECT source_link_hash FROM students WHERE id = ?)", studentID))
 	return c, err
 }
 

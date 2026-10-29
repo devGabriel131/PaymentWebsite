@@ -1,7 +1,5 @@
 package students
 
-import "strings"
-
 // Source: https://pr.gov/gobierno-2/directorio-municipios
 var municipalities = []string{
 	"Adjuntas",
@@ -91,14 +89,5 @@ func MunicipalityOptions() []string {
 }
 
 func ParseMunicipality(raw string, required bool) (string, error) {
-	value := strings.TrimSpace(raw)
-	if value == "" && !required {
-		return "", nil
-	}
-	for _, municipality := range municipalities {
-		if value == municipality {
-			return value, nil
-		}
-	}
-	return "", &ValidationError{Message: "Select a municipality or Fuera de Puerto Rico."}
+	return parseOption(raw, required, municipalities, "Select a municipality or Fuera de Puerto Rico.")
 }

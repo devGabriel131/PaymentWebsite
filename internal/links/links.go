@@ -30,6 +30,11 @@ type Link struct {
 	// TermsAcceptedAt and ProgramStartDate retain the agreement first accepted.
 	TermsAcceptedAt  *time.Time `gorm:"type:timestamptz"`
 	ProgramStartDate string     `gorm:"type:text;not null;default:''"`
+	// Pin is the PIN chosen at submit. It reserves the PIN until payment moves it to the Student; "" before submit and after payment.
+	// The index name must equal students.linkPinIndex.
+	Pin string `gorm:"not null;default:'';uniqueIndex:idx_link_pin,where:pin <> ''"`
+	// PaidAt is when the first payment was confirmed: the instant Enroll created the Student. Nil while unpaid.
+	PaidAt *time.Time `gorm:"type:timestamptz"`
 	// CanceledAt revokes an unfinished token but keeps its draft for staff.
 	CanceledAt *time.Time
 	// ExpiresAt starts with the configured lifetime; completion replaces it
@@ -50,9 +55,11 @@ const (
 	Opened    Status = "Opened"
 	// InProgress means autosaved data exists but the customer hasn't submitted.
 	InProgress Status = "In progress"
-	// Finished means the final answers and student enrollment committed.
+	// AwaitingPayment means the customer submitted the form; no payment confirmed yet.
+	AwaitingPayment Status = "Awaiting payment"
+	// Finished means payment confirmed and the Student created.
 	Finished Status = "Finished"
-	// Expired means the link lapsed before the customer finished.
+	// Expired means the link lapsed before payment was confirmed.
 	Expired  Status = "Expired"
 	Canceled Status = "Canceled"
 )
@@ -64,6 +71,8 @@ const (
 	Unavailable SaveResult = iota
 	Saved
 	AlreadySubmitted
+	// PinTaken means another submitted link or enrolled student holds the PIN; the form stays open.
+	PinTaken
 )
 
 // Entry is a link as shown to staff. ID is the lowercase hex token digest.
@@ -87,9 +96,9 @@ func (e Entry) Cancelable() bool {
 	return e.Status == NotOpened || e.Status == Opened || e.Status == InProgress
 }
 
-// Archived reports whether completion is at least 24 hours old at now.
+// Archived reports whether payment is at least 24 hours old at now.
 func (e Entry) Archived(now time.Time) bool {
-	return e.Status == Finished && e.SubmittedAt != nil && !e.SubmittedAt.After(now.Add(-24*time.Hour))
+	return e.Status == Finished && e.PaidAt != nil && !e.PaidAt.After(now.Add(-24*time.Hour))
 }
 
 // Trashed reports whether the link belongs in canceled or expired history.
@@ -101,13 +110,15 @@ func (l Link) entry(now time.Time) Entry {
 	e := Entry{
 		ID: hex.EncodeToString(l.TokenHash), Name: l.Name, Phone: l.Phone, Status: NotOpened,
 		CreatedAt: l.CreatedAt, ExpiresAt: l.ExpiresAt, CreatedBy: l.CreatedBy, CanceledBy: l.CanceledBy,
-		SubmittedAt: l.SubmittedAt,
+		SubmittedAt: l.SubmittedAt, PaidAt: l.PaidAt,
 	}
 	switch {
 	case l.CanceledAt != nil:
 		e.Status = Canceled
-	case l.SubmittedAt != nil:
-		e.Status = Finished
+	case l.PaidAt != nil:
+		e.Status = Finished // paid wins over expiry: an in-flight payment can fund after the link lapses
+	case l.SubmittedAt != nil && now.Before(l.ExpiresAt):
+		e.Status = AwaitingPayment
 	case !now.Before(l.ExpiresAt):
 		e.Status = Expired
 	case l.Details != (students.Details{}):
@@ -117,7 +128,6 @@ func (l Link) entry(now time.Time) Entry {
 	}
 	return e
 }
-
 // errNoStaff rejects staff actions that would leave an anonymous audit entry.
 var errNoStaff = errors.New("links: staff username required")
 
@@ -227,34 +237,49 @@ func (s *Store) SaveDraft(ctx context.Context, token, key, value string) (SaveRe
 	return s.saveResult(ctx, digest, result, Saved)
 }
 
-// Submit commits final answers and a retained student together, locking the form.
-func (s *Store) Submit(ctx context.Context, token string, details students.Details) (SaveResult, error) {
+// Submit commits final answers and the PIN to the link, locking the form. No Student exists until Enroll.
+func (s *Store) Submit(ctx context.Context, token string, details students.Details, pin string) (SaveResult, error) {
 	digest, ok := tokenDigest(token)
 	if !ok {
 		return Unavailable, nil
 	}
 	result := s.db.WithContext(ctx).Exec(`
-WITH completed AS (
-    UPDATE links
-       SET name = ?,
-           email = ?,
-           phone = ?,
-           municipality = ?,
-           date_of_birth = ?,
-           submitted_at = now(),
-           expires_at = now() + interval '168 hours'
-     WHERE token_hash = ?
-       AND canceled_at IS NULL
-       AND expires_at > now()
-       AND submitted_at IS NULL
-    RETURNING token_hash, name, email, phone, municipality, date_of_birth, submitted_at
-)
-INSERT INTO students (source_link_hash, name, email, phone, municipality, date_of_birth, created_at)
-SELECT token_hash, name, email, phone, municipality, date_of_birth, submitted_at FROM completed
-`, details.Name, details.Email, details.Phone, details.Municipality, details.DateOfBirth, digest)
+UPDATE links
+   SET name = ?, email = ?, phone = ?, municipality = ?, date_of_birth = ?, gender = ?, pin = ?,
+       submitted_at = now(),
+       expires_at = now() + interval '168 hours'
+ WHERE token_hash = ?
+   AND canceled_at IS NULL
+   AND expires_at > now()
+   AND submitted_at IS NULL
+`, details.Name, details.Email, details.Phone, details.Municipality, details.DateOfBirth, details.Gender, pin, digest)
+	if students.IsPinTaken(result.Error) {
+		return PinTaken, nil
+	}
 	return s.saveResult(ctx, digest, result, Unavailable)
 }
 
+var errNotEnrollable = errors.New("links: link is not submitted or already enrolled")
+
+// Enroll creates the link's Student at the moment payment is confirmed, inside the caller's transaction,
+// which must already hold the Link row lock. The Student takes the link's contact snapshot, its PIN
+// (the Student's unique index owns it from here, so the link's copy is cleared) and paidAt as created_at.
+// Its cohort is the month of the agreement's start date, which checkout requires; its group is the
+// column default, Básico.
+// The link keeps its snapshot. It never checks Usable: money was collected, so an expired link still enrolls.
+func Enroll(tx *gorm.DB, hash []byte, paidAt time.Time) error {
+	result := tx.Exec(`
+INSERT INTO students (source_link_hash, name, email, phone, municipality, date_of_birth, gender, pin, cohort, created_at)
+SELECT token_hash, name, email, phone, municipality, date_of_birth, gender, pin, left(program_start_date, 7), ?
+  FROM links WHERE token_hash = ? AND submitted_at IS NOT NULL AND paid_at IS NULL`, paidAt, hash)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return errNotEnrollable // impossible for a checkout-gated contract: fail the funding transaction loudly
+	}
+	return tx.Model(&Link{}).Where("token_hash = ?", hash).Updates(map[string]any{"paid_at": paidAt, "pin": ""}).Error
+}
 
 // AcceptTerms snapshots the displayed start date once, after contact submission.
 // Accepted replays preserve the original agreement even when settings change.

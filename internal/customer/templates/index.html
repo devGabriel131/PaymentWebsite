@@ -117,6 +117,29 @@
         {{with index .FieldErrors "date_of_birth"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
       </div>
     </div>
+    <div class="customer-field">
+      <fieldset aria-describedby="gender-hint save-status-gender">
+        <legend>Género del estudiante</legend>
+        <p class="customer-hint" id="gender-hint">Selecciona una opción.</p>
+        <div class="customer-choices">
+          <label class="customer-choice" for="gender-male">
+            <input id="gender-male" name="gender" type="radio" value="Male" required{{if eq .Gender "Male"}} checked{{end}}{{if index .FieldErrors "gender"}} aria-invalid="true"{{end}}
+              {{if not .Editing}}hx-post="{{.Path}}/draft/gender" hx-params="gender" hx-trigger="change" hx-sync="this:queue last"
+              hx-target="#save-status-gender" hx-swap="innerHTML"{{end}}>
+            <span>Masculino</span>
+          </label>
+          <label class="customer-choice" for="gender-female">
+            <input id="gender-female" name="gender" type="radio" value="Female" required{{if eq .Gender "Female"}} checked{{end}}{{if index .FieldErrors "gender"}} aria-invalid="true"{{end}}
+              {{if not .Editing}}hx-post="{{.Path}}/draft/gender" hx-params="gender" hx-trigger="change" hx-sync="this:queue last"
+              hx-target="#save-status-gender" hx-swap="innerHTML"{{end}}>
+            <span>Femenino</span>
+          </label>
+        </div>
+      </fieldset>
+      <div class="customer-status" id="save-status-gender" role="status" aria-atomic="true">
+        {{with index .FieldErrors "gender"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
+      </div>
+    </div>
   </section>
   <section class="customer-card" aria-labelledby="group-contact">
     <h2 id="group-contact">Contacto del estudiante</h2>
@@ -170,6 +193,23 @@
       </div>
     </div>
   </section>
+  {{if not .Editing}}
+  <section class="customer-card" aria-labelledby="group-pin">
+    <h2 id="group-pin">PIN del estudiante</h2>
+    <div class="customer-field">
+      <label for="pin">PIN</label>
+      <p class="customer-hint" id="pin-hint">De 4 a 6 dígitos. Cada estudiante necesita un PIN distinto: lo verificamos al salir del campo y se guarda al continuar.</p>
+      <input id="pin" name="pin" type="text" inputmode="numeric" pattern="[0-9]{4,6}" minlength="4" maxlength="6"
+        autocomplete="off" enterkeyhint="done" required value="{{.Pin}}"
+        aria-describedby="pin-hint save-status-pin"{{if index .FieldErrors "pin"}} aria-invalid="true"{{end}}
+        hx-post="{{.Path}}/pin" hx-params="pin" hx-trigger="change" hx-sync="this:queue last"
+        hx-target="#save-status-pin" hx-swap="innerHTML">
+      <div class="customer-status" id="save-status-pin" role="status" aria-atomic="true">
+        {{with index .FieldErrors "pin"}}<p role="alert" data-validation="invalid">{{.}}</p>{{end}}
+      </div>
+    </div>
+  </section>
+  {{end}}
   <div id="form-error" aria-live="assertive" aria-atomic="true">
     {{with .Error}}<p class="customer-callout" role="alert">{{template "icon-alert"}}<span>{{.}}</span></p>{{end}}
   </div>
@@ -183,4 +223,11 @@
 {{with .Error}}<p role="alert">No se guardó. {{.}}</p>
 {{else}}{{range .FieldErrors}}<p role="alert" data-validation="invalid">No se guardó. {{.}}</p>
 {{else}}<p>Guardado.</p>{{end}}{{end}}
+{{end}}
+
+{{/* The live PIN check never saves, so it says "available", not "saved". */}}
+{{define "pin-status"}}
+{{with .Error}}<p role="alert">No se verificó. {{.}}</p>
+{{else}}{{range .FieldErrors}}<p role="alert" data-validation="invalid">{{.}}</p>
+{{else}}<p>PIN disponible.</p>{{end}}{{end}}
 {{end}}

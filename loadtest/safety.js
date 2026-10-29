@@ -97,14 +97,16 @@ export default function () {
       'phone 123': { phone: '123' },
       'forged municipality': { municipality: 'Atlantis' },
       'future date_of_birth': { date_of_birth: '2999-12-31' },
+      'forged gender': { gender: 'Other' },
+      'short pin': { pin: '123' },
     };
     for (const [what, override] of Object.entries(invalid)) {
       const r = call('POST', c.path, { body: encode({ ...c.form, ...override }), htmx: true });
       expect(r, `final submit with ${what} is rejected with a field error`, 422, { 'flags the field': has('aria-invalid="true"') });
     }
-    const allWrong = encode({ name: 'x', email: 'bad', email_confirm: '', phone: '1', municipality: 'z', date_of_birth: 'nope' });
+    const allWrong = encode({ name: 'x', email: 'bad', email_confirm: '', phone: '1', municipality: 'z', date_of_birth: 'nope', gender: 'z', pin: '1' });
     expect(call('POST', c.path, { body: allWrong, htmx: true }), 'final submit collects every field error, not only the first', 422, {
-      'flags at least 5 fields': (r) => (r.body.match(/aria-invalid="true"/g) || []).length >= 5,
+      'flags at least 7 fields': (r) => (r.body.match(/aria-invalid="true"/g) || []).length >= 7,
     });
     expect(call('GET', c.path), 'rejected submits leave the link unsubmitted', 200, { 'still shows the welcome page': has(WELCOME) });
 

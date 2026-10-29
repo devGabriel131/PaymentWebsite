@@ -6,13 +6,16 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"gorm.io/gorm"
 
 	"paymentwebsite/internal/links"
+	"paymentwebsite/internal/settings"
 	"paymentwebsite/internal/students"
 	"paymentwebsite/internal/testdb"
 )
@@ -129,6 +132,9 @@ func TestUpdateFieldChangesOnlySelectedCanonicalColumn(t *testing.T) {
 		{"phone", "(939) 234-5678", "+19392345678"},
 		{"municipality", " \tAñasco \u2003", "Añasco"},
 		{"date_of_birth", " 2004-05-14 ", "2004-05-14"},
+		{"gender", " Male ", "Male"},
+		{"pin", " 000123 ", "000123"},
+		{"group", " Regular ", "Regular"},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
 			updated, err := roster.UpdateField(ctx, original.ID, tc.key, tc.raw)
@@ -144,6 +150,12 @@ func TestUpdateFieldChangesOnlySelectedCanonicalColumn(t *testing.T) {
 				want.Municipality = tc.want
 			case "date_of_birth":
 				want.DateOfBirth = tc.want
+			case "gender":
+				want.Gender = tc.want
+			case "pin":
+				want.Pin = tc.want
+			case "group":
+				want.Group = tc.want
 			}
 			if err != nil || updated == nil || !reflect.DeepEqual(*updated, want) {
 				t.Fatalf("UpdateField = %+v, %v, want %+v", updated, err, want)
@@ -181,8 +193,8 @@ func TestUpdateFieldChangesOnlySelectedCanonicalColumn(t *testing.T) {
 			original = want
 		})
 	}
-	if writes != len(students.Fields()) {
-		t.Fatalf("committed-write notifications = %d, want %d", writes, len(students.Fields()))
+	if writes != len(students.StaffFields()) {
+		t.Fatalf("committed-write notifications = %d, want %d", writes, len(students.StaffFields()))
 	}
 }
 
@@ -196,7 +208,7 @@ func TestUpdateFieldRejectsUnknownFieldsAndInvalidDetailsWithoutWrites(t *testin
 	}
 	writes := 0
 	roster = students.New(db, func() { writes++ })
-	for _, key := range []string{"", "Name", "id", "email_confirm", "source_link_hash", "created_at", "is_active", "name = 'changed'; DROP TABLE students; --"} {
+	for _, key := range []string{"", "Name", "id", "email_confirm", "source_link_hash", "created_at", "is_active", "cohort", "name = 'changed'; DROP TABLE students; --"} {
 		t.Run("unknown field "+key, func(t *testing.T) {
 			if got, err := roster.UpdateField(ctx, original.ID, key, "Changed student"); got != nil || !errors.Is(err, students.ErrUnknownField) {
 				t.Fatalf("UpdateField(%q) = %+v, %v, want ErrUnknownField", key, got, err)
@@ -211,6 +223,9 @@ func TestUpdateFieldRejectsUnknownFieldsAndInvalidDetailsWithoutWrites(t *testin
 		{"Canadian phone", "phone", "+15062345678"},
 		{"forged municipality", "municipality", "PRIVATE_FORGED_MUNICIPALITY"},
 		{"future date of birth", "date_of_birth", "2099-01-01"},
+		{"forged gender", "gender", "PRIVATE_FORGED_GENDER"},
+		{"short pin", "pin", "123"},
+		{"forged group", "group", "PRIVATE_FORGED_GROUP"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := roster.UpdateField(ctx, original.ID, tc.key, tc.raw)
@@ -220,10 +235,10 @@ func TestUpdateFieldRejectsUnknownFieldsAndInvalidDetailsWithoutWrites(t *testin
 			}
 		})
 	}
-	for _, field := range students.Fields() {
+	for _, field := range students.StaffFields() {
 		t.Run("missing student "+field.Key, func(t *testing.T) {
 			for _, id := range []uint64{0, other.ID + 1, 1 << 63, ^uint64(0)} {
-				if got, err := roster.UpdateField(ctx, id, field.Key, field.Value(original.Details)); got != nil || err != nil {
+				if got, err := roster.UpdateField(ctx, id, field.Key, field.Value(original)); got != nil || err != nil {
 					t.Fatalf("missing UpdateField(%d, %q) = %+v, %v", id, field.Key, got, err)
 				}
 			}
@@ -351,11 +366,14 @@ func studentXmin(t *testing.T, db *gorm.DB, ctx context.Context, id uint64) stri
 
 func studentStores(t *testing.T) (*gorm.DB, *students.Store, *links.Store, context.Context) {
 	t.Helper()
-	db := testdb.Open(t, &links.Link{}, &students.Student{})
+	db := testdb.Open(t, &links.Link{}, &students.Student{}, &settings.Settings{})
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	t.Cleanup(cancel)
 	return db, students.New(db, nil), links.New(db, nil), ctx
 }
+
+// pinSeq gives each enrolled test student its own PIN: the roster refuses duplicates.
+var pinSeq atomic.Int32
 
 func enroll(t *testing.T, db *gorm.DB, sources *links.Store, ctx context.Context, name string) (links.Entry, students.Student) {
 	t.Helper()
@@ -364,18 +382,83 @@ func enroll(t *testing.T, db *gorm.DB, sources *links.Store, ctx context.Context
 		t.Fatal(err)
 	}
 	details := students.Details{
-		Name: name, Email: "Original.Student@example.com", Phone: "+17872345678", Municipality: "San Juan", DateOfBirth: "2005-06-15",
+		Name: name, Email: "Original.Student@example.com", Phone: "+17872345678", Municipality: "San Juan", DateOfBirth: "2005-06-15", Gender: "Female",
 	}
-	if saved, err := sources.Submit(ctx, entry.Token, details); err != nil || saved != links.Saved {
+	if saved, err := sources.Submit(ctx, entry.Token, details, fmt.Sprintf("%06d", 100000+pinSeq.Add(1))); err != nil || saved != links.Saved {
 		t.Fatalf("enrollment saved=%v, err=%v", saved, err)
 	}
 	digest, err := hex.DecodeString(entry.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Checkout requires the accepted agreement whose start date Enroll turns into the cohort.
+	const programStart = "2026-11-10"
+	if err := settings.New(db).SetProgramStartDate(ctx, programStart, "student-test"); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := sources.AcceptTerms(ctx, entry.Token, programStart); err != nil || accepted == nil {
+		t.Fatalf("accept agreement: link=%+v, err=%v", accepted, err)
+	}
+	if err := db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return links.Enroll(tx, digest, time.Now().UTC())
+	}); err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
 	var student students.Student
 	if err := db.WithContext(ctx).Where("source_link_hash = ?", digest).Take(&student).Error; err != nil {
 		t.Fatal(err)
 	}
 	return entry, student
+}
+
+func TestPinHeldBySubmittedLinkBlocksUpdateField(t *testing.T) {
+	db, roster, sources, ctx := studentStores(t)
+
+	// 1. Submit link with a PIN (no Student exists yet)
+	entry, err := sources.Create(ctx, "student-test", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const linkPin = "654321"
+	details := students.Details{
+		Name: "Pending Customer", Email: "pending@example.com", Phone: "+17875550000", Municipality: "Ponce",
+	}
+	if saved, err := sources.Submit(ctx, entry.Token, details, linkPin); err != nil || saved != links.Saved {
+		t.Fatalf("submit: saved=%v, err=%v", saved, err)
+	}
+
+	// PinTaken is true for a PIN held only by a submitted link
+	taken, err := roster.PinTaken(ctx, linkPin)
+	if err != nil || !taken {
+		t.Fatalf("PinTaken = %v, %v; want true, nil", taken, err)
+	}
+
+	// 2. An enrolled student cannot be edited to take the link-held PIN
+	_, enrolledStudent := enroll(t, db, sources, ctx, "Enrolled Student")
+	updated, err := roster.UpdateField(ctx, enrolledStudent.ID, "pin", linkPin)
+	if updated != nil {
+		t.Fatalf("expected nil updated student, got %+v", updated)
+	}
+	var valErr *students.ValidationError
+	if !errors.As(err, &valErr) || valErr.Message != "That PIN is already in use." {
+		t.Fatalf("expected *ValidationError, got %v", err)
+	}
+}
+
+func TestRosterCount(t *testing.T) {
+	db, roster, sources, ctx := studentStores(t)
+	_, s1 := enroll(t, db, sources, ctx, "Student 1")
+	_, s2 := enroll(t, db, sources, ctx, "Student 2")
+	if err := db.WithContext(ctx).Model(&students.Student{}).Where("id = ?", s2.ID).Update("is_active", false).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	counts, err := roster.Count(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts.Active != 1 || counts.Suspended != 1 || counts.Total() != 2 {
+		t.Fatalf("counts = %+v; want Active=1, Suspended=1, Total=2", counts)
+	}
+	_ = s1
 }

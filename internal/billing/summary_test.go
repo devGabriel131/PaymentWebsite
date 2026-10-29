@@ -5,67 +5,45 @@ package billing_test
 import (
 	"context"
 	"crypto/rand"
-	"encoding/hex"
 	"testing"
 	"time"
 
 	"paymentwebsite/internal/billing"
-	"paymentwebsite/internal/links"
-	"paymentwebsite/internal/students"
 )
 
-func TestFundedTimes(t *testing.T) {
+func TestSummaryForLinkAndStudent(t *testing.T) {
 	mock := newMockStripeServer()
 	db, svc, fundedHash, fundedID := setupTestEnvironment(t, mock)
 	ctx := context.Background()
 
-	empty, err := svc.FundedTimes(ctx, nil)
-	if err != nil || empty == nil || len(empty) != 0 {
-		t.Fatalf("empty input = %v, %v; want empty map, nil", empty, err)
-	}
-
-	unfundedHash := make([]byte, 32)
-	rand.Read(unfundedHash)
-	unfundedLink := links.Link{
-		TokenHash: unfundedHash,
-		Details:   students.Details{Name: "Pedro Rivera", Email: "pedro@example.com", Phone: "+17875550000", Municipality: "Ponce"},
-		CreatedAt: time.Now().UTC(),
-		ExpiresAt: time.Now().UTC().Add(7 * 24 * time.Hour),
-	}
-	if err := db.Create(&unfundedLink).Error; err != nil {
-		t.Fatalf("create link: %v", err)
-	}
-	unfunded := students.Student{
-		SourceLinkHash: unfundedHash,
-		Details:        unfundedLink.Details,
-		IsActive:       true,
-	}
-	if err := db.Create(&unfunded).Error; err != nil {
-		t.Fatalf("create student: %v", err)
-	}
 	fundedAt := time.Date(2026, 10, 1, 15, 4, 5, 0, time.UTC)
-	for _, c := range []billing.Contract{
-		{StudentID: fundedID, FundedAt: &fundedAt},
-		{StudentID: unfunded.ID},
-	} {
-		c.Reference, c.PlanID, c.PlanName = rand.Text(), "three", "Plan de 3 Pagos Mensuales"
-		c.InstallmentCount, c.TotalCents = 3, 62500
-		if err := db.Create(&c).Error; err != nil {
-			t.Fatalf("create contract: %v", err)
-		}
+	contract := billing.Contract{
+		SourceLinkHash:   fundedHash,
+		FundedAt:         &fundedAt,
+		Reference:        rand.Text(),
+		PlanID:           "three",
+		PlanName:         "Plan de 3 Pagos Mensuales",
+		InstallmentCount: 3,
+		TotalCents:       62500,
+	}
+	if err := db.Create(&contract).Error; err != nil {
+		t.Fatalf("create contract: %v", err)
 	}
 
-	unknownHash := make([]byte, 32)
-	rand.Read(unknownHash)
-	got, err := svc.FundedTimes(ctx, [][]byte{fundedHash, unfundedHash, unknownHash})
-	if err != nil {
-		t.Fatalf("FundedTimes: %v", err)
+	sumLink, err := svc.ForLink(ctx, fundedHash)
+	if err != nil || sumLink == nil {
+		t.Fatalf("ForLink = %v, %v; want non-nil summary", sumLink, err)
 	}
-	if len(got) != 1 {
-		t.Fatalf("FundedTimes = %v; want only the funded link", got)
+	if !sumLink.Funded || !sumLink.IsActive {
+		t.Fatalf("ForLink: Funded=%v, IsActive=%v; want true, true", sumLink.Funded, sumLink.IsActive)
 	}
-	if at, ok := got[hex.EncodeToString(fundedHash)]; !ok || !at.Equal(fundedAt) {
-		t.Fatalf("funded time = %v, %v; want %v", at, ok, fundedAt)
+
+	sumStudent, err := svc.ForStudent(ctx, fundedID)
+	if err != nil || sumStudent == nil {
+		t.Fatalf("ForStudent = %v, %v; want non-nil summary", sumStudent, err)
+	}
+	if !sumStudent.Funded || !sumStudent.IsActive {
+		t.Fatalf("ForStudent: Funded=%v, IsActive=%v; want true, true", sumStudent.Funded, sumStudent.IsActive)
 	}
 }
 

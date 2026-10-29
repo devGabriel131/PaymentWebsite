@@ -22,7 +22,7 @@
     <div class="management-page-heading">
       <div>
         <h1>{{if .Trash}}Trash{{else}}Customer links{{end}}</h1>
-        <p class="management-page-description">{{if .Trash}}Canceled and expired unfinished links, with their saved data and history.{{else}}Active links and forms completed in the last 24 hours. Completed information stays in Students.{{end}}</p>
+        <p class="management-page-description">{{if .Trash}}Canceled and expired unfinished links, with their saved data and history.{{else}}Active links, forms awaiting payment, and enrollments paid in the last 24 hours. A customer becomes a student only when payment is confirmed.{{end}}</p>
       </div>
       {{if not .Trash}}
       <form id="create-link" action="/management/links" method="post"
@@ -57,7 +57,7 @@
     <section class="management-panel" aria-labelledby="link-registry-heading">
       <div class="management-panel-heading">
         <h2 id="link-registry-heading">{{if .Trash}}Canceled and expired links{{else}}Link registry{{end}}</h2>
-        <p>{{if .Trash}}These links no longer open the customer form. Their data is kept.{{else}}Each URL is shown only once, right after you create it. Finished links stay here for 24 hours.{{end}}</p>
+        <p>{{if .Trash}}These links no longer open the customer form. Their data is kept.{{else}}Each URL is shown only once, right after you create it. Paid links stay here for 24 hours.{{end}}</p>
       </div>
       <p id="link-status" role="status">{{.Notice}}</p>
       <p id="link-refresh-error" role="status"></p>
@@ -74,12 +74,12 @@
         <p>Canceled and expired unfinished links will appear here, with their saved data.</p>
         {{else}}
         {{template "link-icon"}}
-        <h3>No active or recently completed links</h3>
-        <p>Create a customer link to get started. Completed information remains in Students.</p>
+        <h3>No active, pending, or recently paid links</h3>
+        <p>Create a customer link to get started. Customers appear in Students once payment is confirmed.</p>
         {{end}}
       </div>
       <div class="management-panel-footer">
-        <p class="management-retention-note">{{if .Trash}}Links and their history are retained, not deleted.{{else}}Finished links leave this page after 24 hours; their information remains in Students. Canceled and expired unfinished links move to Trash.{{end}}</p>
+        <p class="management-retention-note">{{if .Trash}}Links and their history are retained, not deleted.{{else}}Paid links leave this page after 24 hours; their information remains in Students. Canceled and expired unpaid links move to Trash.{{end}}</p>
         {{if not .Trash}}
         <form action="/management/links/cancel" method="post"
           hx-post="/management/links/cancel" hx-swap="none" hx-disabled-elt="button"

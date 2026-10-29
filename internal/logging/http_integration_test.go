@@ -75,10 +75,23 @@ func TestStudentSaveAndPreliminaryLoadKeepSafeLeafLogging(t *testing.T) {
 	fixture := newHTTPLoggingFixture(t)
 	entry := fixture.createLink(t)
 	originalDetails := httpContactDetails("Private original student")
-	if saved, err := fixture.store.Submit(t.Context(), entry.Token, originalDetails); err != nil || saved != links.Saved {
+	if saved, err := fixture.store.Submit(t.Context(), entry.Token, originalDetails, ""); err != nil || saved != links.Saved {
 		t.Fatalf("enroll student: result = %v, error = %v", saved, err)
 	}
+	const programStart = "2026-11-10"
+	if err := settings.New(fixture.db).SetProgramStartDate(t.Context(), programStart, "staff"); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := fixture.store.AcceptTerms(t.Context(), entry.Token, programStart); err != nil || accepted == nil {
+		t.Fatalf("accept agreement: link=%+v, err=%v", accepted, err)
+	}
 	source := fixture.link(t, entry.Token)
+	now := time.Now().UTC()
+	if err := fixture.db.WithContext(t.Context()).Transaction(func(tx *gorm.DB) error {
+		return links.Enroll(tx, source.TokenHash, now)
+	}); err != nil {
+		t.Fatalf("enroll student: %v", err)
+	}
 	var original students.Student
 	if err := fixture.db.WithContext(t.Context()).Where("source_link_hash = ?", source.TokenHash).Take(&original).Error; err != nil {
 		t.Fatal(err)
@@ -177,7 +190,7 @@ func TestAgreementFailuresLogOnceWithoutContactData(t *testing.T) {
 	fixture := newHTTPLoggingFixture(t)
 	entry := fixture.createLink(t)
 	details := httpContactDetails("Private agreement student")
-	if result, err := fixture.store.Submit(t.Context(), entry.Token, details); err != nil || result != links.Saved {
+	if result, err := fixture.store.Submit(t.Context(), entry.Token, details, ""); err != nil || result != links.Saved {
 		t.Fatalf("submit: %v, %v", result, err)
 	}
 	const date = "2027-02-28"

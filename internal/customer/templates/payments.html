@@ -95,6 +95,14 @@
     <div class="payment-checkout">
       <button class="customer-primary" type="submit">{{template "icon-lock"}}Continuar al pago seguro</button>
       <p class="customer-hint">Pago seguro procesado por Stripe.</p>
+      <div class="payment-methods" aria-label="Métodos de pago aceptados">
+        <img src="/static/payment-visa.svg" alt="Visa" width="38" height="24" loading="lazy">
+        <img src="/static/payment-mastercard.svg" alt="Mastercard" width="38" height="24" loading="lazy">
+        <img src="/static/payment-amex.svg" alt="American Express" width="38" height="24" loading="lazy">
+        <img src="/static/payment-discover.svg" alt="Discover" width="38" height="24" loading="lazy">
+        <img src="/static/payment-applepay.svg" alt="Apple Pay" width="38" height="24" loading="lazy">
+        <img src="/static/payment-googlepay.svg" alt="Google Pay" width="38" height="24" loading="lazy">
+      </div>
     </div>
   </form>
   {{end}}

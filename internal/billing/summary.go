@@ -3,7 +3,6 @@ package billing
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"slices"
 	"time"
 
@@ -11,22 +10,23 @@ import (
 	"paymentwebsite/internal/students"
 )
 
-// ForLink returns the summary for the student enrolled from sourceLinkHash.
+// ForLink returns the summary for the enrollment behind sourceLinkHash, or nil before checkout creates its contract.
 func (s *Service) ForLink(ctx context.Context, sourceLinkHash []byte) (*Summary, error) {
 	if len(sourceLinkHash) != sha256.Size {
 		return nil, ErrUnavailable
 	}
+	var contract Contract
+	found, err := firstRow(s.db.WithContext(ctx), &contract, "source_link_hash = ?", sourceLinkHash)
+	if err != nil || !found {
+		return nil, err
+	}
 	var student students.Student
-	found, err := firstRow(s.db.WithContext(ctx), &student, "source_link_hash = ?", sourceLinkHash)
+	hasStudent, err := firstRow(s.db.WithContext(ctx), &student, "source_link_hash = ?", sourceLinkHash)
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, ErrUnavailable
-	}
-	return s.forStudent(ctx, student)
+	return s.summarize(ctx, contract, hasStudent && student.IsActive)
 }
-
 
 // ForStudent returns the financial summary, or nil when the student or contract does not exist.
 func (s *Service) ForStudent(ctx context.Context, studentID uint64) (*Summary, error) {
@@ -37,34 +37,14 @@ func (s *Service) ForStudent(ctx context.Context, studentID uint64) (*Summary, e
 	if found, err := firstRow(s.db.WithContext(ctx), &student, "id = ?", studentID); err != nil || !found {
 		return nil, err
 	}
-	return s.forStudent(ctx, student)
-}
-
-// FundedTimes maps hex link token hash -> contract FundedAt for funded enrollments.
-func (s *Service) FundedTimes(ctx context.Context, sourceHashes [][]byte) (map[string]time.Time, error) {
-	times := map[string]time.Time{}
-	if len(sourceHashes) == 0 {
-		return times, nil
-	}
-	var rows []struct {
-		SourceLinkHash []byte
-		FundedAt       time.Time
-	}
-	err := s.db.WithContext(ctx).Model(&Contract{}).
-		Select("students.source_link_hash, billing_contracts.funded_at").
-		Joins("JOIN students ON students.id = billing_contracts.student_id").
-		Where("students.source_link_hash IN ? AND billing_contracts.funded_at IS NOT NULL", sourceHashes).
-		Scan(&rows).Error
-	if err != nil {
+	var contract Contract
+	if found, err := firstRow(s.db.WithContext(ctx), &contract, "source_link_hash = ?", student.SourceLinkHash); err != nil || !found {
 		return nil, err
 	}
-	for _, row := range rows {
-		times[hex.EncodeToString(row.SourceLinkHash)] = row.FundedAt
-	}
-	return times, nil
+	return s.summarize(ctx, contract, student.IsActive)
 }
 
-// ContactEditable reports whether student contact details can still be edited.
+// ContactEditable reports whether the customer's contact details can still be edited.
 // Once funded or while a payment is in flight (processing, uncertain, expiring), edits are locked.
 func (s *Service) ContactEditable(ctx context.Context, sourceLinkHash []byte) (bool, error) {
 	if len(sourceLinkHash) != sha256.Size {
@@ -72,8 +52,7 @@ func (s *Service) ContactEditable(ctx context.Context, sourceLinkHash []byte) (b
 	}
 	var count int64
 	err := s.db.WithContext(ctx).Model(&Contract{}).
-		Joins("JOIN students ON students.id = billing_contracts.student_id").
-		Where("students.source_link_hash = ? AND (billing_contracts.funded_at IS NOT NULL OR EXISTS (SELECT 1 FROM billing_checkout_attempts a WHERE a.contract_id = billing_contracts.id AND a.state IN ?))", sourceLinkHash, inFlightAttemptStates).
+		Where("source_link_hash = ? AND (funded_at IS NOT NULL OR EXISTS (SELECT 1 FROM billing_checkout_attempts a WHERE a.contract_id = billing_contracts.id AND a.state IN ?))", sourceLinkHash, inFlightAttemptStates).
 		Count(&count).Error
 	if err != nil {
 		return false, err
@@ -81,11 +60,7 @@ func (s *Service) ContactEditable(ctx context.Context, sourceLinkHash []byte) (b
 	return count == 0, nil
 }
 
-func (s *Service) forStudent(ctx context.Context, student students.Student) (*Summary, error) {
-	var contract Contract
-	if found, err := firstRow(s.db.WithContext(ctx), &contract, "student_id = ?", student.ID); err != nil || !found {
-		return nil, err
-	}
+func (s *Service) summarize(ctx context.Context, contract Contract, active bool) (*Summary, error) {
 	var obligations []Obligation
 	if err := s.db.WithContext(ctx).Where("contract_id = ?", contract.ID).Order("number ASC").Find(&obligations).Error; err != nil {
 		return nil, err
@@ -107,7 +82,7 @@ func (s *Service) forStudent(ctx context.Context, student students.Student) (*Su
 		TotalCents:   contract.TotalCents,
 		Funded:       contract.FundedAt != nil,
 		FundedAt:     contract.FundedAt,
-		IsActive:     student.IsActive,
+		IsActive:     active,
 		IsSuspended:  suspended,
 		LastSyncedAt: contract.LastSyncedAt,
 	}

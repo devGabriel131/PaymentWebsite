@@ -2,6 +2,7 @@ package students
 
 import (
 	"net/mail"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -14,46 +15,83 @@ var puertoRico = time.FixedZone("America/Puerto_Rico", -4*60*60)
 
 type Field struct {
 	Key, Label, InputType string
-	Value                 func(Details) string
+	Value                 func(Student) string
 	Parse                 func(raw string, required bool) (string, error)
 	Options               []string
 }
 
+// fields are the contact fields: a customer submits them, a Link drafts them, a Student holds them.
 var fields = []Field{
 	{
 		Key: "name", Label: "Name", InputType: "text",
-		Value: func(d Details) string { return d.Name },
+		Value: func(s Student) string { return s.Name },
 		Parse: ParseName,
 	},
 	{
 		Key: "email", Label: "Email", InputType: "email",
-		Value: func(d Details) string { return d.Email },
+		Value: func(s Student) string { return s.Email },
 		Parse: ParseEmail,
 	},
 	{
 		Key: "phone", Label: "Phone", InputType: "tel",
-		Value: func(d Details) string { return d.Phone },
+		Value: func(s Student) string { return s.Phone },
 		Parse: ParsePhone,
 	},
 	{
 		Key: "municipality", Label: "Municipality",
-		Value: func(d Details) string { return d.Municipality },
+		Value: func(s Student) string { return s.Municipality },
 		Parse: ParseMunicipality, Options: MunicipalityOptions(),
 	},
 	{
 		Key: "date_of_birth", Label: "Date of birth", InputType: "date",
-		Value: func(d Details) string { return d.DateOfBirth },
+		Value: func(s Student) string { return s.DateOfBirth },
 		Parse: ParseDateOfBirth,
+	},
+	{
+		Key: "gender", Label: "Gender",
+		Value: func(s Student) string { return s.Gender },
+		Parse: ParseGender, Options: GenderOptions(),
 	},
 }
 
-// Fields returns the ordered registry. Callers must not modify the slice.
+// pinField lives only on the Student: it is never drafted: it is only written at final submit, so abandoned drafts never reserve a PIN.
+var pinField = Field{
+	Key: "pin", Label: "PIN", InputType: "text",
+	Value: func(s Student) string { return s.Pin },
+	Parse: ParsePin,
+}
+
+// groupField is the program stage, staff-only like the PIN: never drafted or customer-edited.
+var groupField = Field{
+	Key: "group", Label: "Group",
+	Value: func(s Student) string { return s.Group },
+	Parse: ParseGroup, Options: groups,
+}
+
+var staffFields = append(slices.Clone(fields), pinField, groupField)
+
+// Fields returns the ordered contact registry. Callers must not modify the slice.
 func Fields() []Field {
 	return fields
 }
 
+// StaffFields is Fields plus the PIN and group, the registry staff see and edit.
+// Callers must not modify the slice.
+func StaffFields() []Field {
+	return staffFields
+}
+
 func FindField(key string) (Field, bool) {
-	for _, field := range fields {
+	return find(fields, key)
+}
+
+// FindStaffField is FindField that also finds the staff-only fields.
+func FindStaffField(key string) (Field, bool) {
+	return find(staffFields, key)
+}
+
+func find(registry []Field, key string) (Field, bool) {
+	for _, field := range registry {
 		if field.Key == key {
 			return field, true
 		}
@@ -215,6 +253,54 @@ func ParseDateOfBirth(raw string, required bool) (string, error) {
 		return "", &ValidationError{Message: "age must be between 0 and 100"}
 	}
 	return t.Format(time.DateOnly), nil
+}
+
+var genders = []string{"Male", "Female"}
+
+// GenderOptions returns the ordered choices. Callers must not modify the slice.
+func GenderOptions() []string {
+	return genders
+}
+
+func ParseGender(raw string, required bool) (string, error) {
+	return parseOption(raw, required, genders, "Select Male or Female.")
+}
+
+// groups are the program stages in order: every student starts in the first.
+// Student.Group's column default and check repeat them.
+var groups = []string{"Básico", "Regular"}
+
+func ParseGroup(raw string, required bool) (string, error) {
+	return parseOption(raw, required, groups, "Select Básico or Regular.")
+}
+
+// parseOption accepts exactly one of options, ignoring surrounding space.
+func parseOption(raw string, required bool, options []string, message string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" && !required {
+		return "", nil
+	}
+	if slices.Contains(options, value) {
+		return value, nil
+	}
+	return "", &ValidationError{Message: message}
+}
+
+// ParsePin accepts 4 to 6 ASCII digits. It stays text so leading zeros survive.
+func ParsePin(raw string, required bool) (string, error) {
+	pin := strings.TrimSpace(raw)
+	if pin == "" && !required {
+		return "", nil
+	}
+	if len(pin) < 4 || len(pin) > 6 {
+		return "", &ValidationError{Message: "Enter a PIN of 4 to 6 digits."}
+	}
+	for i := range len(pin) {
+		if pin[i] < '0' || pin[i] > '9' {
+			return "", &ValidationError{Message: "Enter a PIN of 4 to 6 digits."}
+		}
+	}
+	return pin, nil
 }
 
 type ValidationError struct {

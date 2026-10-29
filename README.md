@@ -83,6 +83,7 @@ Management and login pages load only `/static/styles.css`; customer pages load o
 | `GET /customer/{token}`, `GET /customer/{token}/forms` | Welcome and contact form; `HEAD` works on both |
 | `POST /customer/{token}` | Final submit: validates, enrolls, redirects to the agreement |
 | `POST /customer/{token}/draft/{field}` | Autosaves one field on blur; answers status only |
+| `POST /customer/{token}/pin` | Reports whether a PIN is free; saves nothing |
 | `GET`/`POST /customer/{token}/edit` | Corrects the Student's contact fields after submit |
 | `GET`/`POST /customer/{token}/agreement` | Shows and accepts the terms |
 | `GET`/`POST /customer/{token}/payments` | Plan choice; POST starts hosted Stripe Checkout and redirects to Stripe |
@@ -102,7 +103,7 @@ Management and login pages load only `/static/styles.css`; customer pages load o
 - **Headers:** `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, and the customer CSP (same origin, jsDelivr for HTMX, Google Fonts, `form-action` to `checkout.stripe.com`, no framing). Redirects carry no contact data.
 - **Messaging:** the app sends no email or SMS. Email and phone are syntax-checked, never verified.
 
-Five contact fields come from one registry (`students.Field`, `internal/students/fields.go`). The same parsers serve submit, autosave, customer edit, and staff edit. Autosave lets an empty value clear a field; submit and edits require all five.
+Six contact fields come from one registry (`students.Field`, `internal/students/fields.go`). The same parsers serve submit, autosave, customer edit, and staff edit. Autosave lets an empty value clear a field; submit and edits require all six. The PIN and group are staff-only fields that only a Student holds (`students.StaffFields`): staff see and edit them, but they are never drafted in a Link, so `/draft/pin` and `/draft/group` are 404s and the customer edit form has neither.
 
 | Field | Rule |
 | --- | --- |
@@ -111,6 +112,9 @@ Five contact fields come from one registry (`students.Field`, `internal/students
 | Email | One bare ASCII mailbox, ≤254 bytes, dotted domain, domain lowercased. The confirmation is retyped, compared, never stored |
 | Phone | Default region PR; digits, spaces, `().-`, leading `+`; valid PR or US numbers only; stored as E.164 |
 | Municipality | Exact match: 78 municipios plus `Fuera de Puerto Rico`, 79 values |
+| Gender | Exactly `Male` or `Female`; the customer form shows Masculino and Femenino |
+| PIN | 4 to 6 ASCII digits, kept as text so leading zeros survive. Unique among students: a partial unique index (`idx_student_pin`, rows with an empty PIN excluded) decides at write time. The customer form checks on blur through `/pin`; a lost race at final submit rolls the link back unsubmitted and redraws the form with 422. Staff edits onto a taken PIN also give 422 |
+| Group | Exactly `Básico` or `Regular`, enforced by a check constraint. Enrollment starts every student in `Básico` (the column default); staff promote or correct it from the student dialog |
 
 ## Management
 
@@ -128,6 +132,7 @@ Five contact fields come from one registry (`students.Field`, `internal/students
 - **Settings:** link lifetime 2–14 days, default 7, applies to new links only. The program start date feeds new agreements; accepted agreements keep their snapshot.
 - **Dashboard:** read-only, refreshed live like the lists. Windows are fixed at 30 days (`dashboardWindow`): enrollment looks back, installments due looks ahead. Tuition figures count only funded contracts, because an abandoned Checkout leaves unpaid obligations nobody owes yet (`billing.Service.Overview`). Overdue, failed and in-review follow a student's billing rules, so totals add up to the student pages. Collected is cash received less refunds, before Stripe fees. Overdue-by-the-clock and the 30-day windows show only on the next load or refresh, like other time-based moves.
 - **Students:** one record per completed submission, not a deduplicated person; it outlives its link. An edit changes one column under a row lock; a normalized no-op skips the write and the live event; invalid input gives 422. The Link snapshot never changes. A saved edit marks the student's Stripe-bound contract due and wakes the billing worker, which pushes name and email to the Stripe customer. Unlike customer edits, staff edits are not locked by funding or in-flight payments.
+- **Cohort:** enrollment stores the month (`YYYY-MM`, check-constrained) of the agreement start date the customer accepted, so later changes to the settings date never move existing students. No edit reaches it, and promotion keeps it. The list and dialog show it as `November 2026`.
 - **Privacy:** the link registry projection (`links.Entry`) exposes only name and phone, never email or municipality.
 - **Audit:** creator, canceler, and settings editor come from the verified session (`auth.Staff`), never from form input; stores refuse these writes without one.
 - **Billing actions:** reconcile re-reads existing Stripe state and never creates a charge; reinstatement requests the fee invoice; hosted invoice URLs are fetched on demand, never stored; the portal link is a payer credential, uncached. See [Billing](#billing).
@@ -154,6 +159,7 @@ Startup fails (`startup_failed`) without valid Stripe configuration or a loadabl
 - Webhook endpoint at `<PUBLIC_BASE_URL>/webhooks/stripe`, created with API version `2026-09-30.endive` and subscribed to the types in `webhookEvents` (`internal/billing/webhook.go`).
 - Payment-method configuration (used by the single payment only): Card, Apple Pay, Google Pay, Link and Klarna on, everything else off. Customer portal configuration: invoice history and card update only.
 - Adaptive Pricing off (also for Hosted Invoice Pages), automatic tax off. Smart Retries on for one-off invoices with a 2-week window, matching the 14-day suspension rule; the window is dashboard-only (Settings > Billing > Invoices > Advanced invoicing features), so the app cannot check it.
+- Customer emails (dashboard-only): in Settings > Emails, enable "Successful payments" for receipts. In Settings > Billing > Subscriptions and emails (Automatic collection), enable "Send emails when card payments fail" and "Send a Stripe-hosted link for cardholders to authenticate when required" (3D Secure).
 - Stripe pages, emails and PDFs use locale `es-419` (`stripeLocale` in `internal/billing/stripe.go`): Spanish with US-style numbers, printed `USD 600.00`. `es` prints Spain-style `600,00 US$`; only `en` prints a bare `$600.00`, in English.
 
 ## Logging
@@ -195,5 +201,5 @@ Each integration test gets its own Postgres schema (`internal/testdb`). `interna
 - Customer verification and identity: links are bearer credentials and valid contact syntax is not identity; each completed submission creates its own Student and contract, with no dedup by email or phone.
 - Smart Retries: no proof yet that Stripe itself ran a retry on a one-off invoice (not a manual pay, not just a scheduled next attempt), or of retry exhaustion. Treat retry behavior as unverified.
 - Money: tax treatment and registrations (automatic tax stays off), Adaptive Pricing on the live account, and the actual Stripe fees.
-- Go-live: live catalog, restricted key, configurations and webhook endpoint; Apple Pay and Google Pay on a real device; live email delivery (sandbox suppresses automatic emails).
+- Go-live: live catalog, restricted key, configurations and webhook endpoint; Apple Pay and Google Pay on a real device; live email delivery (sandbox suppresses automatic emails; verify dashboard toggles for successful payment receipts, failed payment alerts and 3DS links).
 - Staff passwords: raise the 4-character minimum in `internal/auth/cli.go`.

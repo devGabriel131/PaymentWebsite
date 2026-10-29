@@ -220,7 +220,7 @@ func TestPaymentChoiceValidatesPersistsAndRemainsIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result, err := fixture.store.Submit(t.Context(), other.Token, contactDetails("Other private student")); err != nil || result != links.Saved {
+	if result, err := fixture.store.Submit(t.Context(), other.Token, contactDetails("Other private student"), ""); err != nil || result != links.Saved {
 		t.Fatalf("submit other: %v, %v", result, err)
 	}
 	if accepted, err := fixture.store.AcceptTerms(t.Context(), other.Token, agreementDate); err != nil || accepted == nil {
@@ -321,8 +321,7 @@ func TestPaymentChoiceFailurePreservesSavedAndAttemptedState(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fixture := newAgreementFixture(t)
 			fixture.accept(t)
-			student := studentRecords(t, fixture.db)[0]
-			contract := billing.Contract{StudentID: student.ID, Reference: rand.Text(), PlanID: full.ID, PlanName: full.Name, InstallmentCount: len(full.Amounts), TotalCents: full.TotalCents()}
+			contract := billing.Contract{SourceLinkHash: stored(t, fixture.db)[0].TokenHash, Reference: rand.Text(), PlanID: full.ID, PlanName: full.Name, InstallmentCount: len(full.Amounts), TotalCents: full.TotalCents()}
 			if err := fixture.db.Create(&contract).Error; err != nil {
 				t.Fatalf("save original plan: %v", err)
 			}
@@ -374,7 +373,7 @@ func TestAgreementPaymentStageAndUsabilityCannotBeBypassed(t *testing.T) {
 	db, store, entry, path, mux := fixture.db, fixture.store, fixture.entry, fixture.path, fixture.mux
 	for _, stage := range []string{"before contact", "before agreement"} {
 		if stage == "before agreement" {
-			if result, err := store.Submit(t.Context(), entry.Token, contactDetails("Stage private student")); err != nil || result != links.Saved {
+			if result, err := store.Submit(t.Context(), entry.Token, contactDetails("Stage private student"), ""); err != nil || result != links.Saved {
 				t.Fatalf("submit stage: %v, %v", result, err)
 			}
 		}
@@ -511,7 +510,7 @@ func newAgreementFixture(t *testing.T) agreementFixture {
 	if err := configuration.SetProgramStartDate(t.Context(), agreementDate, "staff"); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := f.store.Submit(t.Context(), f.entry.Token, contactDetails("Agreement private student")); err != nil || result != links.Saved {
+	if result, err := f.store.Submit(t.Context(), f.entry.Token, contactDetails("Agreement private student"), ""); err != nil || result != links.Saved {
 		t.Fatalf("submit fixture: %v, %v", result, err)
 	}
 	return agreementFixture{fixture: f, configuration: configuration}
