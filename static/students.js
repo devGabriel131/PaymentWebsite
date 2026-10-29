@@ -16,12 +16,16 @@ document.body.addEventListener("htmx:beforeRequest", ({ detail }) => {
   const source = detail.requestConfig?.elt ?? detail.elt;
   const field = source.closest(".student-field");
   const link = source.closest("[data-student-link]");
-  if (!field && !link) return;
+  // A filter change or live refresh; tracked so a replaced request's error clears with the next.
+  const roster = source.matches("#student-filter, #student-records");
+  if (!field && !link && !roster) return;
 
   const request = {
     fieldID: field?.id,
     rowID: link?.closest("tr[data-student-id]")?.id,
-    saving: source.matches("form.student-field-editor"),
+    message: source.matches("form.student-field-editor")
+      ? "Could not save this field. Please try again."
+      : roster ? "Could not load students. Please try again." : "Could not load student. Please try again.",
   };
   studentRequests.set(detail.xhr, request);
   const error = request.fieldID
@@ -70,8 +74,6 @@ document.body.addEventListener("htmx:afterRequest", ({ detail }) => {
     ? document.getElementById(request.fieldID)?.querySelector(".student-request-error")
     : document.querySelector("main.management-students > .student-request-error");
   if (!error) return;
-  error.textContent = request.saving
-    ? "Could not save this field. Please try again."
-    : "Could not load student. Please try again.";
+  error.textContent = request.message;
   error.hidden = false;
 });

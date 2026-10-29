@@ -22,7 +22,7 @@ import (
 
 func TestListRetainsExpiredSourcesAndOrdersNewestFirst(t *testing.T) {
 	db, roster, sources, ctx := studentStores(t)
-	if listed, err := roster.List(ctx, nil); err != nil || len(listed) != 0 {
+	if listed, err := roster.List(ctx, students.Filter{}); err != nil || len(listed) != 0 {
 		t.Fatalf("empty roster = %+v, %v", listed, err)
 	}
 
@@ -67,7 +67,7 @@ func TestListRetainsExpiredSourcesAndOrdersNewestFirst(t *testing.T) {
 		t.Fatalf("inactive student changed retained source: before=%+v, after=%+v", sourceBefore, sourceAfter)
 	}
 
-	listed, err := roster.List(ctx, nil)
+	listed, err := roster.List(ctx, students.Filter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,17 +84,34 @@ func TestListRetainsExpiredSourcesAndOrdersNewestFirst(t *testing.T) {
 			t.Fatalf("Get(%d) = %+v, %v, want listed student %+v", id, got, err, listed[i])
 		}
 	}
+	if _, err := roster.UpdateField(ctx, firstTie.ID, "group", "Regular"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WithContext(ctx).Model(&students.Student{}).Where("id = ?", oldest.ID).Update("cohort", "2026-10").Error; err != nil {
+		t.Fatal(err)
+	}
+	if cohorts, err := roster.Cohorts(ctx); err != nil || !reflect.DeepEqual(cohorts, []string{"2026-11", "2026-10"}) {
+		t.Fatalf("Cohorts() = %v, %v, want newest first without repeats", cohorts, err)
+	}
+	active, suspended := true, false
 	for _, filter := range []struct {
-		active bool
+		filter students.Filter
 		want   []uint64
-	}{{true, wantIDs[:2]}, {false, wantIDs[2:]}} {
-		filtered, err := roster.List(ctx, &filter.active)
+	}{
+		{students.Filter{Active: &active}, wantIDs[:2]},
+		{students.Filter{Active: &suspended}, wantIDs[2:]},
+		{students.Filter{Cohort: "2026-11"}, wantIDs[:2]},
+		{students.Filter{Group: "Básico"}, []uint64{lastTie.ID, oldest.ID}},
+		{students.Filter{Active: &active, Cohort: "2026-11", Group: "Básico"}, []uint64{lastTie.ID}},
+		{students.Filter{Active: &suspended, Group: "Regular"}, nil},
+	} {
+		filtered, err := roster.List(ctx, filter.filter)
 		if err != nil || len(filtered) != len(filter.want) {
-			t.Fatalf("List(active=%t) = %+v, %v, want students %v", filter.active, filtered, err, filter.want)
+			t.Fatalf("List(%+v) = %+v, %v, want students %v", filter.filter, filtered, err, filter.want)
 		}
 		for i, id := range filter.want {
 			if filtered[i].ID != id {
-				t.Fatalf("List(active=%t)[%d] = student %d, want %d", filter.active, i, filtered[i].ID, id)
+				t.Fatalf("List(%+v)[%d] = student %d, want %d", filter.filter, i, filtered[i].ID, id)
 			}
 		}
 	}
@@ -257,7 +274,7 @@ func TestUpdateFieldRejectsUnknownFieldsAndInvalidDetailsWithoutWrites(t *testin
 	if !reflect.DeepEqual(sourceBefore, sourceAfter) {
 		t.Fatalf("rejected edits changed source: before %+v, after %+v", sourceBefore, sourceAfter)
 	}
-	if listed, err := roster.List(ctx, nil); err != nil || len(listed) != 2 {
+	if listed, err := roster.List(ctx, students.Filter{}); err != nil || len(listed) != 2 {
 		t.Fatalf("rejected edits changed roster: %+v, %v", listed, err)
 	}
 	if writes != 0 {

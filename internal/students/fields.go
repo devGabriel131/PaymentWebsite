@@ -270,6 +270,11 @@ func ParseGender(raw string, required bool) (string, error) {
 // Student.Group's column default and check repeat them.
 var groups = []string{"Básico", "Regular"}
 
+// GroupOptions returns the ordered groups. Callers must not modify the slice.
+func GroupOptions() []string {
+	return groups
+}
+
 func ParseGroup(raw string, required bool) (string, error) {
 	return parseOption(raw, required, groups, "Select Básico or Regular.")
 }

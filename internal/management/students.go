@@ -6,7 +6,9 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"paymentwebsite/internal/billing"
@@ -37,8 +39,12 @@ type studentPageData struct {
 	Student  studentView
 	Field    *studentFieldView
 	Modal    bool
-	Status   string           // The roster's status filter: "", "active", or "suspended".
-	Billing  *billing.Summary // nil when the student has no billing contract.
+	// The roster's filters, "" for all: Status is "active" or "suspended", Cohort one of
+	// Cohorts, and Group one of Groups.
+	Status, Cohort, Group string
+	Cohorts               []string // every cohort with a student, newest first
+	Groups                []string
+	Billing               *billing.Summary // nil when the student has no billing contract.
 }
 
 // studentDisplay evaluates the field registry once for each rendered student.
@@ -130,28 +136,57 @@ func registerStudentRoutes(mux *http.ServeMux, roster *students.Store, biller *b
 	mux.Handle("GET /management/students", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		// Any other status shows everyone, so a stale link never hides the roster.
-		status := r.URL.Query().Get("status")
-		var active *bool
-		if status == "active" || status == "suspended" {
-			isActive := status == "active"
-			active = &isActive
-		} else {
-			status = ""
-		}
-		records, err := roster.List(ctx, active)
+		cohorts, err := roster.Cohorts(ctx)
 		if err != nil {
 			logging.RecordError(r, "list", err)
 			http.Error(w, "Could not load students. Please try again.", http.StatusInternalServerError)
 			return
 		}
-		data := studentPageData{Staff: staff(r.Context()), Fields: students.StaffFields(), Status: status, Students: make([]studentView, len(records))}
+		// Unknown filter values show everyone, so a stale link never hides the roster.
+		query := r.URL.Query()
+		data := studentPageData{
+			Staff: staff(r.Context()), Fields: students.StaffFields(), Cohorts: cohorts, Groups: students.GroupOptions(),
+			Status: query.Get("status"), Cohort: query.Get("cohort"), Group: query.Get("group"),
+		}
+		var filter students.Filter
+		if data.Status == "active" || data.Status == "suspended" {
+			isActive := data.Status == "active"
+			filter.Active = &isActive
+		} else {
+			data.Status = ""
+		}
+		if slices.Contains(data.Cohorts, data.Cohort) {
+			filter.Cohort = data.Cohort
+		} else {
+			data.Cohort = ""
+		}
+		if slices.Contains(data.Groups, data.Group) {
+			filter.Group = data.Group
+		} else {
+			data.Group = ""
+		}
+		records, err := roster.List(ctx, filter)
+		if err != nil {
+			logging.RecordError(r, "list", err)
+			http.Error(w, "Could not load students. Please try again.", http.StatusInternalServerError)
+			return
+		}
+		data.Students = make([]studentView, len(records))
 		for i, record := range records {
 			data.Students[i] = studentDisplay(record, false)
 		}
 		name := "students.html"
 		if htmx(r) {
-			name = "student-records" // A live refresh of just the records.
+			// Filter changes and live refreshes swap just the records. The address bar
+			// follows the shown filters, so a reload or bookmark reopens them.
+			name = "student-records"
+			shown := url.Values{}
+			for key, value := range map[string]string{"status": data.Status, "cohort": data.Cohort, "group": data.Group} {
+				if value != "" {
+					shown.Set(key, value)
+				}
+			}
+			w.Header().Set("HX-Replace-Url", strings.TrimSuffix("/management/students?"+shown.Encode(), "?"))
 		}
 		render(w, r, page, http.StatusOK, name, data)
 	}))

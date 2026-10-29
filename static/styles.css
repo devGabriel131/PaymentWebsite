@@ -786,16 +786,25 @@ button.management-button-danger:enabled:hover {
   font-variant-numeric: tabular-nums;
 }
 
-/* Status filter: plain links, so a filtered roster is a bookmarkable URL.
-   Link text lines up with the panel heading at the inset. */
+/* Filters: one GET form, so a filtered roster is a bookmarkable URL. Status
+   radios read as tabs whose text lines up with the panel heading at the inset;
+   the dropdowns sit at the far side and wrap below on narrow screens. */
 .management .student-filter {
   display: flex;
-  gap: 0.25rem;
-  padding-inline: calc(var(--inset) - 0.75rem);
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  column-gap: 1rem;
+  padding-inline: calc(var(--inset) - 0.75rem) var(--inset);
   border-bottom: 1px solid var(--line);
 }
 
-.management .student-filter a {
+.management .student-filter-status {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.management .student-filter-status label {
   display: inline-flex;
   align-items: center;
   box-sizing: border-box;
@@ -805,17 +814,56 @@ button.management-button-danger:enabled:hover {
   border-bottom: 2px solid transparent;
   color: var(--muted);
   font-weight: 500;
-  text-decoration: none;
+  cursor: pointer;
   transition: color 0.15s;
 }
 
-.management .student-filter a:hover {
+.management .student-filter-status input {
+  position: absolute;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.management .student-filter-status label:hover {
   color: var(--text);
 }
 
-.management .student-filter a[aria-current] {
+.management .student-filter-status label:has(:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.management .student-filter-status label:has(:checked) {
   border-bottom-color: var(--accent);
   color: var(--text);
+}
+
+.management .student-filter-selects {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  padding-block: 0.5rem;
+  padding-inline-start: 0.75rem;
+}
+
+.management .student-filter-selects label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 500;
+}
+
+.management .student-filter-selects select {
+  min-height: 36px;
+  padding: 0 0.5rem;
+  border: 1px solid var(--control);
+  border-radius: 0.5rem;
+  background: var(--canvas);
+  color: var(--text);
+  font: inherit;
 }
 
 .management .student-empty {

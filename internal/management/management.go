@@ -63,8 +63,9 @@ func htmx(r *http.Request) bool {
 // biller supplies each student's billing summary and the staff billing actions.
 func RegisterRoutes(mux *http.ServeMux, store *links.Store, roster *students.Store, config *settings.Store, staff func(context.Context) string, biller *billing.Service) error {
 	page, err := template.New("management").Funcs(template.FuncMap{
-		"money":  payments.Money,
-		"plural": plural,
+		"money":       payments.Money,
+		"plural":      plural,
+		"cohortLabel": students.CohortLabel,
 	}).ParseFS(templates, "templates/*.html")
 	if err != nil {
 		return err

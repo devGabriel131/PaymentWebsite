@@ -124,7 +124,7 @@ Six contact fields come from one registry (`students.Field`, `internal/students/
 | `GET /management/`, `GET /management/trash` | Customer links; Trash |
 | `POST /management/links`, `/management/links/{id}/cancel`, `/management/links/cancel` | Create; cancel one; cancel all unfinished |
 | `GET`/`POST /management/settings`, `POST /management/program-start-date` | Link lifetime; agreement start date |
-| `GET /management/students` (`?status=active` or `suspended` filters by `is_active`; any other value lists everyone), `/management/students/{id}`, `GET`/`POST …/{id}/fields/{field}` | List; detail dialog; per-field edit |
+| `GET /management/students` (`?status=active` or `suspended`, `?cohort=YYYY-MM`, `?group=Básico` or `Regular` combine to narrow the list; a value matching no option is ignored), `/management/students/{id}`, `GET`/`POST …/{id}/fields/{field}` | List; detail dialog; per-field edit |
 | `/management/students/{id}/billing` (GET), `…/billing/reconcile`, `…/reinstatement`, `…/portal` (POST), `…/invoices/{obligation}` (GET) | Billing fragment and staff billing actions |
 | `GET /management/events` | Server-sent change feed |
 

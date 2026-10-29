@@ -779,7 +779,7 @@ func stored(t *testing.T, db *gorm.DB) []links.Link {
 
 func studentRecords(t *testing.T, db *gorm.DB) []students.Student {
 	t.Helper()
-	all, err := students.New(db, nil).List(t.Context(), nil)
+	all, err := students.New(db, nil).List(t.Context(), students.Filter{})
 	if err != nil {
 		t.Fatal(err)
 	}

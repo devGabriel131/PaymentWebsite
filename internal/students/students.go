@@ -37,11 +37,11 @@ type Student struct {
 	Cohort string `gorm:"type:text;not null;check:student_cohort_month,cohort ~ '^[0-9]{4}-(0[1-9]|1[0-2])$'"`
 }
 
-// CohortLabel names the cohort's month, such as "November 2026".
-func (s Student) CohortLabel() string {
-	month, err := time.Parse("2006-01", s.Cohort)
+// CohortLabel names a cohort month, YYYY-MM, such as "November 2026".
+func CohortLabel(cohort string) string {
+	month, err := time.Parse("2006-01", cohort)
 	if err != nil {
-		return s.Cohort // the check constraint makes this unreachable for stored rows
+		return cohort // the check constraint makes this unreachable for stored rows
 	}
 	return month.Format("January 2006")
 }
@@ -60,19 +60,38 @@ func New(db *gorm.DB, changed func()) *Store {
 	return &Store{db: db, changed: changed}
 }
 
-// List returns retained students, newest first, regardless of source access.
-// A non-nil active keeps only students whose is_active equals it.
+// Filter narrows List. Its zero value keeps every student; a student must match each set field.
+type Filter struct {
+	Active *bool  // is_active equals it when non-nil
+	Cohort string // a YYYY-MM month
+	Group  string // one of GroupOptions
+}
+
+// List returns retained students matching filter, newest first, regardless of source access.
 // ponytail: unbounded small mock history; paginate before sustained growth.
-func (s *Store) List(ctx context.Context, active *bool) ([]Student, error) {
+func (s *Store) List(ctx context.Context, filter Filter) ([]Student, error) {
 	query := s.db.WithContext(ctx).Order("created_at DESC, id DESC")
-	if active != nil {
-		query = query.Where("is_active = ?", *active)
+	if filter.Active != nil {
+		query = query.Where("is_active = ?", *filter.Active)
+	}
+	if filter.Cohort != "" {
+		query = query.Where("cohort = ?", filter.Cohort)
+	}
+	if filter.Group != "" {
+		query = query.Where(`"group" = ?`, filter.Group)
 	}
 	var records []Student
 	if err := query.Find(&records).Error; err != nil {
 		return nil, err
 	}
 	return records, nil
+}
+
+// Cohorts returns every cohort that has a student, newest first.
+func (s *Store) Cohorts(ctx context.Context) ([]string, error) {
+	var cohorts []string
+	err := s.db.WithContext(ctx).Model(&Student{}).Distinct().Order("cohort DESC").Pluck("cohort", &cohorts).Error
+	return cohorts, err
 }
 
 // Counts is the roster's headcount.
@@ -102,7 +121,6 @@ func (s *Store) Get(ctx context.Context, id uint64) (*Student, error) {
 	}
 	return &record, nil
 }
-
 
 // pinHeld reports whether a Student or a submitted Link still awaiting payment holds pin.
 // links imports this package, so the table is queried by name without importing links.
